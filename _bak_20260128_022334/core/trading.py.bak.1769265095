@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import json
+import time
+import inspect
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from config import settings
+
+
+class TradingEngine:
+    """
+    Stratégie:
+      - Stop loss: -10% depuis entry
+      - Trailing stop: -10% depuis le plus haut (highest_price)
+    Anti double-buy:
+      - si position OPEN -> pas de re-buy
+      - si buy en cours (inflight) -> pas de re-buy
+      - cooldown global BUY_COOLDOWN_SECONDS
+    Persistance:
+      - positions.json écrit dès le démarrage (même vide)
+    """
+
+    def __init__(self, wallet, logger, positions_file: str, mode: str):
+        self.wallet = wallet
+        self.logger = logger
+        self.positions_file = (positions_file or "positions.json").strip()
+        self.mode = (mode or "PAPER").upper().strip()
+
+        self.positions: Dict[str, Dict[str, Any]] = {}
+        self.buy_inflight: set[str] = set()
+        self.last_buy_ts: float = 0.0
+
+        from core.real_executor import RealExecutor
+        from core.paper_executor import PaperExecutor
+        self.executor = RealExecutor(wallet, logger) if self.mode == "REAL" else PaperExecutor(wallet, logger)
+
+        self._load_positions()
+        # important: s'assurer que le fichier existe
+        self._save_positions()
+
+        self.logger.info("[TradingEngine] Initialisé (mode=%s, SL=-10%%, trailing=-10%% du high).", self.mode)
+
+    # ---------------- persistence ----------------
+    def _load_positions(self) -> None:
+        p = Path(self.positions_file)
+        if not p.exists():
+            self.positions = {}
+            return
+        try:
+            self.positions = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if not isinstance(self.positions, dict):
+                self.positions = {}
+        except Exception:
+            self.positions = {}
+
+    def _save_positions(self) -> None:
+        Path(self.positions_file).write_text(json.dumps(self.positions, indent=2), encoding="utf-8")
+
+    # ---------------- strategy ----------------
+    def _should_sell(self, pos: Dict[str, Any], price: float) -> Optional[str]:
+        entry = float(pos.get("entry_price") or 0.0)
+        high = float(pos.get("highest_price") or entry)
+
+        if entry <= 0:
+            return None
+
+        sl_price = entry * 0.90      # -10%
+        trail_price = high * 0.90    # -10% du plus haut
+
+        if price <= sl_price:
+            return "STOP_LOSS"
+
+        # trailing actif dès qu'on est passé au-dessus de l'entry au moins une fois
+        if high > entry and price <= trail_price:
+            return "TRAILING"
+
+        return None
+
+    async def _executor_sell(self, mint: str, pos: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        RealExecutor.sell(mint) existe chez toi.
+        PaperExecutor.sell(mint, token_amount) existe chez toi.
+        On gère les deux sans casser.
+        """
+        fn = getattr(self.executor, "sell", None)
+        if fn is None:
+            raise RuntimeError("Executor n'a pas de méthode sell()")
+
+        try:
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.values())
+            # méthode bound => params sans self
+            argc = len(params)
+
+            if argc == 1:
+                # sell(mint)
+                res = fn(mint)
+            else:
+                # sell(mint, token_amount) -> on tente avec token_amount si dispo
+                token_amount = float(pos.get("token_amount") or 0.0)
+                res = fn(mint, token_amount)
+
+            if hasattr(res, "__await__"):
+                res = await res
+            return res if isinstance(res, dict) else {"result": res}
+        except Exception:
+            # fallback: tenter sell(mint)
+            res = fn(mint)
+            if hasattr(res, "__await__"):
+                res = await res
+            return res if isinstance(res, dict) else {"result": res}
+
+    # ---------------- main loop ----------------
+    async def on_overviews(self, overviews: List[Dict[str, Any]], risk_checker) -> None:
+        now = time.time()
+
+        # 1) SELL d'abord
+        for ov in (overviews or []):
+            mint = ov.get("mint") or ov.get("token") or ov.get("address")
+            price = ov.get("price_usd") or ov.get("price")
+            if not mint or price in (None, 0, 0.0):
+                continue
+
+            pos = self.positions.get(mint)
+            if not pos or pos.get("status") != "OPEN":
+                continue
+
+            price_f = float(price)
+            pos["last_price"] = price_f
+            pos["highest_price"] = max(float(pos.get("highest_price") or price_f), price_f)
+
+            reason = self._should_sell(pos, price_f)
+            if not reason:
+                continue
+
+            self.logger.info("[SELL] %s reason=%s price=%.8f high=%.8f entry=%.8f",
+                             mint, reason, price_f, float(pos["highest_price"]), float(pos["entry_price"]))
+
+            try:
+                res = await self._executor_sell(mint, pos)
+                pos["status"] = "CLOSED"
+                pos["sell_price"] = price_f
+                pos["sell_ts"] = now
+                pos["sell_reason"] = reason
+                pos["sell_tx"] = res.get("signature") or res.get("tx") or res.get("result")
+                self._save_positions()
+                self.logger.info("[SELL OK] %s tx=%s", mint, pos.get("sell_tx"))
+            except Exception as e:
+                self.logger.error("[SELL ERROR] %s: %s", mint, e, exc_info=True)
+
+        # 2) BUY ensuite (1 buy max par loop)
+        for ov in (overviews or []):
+            mint = ov.get("mint") or ov.get("token") or ov.get("address")
+            price = ov.get("price_usd") or ov.get("price")
+            dex = (ov.get("dex_id") or "").lower().strip()
+
+            if not mint or price in (None, 0, 0.0):
+                continue
+
+            # REAL: Raydium only
+            if self.mode == "REAL" and dex and dex != "raydium":
+                continue
+
+            # anti double-buy (position ouverte)
+            if mint in self.positions and self.positions[mint].get("status") == "OPEN":
+                continue
+
+            # anti double-buy (buy en cours)
+            if mint in self.buy_inflight:
+                continue
+
+            # cooldown global
+            cooldown = float(getattr(settings, "BUY_COOLDOWN_SECONDS", 0))
+            if cooldown > 0 and (now - float(self.last_buy_ts or 0.0) < cooldown):
+                continue
+
+            ok, reason = risk_checker.allow_buy(ov)
+            if not ok:
+                continue
+
+            sol_amount = float(getattr(settings, "BUY_AMOUNT_SOL", 0.0))
+            if sol_amount <= 0:
+                continue
+
+            self.buy_inflight.add(mint)
+            try:
+                self.logger.info("[BUY] Signal %s price~%.8f size=%.4f SOL mode=%s", mint, float(price), sol_amount, self.mode)
+                res = self.executor.buy(mint, sol_amount, float(price))
+                if hasattr(res, "__await__"):
+                    res = await res
+
+                self.positions[mint] = {
+                    "status": "OPEN",
+                    "entry_price": float(price),
+                    "highest_price": float(price),
+                    "last_price": float(price),
+                    "buy_ts": now,
+                    "buy_tx": (res.get("signature") if isinstance(res, dict) else None),
+                }
+                self._save_positions()
+                self.last_buy_ts = now
+                self.logger.info("[BUY OK] %s tx=%s", mint, self.positions[mint].get("buy_tx"))
+                break
+            except Exception as e:
+                self.logger.error("[BUY ERROR] %s: %s", mint, e, exc_info=True)
+            finally:
+                self.buy_inflight.discard(mint)
+
+        self._print_portfolio()
+
+    def _print_portfolio(self) -> None:
+        open_cnt = sum(1 for p in self.positions.values() if p.get("status") == "OPEN")
+        closed_cnt = sum(1 for p in self.positions.values() if p.get("status") == "CLOSED")
+        self.logger.info("[PORTFOLIO] mode=%s open=%d closed=%d positions_file=%s",
+                         self.mode, open_cnt, closed_cnt, self.positions_file)

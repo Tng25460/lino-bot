@@ -1,0 +1,519 @@
+SKIP_MINTS_FILE = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
+SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
+BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
+
+from __future__ import annotations
+
+def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    rows2 = sorted(rows, key=lambda r: float(r.get("score") or -1e9), reverse=True)
+    k = max(1, int(SCORED_TOPK))
+    top = rows2[:k]
+
+    import random
+    scores = [float(r.get("score") or 0.0) for r in top]
+    mn = min(scores) if scores else 0.0
+    weights = [(s - mn + 1e-6) for s in scores]
+    try:
+        return random.choices(top, weights=weights, k=1)[0]
+    except Exception:
+        return top[0]
+
+
+import os
+import json
+import time
+import base64
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import requests
+
+
+def _load_skip_mints() -> set[str]:
+    try:
+        from pathlib import Path
+        fp = Path(SKIP_MINTS_FILE)
+        if not fp.exists():
+            return set()
+        s=set()
+        for line in fp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line=line.strip()
+            if not line or line.startswith("#"):
+                continue
+            s.add(line)
+        return s
+    except Exception:
+        return set()
+
+def _get_token_ui_balance(owner_pubkey: str, mint: str) -> float:
+    # jsonParsed token accounts by owner+mint
+    try:
+        import requests
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [owner_pubkey, {"mint": mint}, {"encoding": "jsonParsed"}],
+        }
+        r = requests.post(RPC_HTTP, json=payload, timeout=20).json()
+        accs = ((r.get("result") or {}).get("value") or [])
+        ui = 0.0
+        for a in accs:
+            try:
+                ui = float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0.0)
+            except Exception:
+                pass
+        return float(ui or 0.0)
+    except Exception:
+        return 0.0
+
+BUY_COOLDOWN_S = int(os.getenv("BUY_COOLDOWN_S", "3600"))  # per-mint rebuy cooldown (seconds)
+BYPASS_COOLDOWN = os.getenv("BYPASS_COOLDOWN","0") == "1"
+LAST_BUYS_FILE = os.getenv("LAST_BUYS_FILE", "state/last_buys.json")
+
+
+def _load_last_buys() -> dict:
+    from pathlib import Path
+    import json
+    try:
+        fp = Path(LAST_BUYS_FILE)
+        if not fp.exists():
+            return {}
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_last_buys(d: dict) -> None:
+    from pathlib import Path
+    import json
+    try:
+        fp = Path(LAST_BUYS_FILE)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solders.message import to_bytes_versioned
+
+
+### PICK_SCORE_V1 ###
+
+def _f(x, d=0.0):
+    try:
+        if x is None:
+            return float(d)
+        if isinstance(x, (int, float)):
+            return float(x)
+        xs = str(x).strip().replace("%","")
+        if xs == "":
+            return float(d)
+        return float(xs)
+    except Exception:
+        return float(d)
+
+def _score_candidate(c: dict) -> (float, dict):
+    """
+    Score simple, robuste (utilise ce qui existe dans ready_to_trade.jsonl).
+    Plus le score est haut, meilleur c'est.
+    """
+    liq = _f(c.get("liquidity_usd") or c.get("liq_usd") or (c.get("liquidity") or {}).get("usd"), 0.0)
+    v5  = _f(c.get("vol5m_usd") or c.get("volume5m_usd") or c.get("vol_5m_usd") or c.get("volume_usd_5m"), 0.0)
+    v1h = _f(c.get("vol1h_usd") or c.get("volume1h_usd") or c.get("vol_1h_usd") or c.get("volume_usd_1h"), 0.0)
+    ch5 = _f(c.get("chg5m_pct") or c.get("change5m_pct") or c.get("priceChange5m") or (c.get("priceChange") or {}).get("m5"), 0.0)
+    ch1 = _f(c.get("chg1h_pct") or c.get("change1h_pct") or c.get("priceChange1h") or (c.get("priceChange") or {}).get("h1"), 0.0)
+    mc  = _f(c.get("marketcap_usd") or c.get("mc_usd") or c.get("fdv_usd") or c.get("fdv"), 0.0)
+
+    # gates (env) — si pas set => défauts raisonnables
+    import os
+    MIN_LIQ_USD   = _f(os.getenv("MIN_LIQ_USD", "15000"), 15000)
+    MIN_VOL5M_USD = _f(os.getenv("MIN_VOL5M_USD", "3000"), 3000)
+    MIN_CHG5M_PCT = _f(os.getenv("MIN_CHG5M_PCT", "5"), 5)
+    MAX_CHG5M_PCT = _f(os.getenv("MAX_CHG5M_PCT", "70"), 70)
+    MIN_CHG1H_PCT = _f(os.getenv("MIN_CHG1H_PCT", "0"), 0)
+    MAX_MC_USD    = _f(os.getenv("MAX_MC_USD", "0"), 0)   # 0 => no cap
+
+    # hard rejects
+    if liq < MIN_LIQ_USD:
+        return -1.0, {"why": "liq", "liq": liq}
+    if v5 < MIN_VOL5M_USD:
+        return -1.0, {"why": "vol5m", "vol5m": v5}
+    if ch5 < MIN_CHG5M_PCT or ch5 > MAX_CHG5M_PCT:
+        return -1.0, {"why": "chg5m", "chg5m": ch5}
+    if ch1 < MIN_CHG1H_PCT:
+        return -1.0, {"why": "chg1h", "chg1h": ch1}
+    if MAX_MC_USD > 0 and mc > MAX_MC_USD:
+        return -1.0, {"why": "mc", "mc": mc}
+
+    # score (pondérations simples)
+    # - favorise volume court terme + liquidité + momentum (5m/1h)
+    # - pénalise un peu mc trop gros
+    score = 0.0
+    score += min(v5 / 2000.0, 10.0)        # 0..10
+    score += min(v1h / 20000.0, 6.0)       # 0..6
+    score += min(liq / 25000.0, 6.0)       # 0..6
+    score += min(ch5 / 10.0, 8.0)          # 0..8
+    score += min(max(ch1, 0.0) / 20.0, 6.0)# 0..6
+    if mc > 0:
+        score -= min(mc / 5_000_000.0, 3.0) # 0..-3
+
+    dbg = {"liq": liq, "v5": v5, "v1h": v1h, "ch5": ch5, "ch1": ch1, "mc": mc, "score": score}
+    return float(score), dbg
+
+def _pick_best_ready(ready: list) -> dict:
+    best = None
+    best_score = -1e9
+    best_dbg = {}
+    for c in ready:
+        if not isinstance(c, dict):
+            continue
+        sc, dbg = _score_candidate(c)
+        if sc > best_score:
+            best_score = sc
+            best = c
+            best_dbg = dbg
+    if best is None:
+        return {}
+    # log minimal
+    mint = (best.get("outputMint") or best.get("mint") or best.get("address") or "").strip()
+    sym  = (best.get("symbol") or "").strip()
+    print(f"[DECISION] PICK mint={mint} sym={sym} score={best_score:.2f} dbg={best_dbg}")
+    return best
+### SOL_BALANCE_GUARD_V1 ###
+MIN_SOL_BUFFER_LAMPORTS = int(float(os.getenv('MIN_SOL_BUFFER_SOL','0.003')) * 1_000_000_000)  # fees/ATA buffer
+
+def _get_balance_lamports(rpc_http: str, pubkey: str) -> int:
+    try:
+        rr = requests.post(rpc_http, json={'jsonrpc':'2.0','id':1,'method':'getBalance','params':[pubkey]}, timeout=20)
+        return int((rr.json().get('result') or {}).get('value') or 0)
+    except Exception:
+        return 0
+
+
+
+READY_FILE = Path(os.getenv("READY_FILE", "ready_to_trade.jsonl"))
+OUT_TX_B64 = Path(os.getenv("OUT_TX_B64", "last_swap_tx.b64"))
+OUT_META = Path(os.getenv("OUT_META", "last_swap_meta.json"))
+OUT_ERR = Path(os.getenv("OUT_ERR", "last_swap_error.json"))
+OUT_DBG = Path(os.getenv("OUT_DBG", "last_swap_debug.log"))
+OUT_SENT = Path(os.getenv("OUT_SENT", "last_swap_sent.json"))
+
+JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag")).rstrip("/")
+RPC_HTTP = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com"))
+
+SOL_MINT = os.getenv("SOL_MINT", "So11111111111111111111111111111111111111112")
+
+SLIPPAGE_BPS = int(float(os.getenv("SLIPPAGE_BPS", os.getenv("TRADER_SLIPPAGE_BPS", "120"))))
+MAX_PRICE_IMPACT_PCT = float(os.getenv("MAX_PRICE_IMPACT_PCT", os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", "1.5")))
+DEFAULT_SOL_AMOUNT = float(os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")))
+
+ONE_SHOT = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1", "true", "yes", "on")
+DRY_RUN = os.getenv("TRADER_DRY_RUN", os.getenv("DRY_RUN", "1")).strip().lower() in ("1", "true", "yes", "on")
+SKIP_PREFLIGHT = os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1", "true", "yes", "on")
+
+WALLET_PUBKEY = (os.getenv("WALLET_PUBKEY") or os.getenv("TRADER_USER_PUBLIC_KEY") or "").strip()
+
+
+def _append_dbg(line: str) -> None:
+    try:
+        OUT_DBG.parent.mkdir(parents=True, exist_ok=True)
+        with OUT_DBG.open("a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def _write_err(kind: str, payload: Dict[str, Any]) -> None:
+    try:
+        OUT_ERR.write_text(json.dumps({"ts": int(_time.time()), "kind": kind, **payload}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _headers() -> Dict[str, str]:
+    h = {"accept": "application/json"}
+    k = os.getenv("JUPITER_API_KEY") or os.getenv("JUP_API_KEY") or ""
+    if k:
+        h["x-api-key"] = k
+    return h
+
+
+def _load_ready() -> list[dict]:
+    if not READY_FILE.exists():
+        return []
+    out = []
+    with READY_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def _lamports_from_any(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str) and v.strip():
+        try:
+            if "." in v:
+                return int(float(v))
+            return int(v)
+        except Exception:
+            return None
+    return None
+
+
+def _load_keypair() -> Keypair:
+    path = os.getenv("SOLANA_KEYPAIR") or os.getenv("KEYPAIR_PATH") or ""
+    if not path:
+        raise RuntimeError("Missing SOLANA_KEYPAIR env (path to keypair.json)")
+    p = Path(path).expanduser()
+    arr = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(arr, list) or len(arr) < 64:
+        raise RuntimeError("Bad keypair.json format (expected list of 64 ints)")
+    secret = bytes(int(x) & 0xFF for x in arr[:64])
+    return Keypair.from_bytes(secret)
+
+
+def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
+    kp = _load_keypair()
+
+    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    sig = kp.sign_message(to_bytes_versioned(raw_tx.message))
+    signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
+
+    encoded_tx = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+
+    req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded_tx,
+            {
+                "encoding": "base64",
+                "skipPreflight": bool(SKIP_PREFLIGHT),
+                "preflightCommitment": os.getenv("PREFLIGHT_COMMITMENT", "processed"),
+                "maxRetries": int(os.getenv("SEND_MAX_RETRIES", "3")),
+            },
+        ],
+    }
+    r = requests.post(rpc_http, json=req, timeout=35)
+    _append_dbg("SEND_STATUS=" + str(r.status_code))
+    _append_dbg("SEND_BODY=" + (r.text[:2000] if r.text else ""))
+
+    if r.status_code != 200:
+        raise RuntimeError(f"sendTransaction http={r.status_code} body={r.text[:2000]}")
+
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"sendTransaction error={j['error']}")
+    res = j.get("result")
+    if not res:
+        raise RuntimeError(f"sendTransaction no result: {j}")
+    return str(res)
+
+
+def main() -> int:
+    if not WALLET_PUBKEY:
+        print("❌ missing WALLET_PUBKEY/TRADER_USER_PUBLIC_KEY")
+        return 1
+
+    print("🚀 trader_exec BUY")
+
+    print("   ready_file=", READY_FILE)
+
+    print("   jup_base=", JUP_BASE)
+
+    print("   rpc_http=", RPC_HTTP)
+
+    print("   input_mint=", SOL_MINT)
+
+    print("   slippage_bps=", SLIPPAGE_BPS, "max_price_impact=", f"{MAX_PRICE_IMPACT_PCT}%")
+
+    print("   one_shot=", ONE_SHOT, "dry_run=", DRY_RUN)
+
+
+    ready = _load_ready()
+
+    print("   ready_count=", len(ready))
+
+    if not ready:
+
+        _write_err("no_ready_candidates", {"ready_file": READY_FILE})
+
+        print("⚠️ ready_to_trade vide")
+
+        return 0
+
+
+    # IMPORTANT: trader_exec ne score PAS. Le scoring/filters doivent être upstream (core/trading.py)
+
+    cand = ready[0]
+
+    output_mint = (cand.get("outputMint") or cand.get("mint") or cand.get("address") or "").strip()
+    FORCE_OUTPUT_MINT = os.getenv("FORCE_OUTPUT_MINT")
+    if FORCE_OUTPUT_MINT:
+        output_mint = FORCE_OUTPUT_MINT.strip()
+        print(f"   [CFG] FORCE_OUTPUT_MINT -> {output_mint}")
+    # skiplist + bag check
+    try:
+        skip = _load_skip_mints()
+        if output_mint in skip:
+            print(f"⚠️ skip BUY: mint in SKIP_MINTS_FILE mint={output_mint}")
+            return 0
+    except Exception:
+        pass
+    if SKIP_IF_BAG:
+        ui = _get_token_ui_balance(WALLET_PUBKEY, output_mint)
+        if ui > BAG_MIN_UI:
+            print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
+            return 0
+
+    if not output_mint:
+
+        _write_err("bad_candidate_no_mint", {"candidate": cand})
+
+        print("⚠️ candidate sans mint/outputMint/address")
+
+        return 0
+
+    # rebuy cooldown
+    try:
+        import time as _time
+        last = _load_last_buys()
+        ts = int((last or {}).get(output_mint) or 0)
+        if ts > 0:
+            age = int(_time.time()) - ts
+            if (not BYPASS_COOLDOWN) and age < BUY_COOLDOWN_S:
+                wait = BUY_COOLDOWN_S - age
+                print(f"   [COOLDOWN] selected mint={output_mint}")
+                print(f"⚠️ skip BUY: rebuy cooldown mint={output_mint} age_s={age} wait_s={wait}")
+                return 0
+    except Exception:
+        pass
+
+
+
+    amount_lamports = _lamports_from_any(cand.get("amount"))
+    BUY_LAMPORTS_OVERRIDE = os.getenv("BUY_LAMPORTS")
+    if BUY_LAMPORTS_OVERRIDE:
+        try:
+            amount_lamports = int(BUY_LAMPORTS_OVERRIDE)
+            print(f"   [CFG] BUY_LAMPORTS override -> {amount_lamports}")
+        except Exception:
+            pass
+
+    if amount_lamports is None:
+
+        amount_lamports = int(DEFAULT_SOL_AMOUNT * 1_000_000_000)
+
+
+    input_mint = SOL_MINT
+
+
+    amount = int(amount_lamports)
+
+
+    print("   pick=", output_mint, "amount_lamports=", amount)
+
+        
+    # QUOTE
+    qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
+    params = {
+        "inputMint": SOL_MINT,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(SLIPPAGE_BPS),
+    }
+    try:
+        qr = requests.get(qurl, params=params, headers=_headers(), timeout=25)
+        _append_dbg("QUOTE_URL=" + qr.url)
+        _append_dbg("QUOTE_STATUS=" + str(qr.status_code))
+        _append_dbg("QUOTE_BODY=" + (qr.text[:2000] if qr.text else ""))
+        if qr.status_code != 200:
+            _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
+            print("❌ quote failed http=", qr.status_code)
+            return 0
+        quote = qr.json()
+    except Exception as e:
+        _write_err("quote_exc", {"error": str(e)})
+        print("❌ quote exception:", e)
+        return 0
+
+    # SWAP build
+    surl = os.getenv("JUP_SWAP_URL", f"{JUP_BASE}/swap/v1/swap")
+    body = {"quoteResponse": quote, "userPublicKey": WALLET_PUBKEY, "wrapAndUnwrapSol": True}
+
+    try:
+        sr = requests.post(surl, headers=_headers(), json=body, timeout=35)
+        _append_dbg("SWAP_STATUS=" + str(sr.status_code))
+        _append_dbg("SWAP_BODY=" + (sr.text[:2000] if sr.text else ""))
+        if sr.status_code != 200:
+            _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
+            print("❌ swap build failed http=", sr.status_code)
+            return 0
+
+        swap = sr.json()
+        txb64 = swap.get("swapTransaction")
+        if not txb64:
+            _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
+            print("⚠️ swap response sans swapTransaction")
+            return 0
+
+        OUT_TX_B64.write_text(txb64, encoding="utf-8")
+        OUT_META.write_text(json.dumps({
+            "ts": int(_time.time()),
+            "mode": "BUY",
+            "inputMint": SOL_MINT,
+            "outputMint": output_mint,
+            "amount": amount,
+            "slippageBps": SLIPPAGE_BPS,
+            "userPublicKey": WALLET_PUBKEY,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print("✅ built tx -> last_swap_tx.b64")
+
+        if DRY_RUN:
+            print("🧪 DRY_RUN=1 -> not sending")
+            return 0
+
+        try:
+            txsig = _send_signed_b64(txb64, RPC_HTTP)
+            OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("✅ sent txsig=", txsig)
+            # record_last_buy
+            try:
+                import time as _time
+                last=_load_last_buys()
+                last[output_mint]=int(_time.time())
+                _save_last_buys(last)
+            except Exception:
+                pass
+
+        except Exception as e:
+            _write_err("send_exc", {"error": str(e)})
+            print("❌ send exception:", e)
+
+        return 0
+
+    except Exception as e:
+        _write_err("swap_exc", {"error": str(e)})
+        print("❌ swap exception:", e)
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

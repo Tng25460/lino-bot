@@ -1,0 +1,118 @@
+# /home/tng25/lino/src/main.py
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from typing import Any, Dict, List
+
+# assure les imports "core.*" et "config.*"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from config import settings
+from core.logger import get_logger
+from core.wallet import Wallet
+from core.risk_checks import RiskChecker
+from core.trading import TradingEngine
+from core.token_scanner import TokenScanner, ScannerConfig
+
+
+ASCII_LINO = r"""
+██╗     ██╗███╗   ██╗ ██████╗
+██║     ██║████╗  ██║██╔═══██╗
+██║     ██║██╔██╗ ██║██║   ██║
+██║     ██║██║╚██╗██║██║   ██║
+███████╗██║██║ ╚████║╚██████╔╝
+╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝
+        L I N O   B O T
+"""
+
+
+async def run_loop() -> None:
+    logger = get_logger()
+
+    logger.info(f"Bot Lino démarré en mode {settings.MODE}")
+    logger.info("Début de la boucle principale...")
+    logger.info(ASCII_LINO)
+
+    wallet = Wallet()
+    logger.info(f"[WALLET] Loaded keypair with pubkey: {wallet.pubkey()}")
+
+    risks = RiskChecker(logger=logger)
+
+    engine = TradingEngine(
+        wallet=wallet,
+        logger=logger,
+        positions_file=os.path.join(PROJECT_ROOT, "positions.json"),
+        mode=settings.MODE,
+    )
+
+    # TokenScanner config (Birdeye)
+    api = settings.BIRDEYE_API_KEY
+    if not api:
+        logger.error("BIRDEYE_API_KEY manquant. export BIRDEYE_API_KEY='...' puis relance.")
+        return
+
+    scanner = TokenScanner(
+        ScannerConfig(
+            birdeye_api_key=api,
+            new_listing_limit=settings.NEW_LISTING_LIMIT,
+            global_rps=settings.GLOBAL_RPS,
+            max_concurrency=settings.MAX_CONCURRENCY,
+        )
+    )
+    logger.info(f"[Main] TokenScanner ✅ limit={settings.NEW_LISTING_LIMIT}")
+
+    try:
+        while True:
+            # 1) fetch new tokens
+            try:
+                new_overviews: List[Dict[str, Any]] = await scanner.scan_once_async()
+                logger.info(f"[Main] overviews reçus (new): {len(new_overviews)}")
+            except Exception as e:
+                logger.error(f"[Scanner] erreur: {e}")
+                new_overviews = []
+
+            # 2) also request overviews for current positions (so trailing updates even if scanner fails)
+            pos_overviews: List[Dict[str, Any]] = []
+            try:
+                # si ton scanner sait enrichir/overview par mint, adapte ici.
+                # sinon, on retombe sur new_overviews uniquement.
+                pos_overviews = []
+            except Exception:
+                pos_overviews = []
+
+            merged = new_overviews
+            # si plus tard tu ajoutes pos_overviews, tu pourras merge ici.
+
+            # 3) engine cycle
+            if merged:
+                engine.on_overviews(merged, risks)
+
+            await asyncio.sleep(settings.SCAN_INTERVAL_SECONDS)
+
+    except asyncio.CancelledError:
+        raise
+    except KeyboardInterrupt:
+        logger.info("Arrêt demandé (CTRL+C). Fermeture...")
+    finally:
+        try:
+            scanner.close()
+        except Exception:
+            pass
+        logger.info("Bot Lino arrêté.")
+
+
+def main() -> None:
+    logger = get_logger()
+    try:
+        asyncio.run(run_loop())
+    except Exception as e:
+        logger.error(f"[MAIN ERROR] {e}", exc_info=True)
+        logger.info("Bot Lino arrêté.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,33 @@
+# /home/tng25/lino/config/settings.py
+import os
+
+# --- MODE ---
+# "PAPER" ou "REAL"
+MODE = os.getenv("MODE", os.getenv("TRADING_MODE", "PAPER")).upper().strip()
+
+# --- RPC ---
+RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+
+# --- TRADING ---
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+BUY_COOLDOWN_SECONDS = int(os.getenv("BUY_COOLDOWN_SECONDS", "60"))
+
+# --- STRAT MOONSHOT ---
+# Stop loss: -10% depuis l'entrée
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.10"))
+
+# Trailing: on vend si prix <= high * (1 - trailing_pct)
+# (pour test rapide : 0.03 => 3%)
+TRAILING_FROM_HIGH_PCT = float(os.getenv("TRAILING_FROM_HIGH_PCT", "0.03"))
+
+# --- RISK FILTERS (ce que tu as demandé) ---
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "1000"))
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "300000"))
+
+# --- SCANNER (Birdeye) ---
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+NEW_LISTING_LIMIT = int(os.getenv("NEW_LISTING_LIMIT", "10"))
+GLOBAL_RPS = float(os.getenv("GLOBAL_RPS", "1.0"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite
+*.db
+
+# Virtualenv
+.venv/
+venv/
+
+# Secrets / keys
+keypair.json
+*.key
+*.pem
+*.env
+
+# Local runtime files
+positions.json
+lino.log
+recent_sells.json
+dev_db.json
+cache/
+tmp/
+
+# OS
+.DS_Store

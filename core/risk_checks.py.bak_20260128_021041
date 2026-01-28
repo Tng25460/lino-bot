@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Tuple, Optional
+
+from config import settings
+from core.logger import get_logger
+from core.anti_rug import AntiRug
+from core.dev_profiler import DevProfiler
+from core.solana_rpc_async import SolanaRPCAsync
+
+BLACKLIST_DEV_PATH = Path(os.getenv("BLACKLIST_DEV_PATH", "state/blacklist_dev.json"))
+BLACKLIST_MINT_PATH = Path(os.getenv("BLACKLIST_MINT_PATH", "state/blacklist_mint.json"))
+
+
+def _load_json(path: Path, default: Any):
+    try:
+        if path.exists():
+            import json
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+class RiskChecker:
+    """
+    Risk checks:
+      - dev + mint blacklist
+      - anti-rug on-chain via async RPC:
+          - token program (Token-2022 blocked by default)
+          - mint authority / freeze authority must be None (renounced)
+          - top holders concentration (top1/top10)
+    """
+
+    def __init__(self, *, logger=None, rpc_url: str = "", mode: str = "PAPER"):
+        self.logger = logger or get_logger()
+        self.mode = (mode or "PAPER").upper()
+
+        self.dev_profiler = DevProfiler(path=os.getenv("DEV_DB_PATH", "dev_db.json"))
+
+        # --- RPC async (required in REAL) ---
+        self.rpc: Optional[SolanaRPCAsync] = None
+        rpc_url = (rpc_url or "").strip()
+
+        if rpc_url:
+            try:
+                self.rpc = SolanaRPCAsync(
+                    rpc_url=rpc_url,
+                    timeout_s=float(os.getenv("RISK_RPC_TIMEOUT_S", "20")),
+                    rps=float(os.getenv("RISK_RPC_RPS", "5")),
+                    max_concurrency=int(os.getenv("RISK_RPC_CONCURRENCY", "8")),
+                )
+            except Exception as e:
+                self.rpc = None
+                self.logger.error("[RiskChecker] RPC init failed: %s", e, exc_info=True)
+
+        if self.mode == "REAL" and self.rpc is None:
+            raise SystemExit("❌ MODE=REAL but async RPC client unavailable -> anti-rug cannot run")
+
+        self.anti: Optional[AntiRug] = None
+        if self.rpc:
+            self.anti = AntiRug(
+                self.rpc,
+                self.logger,
+                block_token_2022=bool(getattr(settings, "RISK_BLOCK_TOKEN_2022", True)),
+            )
+
+        # cache anti-rug results per mint
+        self._cache: Dict[str, Tuple[int, bool, str]] = {}
+
+    def _is_mint_blacklisted(self, mint: str) -> Tuple[bool, str]:
+        bl = _load_json(BLACKLIST_MINT_PATH, {})
+        if isinstance(bl, dict) and mint in bl:
+            # optional TTL format { mint: {reason, until_ts} }
+            v = bl.get(mint)
+            if isinstance(v, dict) and "until_ts" in v:
+                try:
+                    if int(v["until_ts"]) < int(time.time()):
+                        return False, ""
+                except Exception:
+                    pass
+            return True, str(v)
+        return False, ""
+
+    def _is_dev_blacklisted(self, dev: str) -> Tuple[bool, str]:
+        bl = _load_json(BLACKLIST_DEV_PATH, {})
+        if isinstance(bl, dict) and dev in bl:
+            return True, str(bl.get(dev))
+        return False, ""
+
+    async def allow_buy(self, ov: Dict[str, Any]) -> Tuple[bool, str]:
+        mint = (ov.get("mint") or "").strip()
+        if not mint:
+            return False, "missing mint"
+
+        # -------- 1) blacklists --------
+        is_bl_m, why_m = self._is_mint_blacklisted(mint)
+        if is_bl_m:
+            return False, f"mint blacklisted: {why_m}"
+
+        creator = (ov.get("creator") or ov.get("dev") or "").strip()
+        if creator:
+            is_bl_d, why_d = self._is_dev_blacklisted(creator)
+            if is_bl_d:
+                return False, f"dev blacklisted: {why_d}"
+
+        # -------- 2) anti-rug --------
+        if not self.anti:
+            # PAPER: fail-soft (REAL is already blocked in __init__)
+            return True, "ok(paper_no_anti_rug)"
+
+        ttl = int(getattr(settings, "RISK_CACHE_TTL_SEC", 900))
+        now = int(time.time())
+        c = self._cache.get(mint)
+        if c and (now - c[0]) < ttl:
+            return c[1], c[2]
+
+        try:
+            max_top1 = float(getattr(settings, "RISK_MAX_TOP1_PCT", 0.25))
+            max_top10 = float(getattr(settings, "RISK_MAX_TOP10_PCT", 0.60))
+            require_renounced = bool(getattr(settings, "RISK_REQUIRE_RENOUNCED", True))
+
+            res = await self.anti.check(
+                mint,
+                max_top1=max_top1,
+                max_top10=max_top10,
+                require_renounced=require_renounced,
+            )
+            ok = bool(res.ok)
+            reason = str(res.reason)
+            self._cache[mint] = (now, ok, reason)
+            return ok, reason
+        except Exception as e:
+            # In PAPER: fail-soft. In REAL: refuse.
+            if self.mode == "REAL":
+                self._cache[mint] = (now, False, f"anti_rug_exc: {e}")
+                return False, f"anti_rug_exc: {e}"
+            return True, f"ok(paper_anti_rug_exc:{e})"

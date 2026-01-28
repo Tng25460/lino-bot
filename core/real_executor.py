@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from config import settings
+
+
+class RealExecutor:
+    def __init__(self, wallet, logger):
+        self.wallet = wallet
+        self.logger = logger
+
+        rpc_url = getattr(settings, "RPC_URL", "https://api.mainnet-beta.solana.com")
+        self.logger.info("[RealExecutor] initialisé (rpc=%s)", rpc_url)
+
+        from core.raydium_client import RaydiumClient
+        self.raydium = RaydiumClient(wallet=self.wallet, logger=self.logger, rpc_url=rpc_url)
+
+    async def buy(self, mint: str, sol_amount: float, price: float) -> Dict[str, Any]:
+        slippage_bps = int(getattr(settings, "SLIPPAGE_BPS", 300) or 300)
+        self.logger.info("[REAL BUY] mint=%s sol=%s price=%s slippage_bps=%s", mint, sol_amount, price, slippage_bps)
+
+        # IMPORTANT: on évite les keywords (token_mint/token_address/sol_in)
+        # -> positionnel = compatible avec ta signature actuelle
+        tx_sig = await self.raydium.swap_sol_to_token(
+            mint,
+            sol_amount,
+            slippage_bps=slippage_bps,
+        )
+        return {"tx": tx_sig}
+
+    async def sell(self, mint: str, pct: float = 1.0) -> Dict[str, Any]:
+        """Vend pct (0..1) du token mint -> SOL. pct=1.0 => vend tout."""
+        slippage_bps = int(getattr(settings, "SLIPPAGE_BPS", 300) or 300)
+
+        try:
+            pct = float(pct)
+        except Exception:
+            pct = 1.0
+        if pct <= 0:
+            self.logger.info("[REAL SELL] mint=%s pct<=0 -> skip", mint)
+            return {"tx": None, "skipped": True}
+        if pct > 1.0:
+            pct = 1.0
+
+        self.logger.info("[REAL SELL] mint=%s pct=%.3f slippage_bps=%s", mint, pct, slippage_bps)
+
+        if not hasattr(self.raydium, "swap_token_to_sol"):
+            raise RuntimeError("RaydiumClient n'a pas swap_token_to_sol()")
+
+        if not hasattr(self.raydium, "get_token_balance_ui"):
+            raise RuntimeError("RaydiumClient n'a pas get_token_balance_ui()")
+
+        bal = await self.raydium.get_token_balance_ui(mint)
+        if bal <= 0:
+            self.logger.info("[REAL SELL] mint=%s balance=0 -> skip", mint)
+            return {"tx": None, "skipped": True}
+
+        # amount à vendre (UI amount)
+        amt = bal if pct >= 0.999 else (bal * pct)
+
+        # évite la poussière
+        if amt <= 0:
+            self.logger.info("[REAL SELL] mint=%s amt<=0 -> skip", mint)
+            return {"tx": None, "skipped": True}
+
+        tx_sig = await self.raydium.swap_token_to_sol(
+            mint,
+            amt,
+            slippage_bps=slippage_bps,
+        )
+        return {"tx": tx_sig}

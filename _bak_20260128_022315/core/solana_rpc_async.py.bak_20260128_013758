@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+
+@dataclass
+class RpcResponseError(Exception):
+    message: str
+    data: Any = None
+
+    def __str__(self) -> str:
+        if self.data is None:
+            return self.message
+        return f"{self.message} | data={self.data}"
+
+
+class SolanaRPCAsync:
+    """
+    Minimal async JSON-RPC client for Solana.
+
+    Goals:
+      - stable, simple, production-safe defaults
+      - used by RiskChecker / AntiRug
+      - handles timeouts + basic RPS throttling
+    """
+
+    def __init__(
+        self,
+        rpc_url: str,
+        *,
+        timeout_s: float = 20.0,
+        rps: float = 5.0,
+        max_concurrency: int = 8,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> None:
+        self.rpc_url = rpc_url
+        self.timeout_s = float(timeout_s)
+        self.rps = float(max(0.0, rps))
+        self._min_interval = 0.0 if self.rps <= 0 else (1.0 / self.rps)
+        self._last_call_ts = 0.0
+        self._lock = asyncio.Lock()
+        self._sem = asyncio.Semaphore(int(max(1, max_concurrency)))
+        self._external_session = session
+        self._session: Optional[aiohttp.ClientSession] = session
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and self._external_session is None:
+            await self._session.close()
+        self._session = None
+
+    async def _throttle(self) -> None:
+        if self._min_interval <= 0:
+            return
+        async with self._lock:
+            now = time.time()
+            wait = (self._last_call_ts + self._min_interval) - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call_ts = time.time()
+
+    async def call(self, method: str, params: List[Any]) -> Any:
+        await self._throttle()
+        async with self._sem:
+            s = await self._ensure_session()
+            payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            try:
+                async with s.post(self.rpc_url, json=payload) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        raise RpcResponseError(f"RPC HTTP {resp.status}", text[:300])
+                    j = json.loads(text)
+            except asyncio.TimeoutError as e:
+                raise RpcResponseError("RPC timeout") from e
+            except aiohttp.ClientError as e:
+                raise RpcResponseError("RPC client error", str(e)) from e
+            except json.JSONDecodeError as e:
+                raise RpcResponseError("RPC invalid JSON", text[:300]) from e
+
+            if isinstance(j, dict) and j.get("error"):
+                raise RpcResponseError("RPC error", j.get("error"))
+            return j.get("result") if isinstance(j, dict) else None
+
+    async def get_account_info(self, pubkey: str, *, encoding: str = "jsonParsed") -> Any:
+        return await self.call("getAccountInfo", [pubkey, {"encoding": encoding}])
+
+    async def get_token_largest_accounts(self, mint: str) -> Any:
+        return await self.call("getTokenLargestAccounts", [mint])
+
+    async def get_token_supply(self, mint: str) -> Any:
+        return await self.call("getTokenSupply", [mint])

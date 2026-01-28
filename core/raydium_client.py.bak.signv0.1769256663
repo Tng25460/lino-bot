@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import os
+import re
+import base64
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
+
+import httpx
+
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+RAYDIUM_SWAP_HOST = "https://transaction-v1.raydium.io"
+
+_BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+@dataclass
+class RaydiumConfig:
+    tx_version: str = "V0"          # "V0" ou "LEGACY"
+    slippage_bps: int = 300         # 3.00%
+    compute_unit_price_micro_lamports: str = "0"
+    test_mode: bool = False         # True => ne broadcast pas
+
+
+class RaydiumClient:
+    def __init__(
+        self,
+        rpc_url: Optional[str] = None,
+        solana_client: Any = None,
+        wallet: Any = None,
+        logger: Any = None,
+        cfg: Optional[RaydiumConfig] = None,
+    ):
+        self.rpc_url = rpc_url or os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
+        self.solana_client = solana_client
+        self.wallet = wallet
+        self.log = logger
+        self.cfg = cfg or RaydiumConfig()
+
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            headers={"accept": "application/json"},
+        )
+
+        self._rpc = None
+        try:
+            from solana.rpc.async_api import AsyncClient
+            self._rpc = AsyncClient(self.rpc_url)
+        except Exception as e:
+            self._warn("[RaydiumClient] RPC AsyncClient non dispo: %s", e)
+
+    async def aclose(self) -> None:
+        try:
+            await self._http.aclose()
+        except Exception:
+            pass
+        try:
+            if self._rpc is not None:
+                await self._rpc.close()
+        except Exception:
+            pass
+
+    def _info(self, msg: str, *args: Any) -> None:
+        if self.log and hasattr(self.log, "info"):
+            self.log.info(msg, *args)
+
+    def _warn(self, msg: str, *args: Any) -> None:
+        if self.log and hasattr(self.log, "warning"):
+            self.log.warning(msg, *args)
+
+    def _error(self, msg: str, *args: Any) -> None:
+        if self.log and hasattr(self.log, "error"):
+            self.log.error(msg, *args)
+
+    def _wallet_pubkey_str(self) -> str:
+        if self.wallet is None:
+            raise RuntimeError("Wallet manquant (swap REAL impossible).")
+
+        # Wallet.pubkey() (ton cas)
+        if hasattr(self.wallet, "pubkey") and callable(getattr(self.wallet, "pubkey")):
+            s = str(self.wallet.pubkey()).strip()
+            # si c'est "Pubkey(xxx)" on extrait xxx
+            m = re.search(r"Pubkey\(([^)]+)\)", s)
+            if m:
+                s = m.group(1).strip()
+
+            # validation base58 stricte
+            if not _BASE58_RE.match(s):
+                raise RuntimeError(f"Wallet pubkey invalide pour Raydium (pas base58 clean): {s!r}")
+            return s
+
+        # fallback
+        for attr in ("public_key", "publicKey", "pubkey"):
+            v = getattr(self.wallet, attr, None)
+            if v is None:
+                continue
+            s = str(v).strip()
+            m = re.search(r"Pubkey\(([^)]+)\)", s)
+            if m:
+                s = m.group(1).strip()
+            if _BASE58_RE.match(s):
+                return s
+
+        raise RuntimeError("Impossible de récupérer une pubkey base58 clean depuis wallet.")
+    def _get_signer_keypair(self):
+        """
+        Retourne un solders.keypair.Keypair pour signer les TX Raydium.
+        Supporte:
+          - wallet.keypair() (méthode) ou wallet.keypair (attribut)
+          - solders Keypair déjà prêt
+          - extraction de secret bytes/list[int]
+          - KEYPAIR_PATH ou ./keypair.json (array de 64 ints)
+        """
+        try:
+            from solders.keypair import Keypair as SoldersKeypair
+        except Exception as e:
+            raise RuntimeError(f"solders non dispo: {e}")
+
+        w = self.wallet
+        if w is None:
+            raise RuntimeError("Wallet manquant (swap REAL impossible).")
+
+        # 1) récupérer un keypair depuis wallet (souvent wallet.keypair() chez toi)
+        kp = None
+        for attr in ("keypair", "_keypair", "kp", "signer"):
+            v = getattr(w, attr, None)
+            if v is None:
+                continue
+            try:
+                kp = v() if callable(v) else v
+                if kp is not None:
+                    break
+            except Exception:
+                pass
+        if kp is None:
+            kp = w  # au cas où wallet EST déjà le keypair
+
+        # 2) déjà du solders ?
+        if kp.__class__.__module__.startswith("solders") and kp.__class__.__name__ == "Keypair":
+            return kp
+
+        raw = None
+
+        # 3) essayer d'extraire secret bytes depuis différentes libs
+        for attr in ("secret_key", "secretKey", "_secret_key", "to_bytes", "toBytes", "__bytes__"):
+            v = getattr(kp, attr, None)
+            if v is None:
+                continue
+            try:
+                raw = v() if callable(v) else v
+                if raw:
+                    break
+            except Exception:
+                pass
+
+        # parfois wallet a direct un champ secret
+        if raw is None:
+            for attr in ("secret", "seed"):
+                v = getattr(kp, attr, None)
+                if v is None:
+                    continue
+                try:
+                    raw = v() if callable(v) else v
+                    if raw:
+                        break
+                except Exception:
+                    pass
+
+        # normaliser raw si trouvé
+        if raw is not None:
+            if isinstance(raw, list):
+                raw = bytes(raw)
+            elif isinstance(raw, bytearray):
+                raw = bytes(raw)
+
+            if isinstance(raw, (bytes,)):
+                if len(raw) == 64:
+                    return SoldersKeypair.from_bytes(raw)
+                if len(raw) == 32:
+                    return SoldersKeypair.from_seed(raw)
+
+        # 4) fallback: lire keypair.json (64 ints)
+        import os, json
+        keypath = (
+            os.getenv("KEYPAIR_PATH")
+            or os.getenv("SOLANA_KEYPAIR")
+            or str(Path("keypair.json").resolve())
+        )
+        try:
+            data = json.loads(Path(keypath).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                raw = bytes(data)
+                if len(raw) == 64:
+                    return SoldersKeypair.from_bytes(raw)
+                if len(raw) == 32:
+                    return SoldersKeypair.from_seed(raw)
+                raise RuntimeError(f"KEYPAIR_PATH={keypath}: taille inattendue {len(raw)} (attendu 64 ou 32).")
+        except FileNotFoundError:
+            raise RuntimeError(f"Keypair introuvable: KEYPAIR_PATH={keypath} (fichier absent).")
+        except Exception as e:
+            raise RuntimeError(f"Impossible de charger KEYPAIR_PATH={keypath}: {e}")
+
+        raise RuntimeError("Impossible d'extraire la secret key pour signer (keypair non compatible).")
+
+    def _get_solders_keypair(self):
+        """
+        Retourne un solders.keypair.Keypair pour signer.
+        - Prend wallet.keypair si compatible
+        - Sinon charge keypair.json (KEYPAIR_PATH ou ./keypair.json)
+        """
+        try:
+            from solders.keypair import Keypair
+        except Exception as e:
+            raise RuntimeError(f"solders non dispo: {e}")
+
+        # 1) Essaye wallet.keypair
+        kp = getattr(self.wallet, "keypair", None) if self.wallet is not None else None
+        if kp is not None:
+            # déjà un Keypair solders ?
+            if kp.__class__.__module__.startswith("solders") and kp.__class__.__name__ == "Keypair":
+                return kp
+            # solana-py Keypair ? (parfois secret_key/seed)
+            for attr in ("secret_key", "secretKey", "_secret_key"):
+                sk = getattr(kp, attr, None)
+                if sk is not None:
+                    try:
+                        b = bytes(sk)
+                        if len(b) == 64:
+                            return Keypair.from_bytes(b)
+                        if len(b) == 32:
+                            return Keypair.from_seed(b)
+                    except Exception:
+                        pass
+
+        # 2) Fallback keypair.json
+        import os, json
+        kp_path = os.getenv("KEYPAIR_PATH") or "keypair.json"
+        try:
+            arr = json.load(open(kp_path, "r"))
+        except Exception as e:
+            raise RuntimeError(f"Impossible de lire {kp_path}: {e}")
+
+        if not isinstance(arr, list):
+            raise RuntimeError(f"{kp_path} invalide (doit être une liste)")
+
+        if len(arr) == 64:
+            return Keypair.from_bytes(bytes(arr))
+        if len(arr) == 32:
+            return Keypair.from_seed(bytes(arr))
+
+        raise RuntimeError(f"{kp_path} invalide: len={len(arr)} (attendu 64 ou 32)")
+
+
+
+    async def get_quote(
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount: int,
+        slippage_bps: Optional[int] = None,
+        swap_mode: str = "swap-base-in",
+        tx_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        slippage = int(slippage_bps if slippage_bps is not None else self.cfg.slippage_bps)
+        txv = (tx_version or self.cfg.tx_version).upper()
+
+        url = f"{RAYDIUM_SWAP_HOST}/compute/{swap_mode}"
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": int(amount),
+            "slippageBps": slippage,
+            "txVersion": txv,
+        }
+        r = await self._http.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+    async def _build_transactions(
+        self,
+        swap_response: Dict[str, Any],
+        wallet_pubkey: str,
+        wrap_sol: bool,
+        unwrap_sol: bool,
+        input_account: Optional[str] = None,
+        output_account: Optional[str] = None,
+        tx_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        txv = (tx_version or self.cfg.tx_version).upper()
+        url = f"{RAYDIUM_SWAP_HOST}/transaction/swap-base-in"
+
+        if self.log and hasattr(self.log, "info"):
+            self.log.info("[Raydium TX] wallet_pubkey=%s", wallet_pubkey)
+
+        payload = {
+            "computeUnitPriceMicroLamports": str(self.cfg.compute_unit_price_micro_lamports),
+            "swapResponse": swap_response,
+            "txVersion": txv,
+            "wallet": wallet_pubkey,
+            "wrapSol": bool(wrap_sol),
+            "unwrapSol": bool(unwrap_sol),
+            "inputAccount": input_account,
+            "outputAccount": output_account,
+        }
+        r = await self._http.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def _extract_tx_b64s(self, txs_payload: Dict[str, Any]) -> List[str]:
+        txs: List[str] = []
+        data = txs_payload.get("data")
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and isinstance(item.get("transaction"), str):
+                    txs.append(item["transaction"])
+                elif isinstance(item, str):
+                    txs.append(item)
+            return txs
+
+        if isinstance(data, dict):
+            for key in ("transaction", "transactions", "txs", "data"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict) and isinstance(item.get("transaction"), str):
+                            txs.append(item["transaction"])
+                        elif isinstance(item, str):
+                            txs.append(item)
+                    if txs:
+                        return txs
+                elif isinstance(v, str):
+                    txs.append(v)
+
+        v = txs_payload.get("transaction")
+        if isinstance(v, str):
+            txs.append(v)
+
+        return txs
+    async def _sign_and_send_b64(self, tx_b64: str) -> str:
+        """
+        Decode une TX Raydium en base64 (souvent V0), signe avec solders.Keypair,
+        puis envoie via RPC send_raw_transaction.
+        Compatible avec solana-py 0.28.x + solders.
+        """
+        import base64
+
+        from solders.transaction import VersionedTransaction
+        from solana.rpc.types import TxOpts
+
+        raw_tx = base64.b64decode(tx_b64)
+        self._info("[Raydium] tx_b64_len=%s raw_len=%s", len(tx_b64), len(raw_tx))
+
+        kp = self._get_signer_keypair()
+
+        # 1) decode V0 (VersionedTransaction)
+        vtx = VersionedTransaction.from_bytes(raw_tx)
+
+        # 2) signer le message
+        msg = vtx.message
+        # selon versions solders, bytes(msg) ou msg.serialize()
+        try:
+            msg_bytes = bytes(msg)
+        except Exception:
+            msg_bytes = msg.serialize()
+
+        sig = kp.sign_message(msg_bytes)
+
+        # 3) reconstruire tx signée
+        if hasattr(VersionedTransaction, "populate"):
+            signed = VersionedTransaction.populate(msg, [sig])
+        else:
+            signed = VersionedTransaction(msg, [sig])
+
+        # 4) envoyer raw
+        opts = TxOpts(skip_preflight=False, preflight_commitment="processed")
+        resp = await self._rpc.send_raw_transaction(bytes(signed), opts=opts)
+
+        # solana-py peut renvoyer un objet avec .value ou un dict
+        if hasattr(resp, "value"):
+            return str(resp.value)
+        if isinstance(resp, dict):
+            if "result" in resp:
+                return str(resp["result"])
+        return str(resp)
+
+
+
+    async def swap_sol_to_token(self, token_address: str, sol_amount: float, slippage_bps: Optional[int] = None) -> str:
+        wallet_pubkey = self._wallet_pubkey_str()
+        lamports = int(float(sol_amount) * 1_000_000_000)
+        slippage = int(slippage_bps if slippage_bps is not None else self.cfg.slippage_bps)
+
+        self._info("[REAL BUY] token_address=%s sol=%s slippage_bps=%s wallet=%s", token_address, sol_amount, slippage, wallet_pubkey)
+
+        quote = await self.get_quote(
+            input_mint=WSOL_MINT,
+            output_mint=token_address,
+            amount=lamports,
+            slippage_bps=slippage,
+        )
+
+        if isinstance(quote, dict) and quote.get("success") is False:
+            raise RuntimeError(f"Raydium quote failed: {quote}")
+
+        tx_payload = await self._build_transactions(
+            swap_response=quote,
+            wallet_pubkey=wallet_pubkey,
+            wrap_sol=True,
+            unwrap_sol=False,
+        )
+
+        if isinstance(tx_payload, dict) and tx_payload.get("success") is False:
+            raise RuntimeError(f"Raydium tx build failed: {tx_payload}")
+
+        txs = self._extract_tx_b64s(tx_payload)
+        if not txs:
+            raise RuntimeError(f"Raydium: aucune tx reçue: {tx_payload!r}")
+
+        if self.cfg.test_mode:
+            self._warn("[Raydium TEST] tx reçue (%d) -> pas envoyée", len(txs))
+            return "SIMULATED_TX_OK"
+
+        sig = await self._sign_and_send_b64(txs[-1])
+        self._info("[Raydium] tx envoyée: %s", sig)
+        return sig

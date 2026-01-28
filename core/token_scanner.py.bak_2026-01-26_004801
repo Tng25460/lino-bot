@@ -1,0 +1,332 @@
+from __future__ import annotations
+
+def _cfg_get(cfg, *names, default=None):
+    """Retourne cfg.<name> pour le 1er name existant, sinon default."""
+    for n in names:
+        if hasattr(cfg, n):
+            return getattr(cfg, n)
+    return default
+
+
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LinoBot/1.0",
+}
+
+from core.quality import rank_and_filter
+
+
+def _dex_metrics_from_pair(pair: dict) -> dict:
+    """
+    Extrait des métriques Dexscreener de manière SAFE.
+    Retourne des champs optionnels:
+      - priceChange_5m, priceChange_1h (en %)
+      - volume_5m (USD)
+      - buys_5m, sells_5m
+    """
+    out = {}
+    try:
+        pc = (pair.get("priceChange") or {})
+        vol = (pair.get("volume") or {})
+        txns = (pair.get("txns") or {})
+        m5 = (txns.get("m5") or {})
+        out["priceChange_5m"] = float(pc.get("m5")) if pc.get("m5") is not None else None
+        out["priceChange_1h"] = float(pc.get("h1")) if pc.get("h1") is not None else None
+        out["volume_5m"] = float(vol.get("m5")) if vol.get("m5") is not None else None
+        out["buys_5m"] = int(m5.get("buys")) if m5.get("buys") is not None else None
+        out["sells_5m"] = int(m5.get("sells")) if m5.get("sells") is not None else None
+    except Exception:
+        pass
+    return out
+
+
+import asyncio
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+@dataclass
+class ScannerConfig:
+    # DexScreener (free)
+    dexscreener_base_url: str = "https://api.dexscreener.com"
+    chain_id: str = "solana"
+
+    # Loop config
+    new_listing_limit: int = 5
+    global_rps: float = 0.2
+    max_concurrency: int = 1
+
+    # Filters (applied in scanner)
+    min_liquidity_usd: float = 1000.0
+    max_market_cap_usd: float = 300000.0
+
+
+class _RateLimiter:
+    def __init__(self, rps: float) -> None:
+        self.rps = max(0.01, float(rps))
+        self._next = 0.0
+
+    async def wait(self) -> None:
+        now = time.time()
+        if self._next > now:
+            await asyncio.sleep(self._next - now)
+        self._next = time.time() + (1.0 / self.rps)
+
+
+class TokenScanner:
+    """
+    Scanner stable basé sur DexScreener (free):
+      - discovery via /token-profiles/latest/v1  (liste des derniers tokens/pairs)
+      - details via /latest/dex/tokens/{mint}
+    On retourne une liste d'overviews (dict) compatibles avec ton TradingEngine.
+    """
+
+    def __init__(self, cfg: ScannerConfig) -> None:
+        self.cfg = cfg
+        self._rl = _RateLimiter(_cfg_get(cfg, 'global_rps','GLOBAL_RPS','SCANNER_GLOBAL_RPS','SCANNER_RPS','scanner_rps','RPS', default=2.0))
+        self._client = httpx.AsyncClient(timeout=20.0, headers={"accept": "application/json"})
+
+        # Petit semaphore pour éviter d'exploser le rate limit
+        self._sem = asyncio.Semaphore(max(1, int(_cfg_get(cfg,'max_concurrency','MAX_CONCURRENCY','scanner_concurrency','CONCURRENCY', default=2))))
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    def close(self) -> None:
+        try:
+            # fallback sync
+            asyncio.get_event_loop().create_task(self.aclose())
+        except Exception:
+            pass
+
+    async def _get_json(self, url: str) -> Any:
+        async with self._sem:
+            await self._rl.wait()
+            r = await self._client.get(url, headers=DEFAULT_HEADERS)
+            r.raise_for_status()
+            return r.json()
+
+    async def _latest_profiles(self) -> List[Dict[str, Any]]:
+        # DexScreener: latest token profiles (v1)
+        url = f"{self.cfg.dexscreener_base_url}/token-profiles/latest/v1"
+        data = await self._get_json(url)
+        if not isinstance(data, list):
+            print('[DBG_DEX_EMPTY] retour [] (vérifie url/parsing)')
+        return []
+        # filter chain
+        out = [x for x in data if str(x.get("chainId", "")).lower() == self.cfg.chain_id]
+        return out
+
+    async def _overview_from_token(self, mint: str) -> Optional[Dict[str, Any]]:
+        # DexScreener: token details / pairs
+        url = f"{self.cfg.dexscreener_base_url}/latest/dex/tokens/{mint}"
+        data = await self._get_json(url)
+        pairs = data.get("pairs") if isinstance(data, dict) else None
+        if not pairs or not isinstance(pairs, list):
+            return None
+
+        # pick best pair: highest liquidity USD
+        best = None
+        best_liq = -1.0
+        for p in pairs:
+            liq = (p.get("liquidity") or {}).get("usd")
+            try:
+                liq = float(liq) if liq is not None else 0.0
+            except Exception:
+                liq = 0.0
+            if liq > best_liq:
+                best_liq = liq
+                best = p
+
+        if not best:
+            return None
+
+        # Extract metrics
+        base = best.get("baseToken") or {}
+        symbol = base.get("symbol") or ""
+        name = base.get("name") or ""
+        price_usd = best.get("priceUsd")
+        try:
+            price_usd_f = float(price_usd) if price_usd is not None else 0.0
+        except Exception:
+            price_usd_f = 0.0
+
+        liq_usd = best_liq
+
+        # DexScreener uses fdv (fully diluted valuation) often; treat as "marketcap proxy"
+        fdv = best.get("fdv")
+        try:
+            mcap = float(fdv) if fdv is not None else 0.0
+        except Exception:
+            mcap = 0.0
+
+        # Apply filters here (so TradingEngine receives only candidates)
+        if liq_usd < float(self.cfg.min_liquidity_usd):
+            return None
+        if mcap > 0 and mcap > float(self.cfg.max_market_cap_usd):
+            return None
+
+        # Build overview compatible-ish with your logs/engine
+        ov: Dict[str, Any] = {
+            "mint": mint,
+            "token": mint,
+            "symbol": symbol,
+            "name": name,
+            "price_usd": price_usd_f,
+            "liquidity_usd": liq_usd,
+            "marketcap_usd": mcap,
+            "data": {"liquidity": liq_usd, "marketCap": mcap, "price": price_usd_f},
+            "source": "dexscreener",
+            "pair_address": best.get("pairAddress"),
+            "dex_id": best.get("dexId"),
+            "url": best.get("url"),
+        }
+        # --- REAL mode: keep only Raydium pools (executor REAL=Raydium) ---
+        mode = (os.getenv('MODE') or os.getenv('TRADING_MODE') or 'REAL').upper().strip()
+        if mode == 'REAL':
+            dex = (ov.get('dex_id') or ov.get('dex') or '').lower().strip()
+            if dex and dex != 'raydium':
+                return None
+
+        return ov
+
+    async def scan_once_async(self) -> List[Dict[str, Any]]:
+        try:
+            profiles = await self._latest_profiles()
+        except Exception as e:
+            # FAIL-SOFT: si DexScreener/DNS tombe, on ne stoppe pas le bot
+            try:
+                self.logger.warning('[TokenScanner] dexscreener error (fail-soft): %s', e)
+            except Exception:
+                pass
+            print('[DBG_DEX_EMPTY] retour [] (vérifie url/parsing)')
+        return []
+# Take latest N
+        profiles = profiles[: int(self.cfg.new_listing_limit)]
+        mints: List[str] = []
+        for x in profiles:
+            addr = x.get("tokenAddress") or x.get("address")
+            if addr and isinstance(addr, str):
+                mints.append(addr)
+
+        # Dedup while preserving order
+        seen = set()
+        mints2 = []
+        for m in mints:
+            if m not in seen:
+                seen.add(m)
+                mints2.append(m)
+
+        out: List[Dict[str, Any]] = []
+        for mint in mints2:
+            try:
+                ov = await self._overview_from_token(mint)
+                if ov:
+                    out.append(ov)
+            except Exception:
+                # ignore per-token errors
+                continue
+
+        return out
+
+
+async def _dex_search(session, q: str):
+    # Endpoint identique à ton curl (important: /search/?q=...)
+    url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
+    async with session.get(url, headers=DEFAULT_HEADERS, timeout=20) as r:
+        status = r.status
+        raw = await r.text()
+        if status != 200:
+            return {"_status": status, "_raw_len": len(raw), "pairs": []}
+        try:
+            j = await r.json(content_type=None)
+        except Exception:
+            return {"_status": status, "_raw_len": len(raw), "pairs": []}
+        j["_status"] = status
+        j["_raw_len"] = len(raw)
+        return j
+
+
+    async def get_overviews(self):
+        """Retourne une liste d'overviews (pairs) depuis le scanner.
+        Fallback: DexScreener search (rapide) si la source principale renvoie vide.
+        """
+        # 1) si une méthode interne existe déjà, on la tente
+        for name in ("scan", "scan_pairs", "fetch_pairs", "fetch", "run", "get_pairs", "overviews"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                try:
+                    out = fn()
+                    if hasattr(out, "__await__"):
+                        out = await out
+                    if out:
+                        return out
+                except Exception:
+                    pass
+
+        # 2) Fallback DexScreener search
+        try:
+            import aiohttp
+        except Exception:
+            return []
+
+        chain = _cfg_get(self.cfg, "SCANNER_CHAIN", "scanner_chain", default="solana")
+        dexs  = _cfg_get(self.cfg, "SCANNER_DEXES", "scanner_dexes", default=["raydium","pumpfun"]) or []
+        queries = _cfg_get(self.cfg, "SCANNER_QUERIES", "scanner_queries", default=["pump","raydium","sol","bonk"]) or []
+        limit = int(_cfg_get(self.cfg, "MAX_CANDIDATES_PER_LOOP","max_candidates_per_loop", default=30))
+
+        # petits filtres qualité (tu pourras ajuster dans settings.py)
+        min_liq = float(_cfg_get(self.cfg, "MIN_LIQUIDITY_USD","min_liquidity_usd", default=5000))
+        min_vol = float(_cfg_get(self.cfg, "MIN_VOLUME_M5_USD","min_volume_m5_usd", default=2000))
+        min_tx  = int(_cfg_get(self.cfg, "MIN_TXNS_M5","min_txns_m5", default=20))
+
+        pairs = []
+        async with aiohttp.ClientSession() as session:
+            for q in queries:
+                got = await _dex_search(session, q)
+                if got:
+                    pairs.extend(got)
+
+        # normalize + filter
+        uniq = {}
+        for x in pairs:
+            if not isinstance(x, dict):
+                continue
+            if (x.get("chainId") or "").lower() != str(chain).lower():
+                continue
+            dex = (x.get("dexId") or "").lower()
+            if dexs and dex not in [d.lower() for d in dexs]:
+                continue
+
+            liq = (x.get("liquidity") or {}).get("usd") or 0
+            volm5 = (x.get("volume") or {}).get("m5") or 0
+            txm5 = (x.get("txns") or {}).get("m5") or {}
+            buys = int(txm5.get("buys") or 0)
+            sells = int(txm5.get("sells") or 0)
+            txns = buys + sells
+
+            if liq < min_liq:
+                continue
+            if volm5 < min_vol:
+                continue
+            if txns < min_tx:
+                continue
+
+            key = x.get("pairAddress") or x.get("url") or (x.get("baseToken") or {}).get("address")
+            if not key:
+                continue
+            # keep best by volm5
+            prev = uniq.get(key)
+            if (prev is None) or ((prev.get("volume") or {}).get("m5") or 0) < volm5:
+                uniq[key] = x
+
+        out = list(uniq.values())
+        # sort by volume m5 then liquidity
+        out.sort(key=lambda z: ((z.get("volume") or {}).get("m5") or 0, (z.get("liquidity") or {}).get("usd") or 0), reverse=True)
+        return out[:limit]
+

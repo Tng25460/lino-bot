@@ -1,0 +1,5 @@
+{
+  "ts": 1769606231,
+  "kind": "swap_exc",
+  "error": "cannot access local variable 'time' where it is not associated with a value"
+}

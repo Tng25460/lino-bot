@@ -1,0 +1,2212 @@
+
+
+========================
+FILE: src/main.py
+========================
+     1	from __future__ import annotations
+     2	
+     3	import asyncio
+     4	import os
+     5	import sys
+     6	from typing import Any, Dict, List
+     7	
+     8	# Assure les imports "core.*" et "config.*"
+     9	PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    10	from dotenv import load_dotenv
+    11	# Auto-load env (API keys, base URLs)
+    12	try:
+    13	    load_dotenv(os.path.join(PROJECT_ROOT, '.env.real'), override=True)
+    14	except Exception:
+    15	    pass
+    16	
+    17	if PROJECT_ROOT not in sys.path:
+    18	    sys.path.insert(0, PROJECT_ROOT)
+    19	
+    20	from config import settings
+    21	from core.logger import get_logger
+    22	from core.wallet import Wallet
+    23	from core.risk_checks import RiskChecker
+    24	from core.trading import TradingEngine
+    25	from core.token_scanner import TokenScanner, ScannerConfig
+    26	
+    27	
+    28	ASCII_LINO = r"""
+    29	██╗     ██╗███╗   ██╗ ██████╗
+    30	██║     ██║████╗  ██║██╔═══██╗
+    31	██║     ██║██╔██╗ ██║██║   ██║
+    32	██║     ██║██║╚██╗██║██║   ██║
+    33	███████╗██║██║ ╚████║╚██████╔╝
+    34	╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝
+    35	L I N O   B O T
+    36	"""
+    37	
+    38	
+    39	def _get_float(name: str, default: float) -> float:
+    40	    v = os.getenv(name)
+    41	    if not v:
+    42	        return default
+    43	    try:
+    44	        return float(v)
+    45	    except Exception:
+    46	        return default
+    47	
+    48	
+    49	async def run_loop() -> None:
+    50	    logger = get_logger()
+    51	
+    52	    logger.info(f"Bot Lino démarré en mode {settings.MODE}")
+    53	    logger.info(ASCII_LINO)
+    54	
+    55	    wallet = Wallet()
+    56	    logger.info(f"[WALLET] Loaded keypair with pubkey: {wallet.pubkey()}")
+    57	
+    58	    risks = RiskChecker()
+    59	
+    60	    engine = TradingEngine(
+    61	        wallet=wallet,
+    62	        logger=logger,
+    63	        positions_file=os.path.join(PROJECT_ROOT, "positions.json"),
+    64	        mode=settings.MODE,
+    65	    )
+    66	
+    67	    # -------- Scanner --------
+    68	    # -------- Jupiter API KEY (ne doit plus bloquer le bot) --------
+    69	    # On accepte plusieurs noms pour éviter "on me redemande la clé"
+    70	    jup_key = (
+    71	        os.getenv("JUPITER_API_KEY")
+    72	        or os.getenv("JUP_API_KEY")
+    73	        or os.getenv("JUPITER_KEY")
+    74	        or getattr(settings, "JUPITER_API_KEY", "")
+    75	        or getattr(settings, "JUP_API_KEY", "")
+    76	    )
+    77	    if not jup_key:
+    78	        logger.warning("[WARN] Aucune clé Jupiter trouvée. Le bot continue (scanner DexScreener OK), mais swaps/quotes Jupiter peuvent échouer.")
+    79	
+    80	    cfg = ScannerConfig(
+    81	        new_listing_limit=int(getattr(settings, "NEW_LISTING_LIMIT", 5)),
+    82	        global_rps=float(getattr(settings, "GLOBAL_RPS", 0.2)),
+    83	        max_concurrency=int(getattr(settings, "MAX_CONCURRENCY", 1)),
+    84	        min_liquidity_usd=_get_float("MIN_LIQUIDITY_USD", 1000.0),
+    85	        max_market_cap_usd=_get_float("MAX_MARKET_CAP_USD", 300000.0),
+    86	    )
+    87	
+    88	    scanner = TokenScanner(cfg)
+    89	    logger.info(
+    90	        f"[Scanner] ✅ limit={getattr(cfg, "new_listing_limit", getattr(cfg, "scan_limit", 30))} rps={cfg.global_rps} conc={cfg.max_concurrency}"
+    91	    )
+    92	
+    93	    try:
+    94	        while True:
+    95	            try:
+    96	                overviews: List[Dict[str, Any]] = await scanner.scan_once_async()
+    97	                logger.info(f"[DBG_OV] {overviews[:2]}")
+    98	                logger.info(f"[Main] overviews reçus: {len(overviews)}")
+    99	            except Exception as e:
+   100	                logger.error(f"[Token=***MASKED***
+   101	                overviews = []
+   102	
+   103	            # 🔥 TOUJOURS appeler l’engine, même si overviews est vide
+   104	            logger.info(
+   105	                f"[DBG_MAIN_BEFORE_ENGINE] calling engine.on_overviews n={len(overviews)}"
+   106	            )
+   107	            await engine.on_overviews(overviews, risks)
+   108	
+   109	            await asyncio.sleep(getattr(settings, "SCAN_INTERVAL_SECONDS", 25))
+   110	
+   111	    except KeyboardInterrupt:
+   112	        logger.info("Arrêt demandé (CTRL+C).")
+   113	    finally:
+   114	        try:
+   115	            await scanner.aclose()
+   116	        except Exception:
+   117	            pass
+   118	        logger.info("Bot Lino arrêté.")
+   119	
+   120	
+   121	def main() -> None:
+   122	    logger = get_logger()
+   123	    try:
+   124	        asyncio.run(run_loop())
+   125	    except Exception as e:
+   126	        logger.error(f"[MAIN ERROR] {e}", exc_info=True)
+   127	        logger.info("Bot Lino arrêté.")
+   128	
+   129	
+   130	if __name__ == "__main__":
+   131	    main()
+
+
+========================
+FILE: src/config.py
+========================
+     1	import os
+     2	from dataclasses import dataclass
+     3	from pathlib import Path
+     4	
+     5	def _env_bool(name: str, default: str = "0") -> bool:
+     6	    return (os.getenv(name, default) or "").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+     7	
+     8	def _mask(s: str, keep: int = 6) -> str:
+     9	    s = (s or "").strip()
+    10	    if not s:
+    11	        return ""
+    12	    if len(s) <= keep:
+    13	        return s
+    14	    return s[:keep] + "..."
+    15	
+    16	
+    17	@dataclass(frozen=True)
+    18	class Settings:
+    19	    mints_found_path: Path
+    20	    ready_path: Path
+    21	    db_path: Path
+    22	
+    23	    jup_base: str
+    24	    jup_api_key: str
+    25	    rpc_http: str
+    26	
+    27	    input_mint: str
+    28	    amount: int
+    29	    slippage_bps: int
+    30	    max_price_impact_pct: float
+    31	
+    32	    dry_run: bool
+    33	    one_shot: bool
+    34	    confirm_send: bool
+    35	
+    36	    poll_s: float
+    37	
+    38	    def safe_summary(self) -> str:
+    39	        return (
+    40	            f"paths: mints_found={self.mints_found_path} ready={self.ready_path} db={self.db_path}\n"
+    41	            f"jup_base={self.jup_base} api_key=***MASKED***
+    42	            f"rpc_http={self.rpc_http}\n"
+    43	            f"input_mint={self.input_mint}\n"
+    44	            f"amount={self.amount} slippage_bps={self.slippage_bps} max_pi={self.max_price_impact_pct}\n"
+    45	            f"dry_run={self.dry_run} one_shot={self.one_shot} confirm_send={self.confirm_send}\n"
+    46	            f"poll_s={self.poll_s}"
+    47	        )
+    48	
+    49	
+    50	def get_settings() -> Settings:
+    51	    usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    52	
+    53	    mints_found = Path(os.getenv("MINTS_FOUND_PATH", "mints_found.json"))
+    54	    ready_path = Path(os.getenv("READY_PATH", "ready_to_trade.jsonl"))
+    55	    db_path = Path(os.getenv("TRADER_DB_PATH", "state/trades.sqlite"))
+    56	
+    57	    jup_base = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+    58	    jup_api_key=***MASKED***
+    59	    rpc_http = (os.getenv("SOLANA_RPC_HTTP") or "https://api.mainnet-beta.solana.com").strip()
+    60	
+    61	    input_mint = (os.getenv("TRADER_INPUT_MINT") or usdc).strip()
+    62	    amount = int(os.getenv("TRADER_AMOUNT", "1000000"))        # 1 USDC (base units)
+    63	    slippage_bps = int(os.getenv("TRADER_SLIPPAGE_BPS", "50")) # 0.50%
+    64	    max_pi = float(os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", "5.0"))
+    65	
+    66	    dry_run = _env_bool("TRADER_DRY_RUN", "1")
+    67	    one_shot = _env_bool("TRADER_ONE_SHOT", "0")
+    68	
+    69	    confirm_send = (os.getenv("TRADER_CONFIRM") or "").strip().upper() == "YES"
+    70	    poll_s = float(os.getenv("TRADER_POLL_S", "1.0"))
+    71	
+    72	    db_path.parent.mkdir(parents=True, exist_ok=True)
+    73	
+    74	    return Settings(
+    75	        mints_found_path=mints_found,
+    76	        ready_path=ready_path,
+    77	        db_path=db_path,
+    78	        jup_base=jup_base,
+    79	        jup_api_key=***MASKED***
+    80	        rpc_http=rpc_http,
+    81	        input_mint=input_mint,
+    82	        amount=amount,
+    83	        slippage_bps=slippage_bps,
+    84	        max_price_impact_pct=max_pi,
+    85	        dry_run=dry_run,
+    86	        one_shot=one_shot,
+    87	        confirm_send=confirm_send,
+    88	        poll_s=poll_s,
+    89	    )
+
+
+========================
+FILE: src/trader_loop.py
+========================
+     1	import os
+     2	import time
+     3	import subprocess
+     4	from pathlib import Path
+     5	
+     6	def trader_loop():
+     7	    sleep_s = float(os.getenv("LOOP_SLEEP_S", os.getenv("SCAN_INTERVAL_SECONDS", "12")))
+     8	    max_trades_per_hour = int(os.getenv("LOOP_MAX_TRADES_PER_HOUR", "6"))
+     9	    cooldown_s = int(os.getenv("LOOP_COOLDOWN_MINT_S", "1800"))
+    10	
+    11	    one_shot = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1","true","yes","on")
+    12	
+    13	    print("🧠 trader_loop (universe_builder -> exec -> sign -> send)")
+    14	    print("   sleep_s=", sleep_s, "max_trades/h=", max_trades_per_hour, "cooldown_s=", cooldown_s)
+    15	
+    16	    # NOTE: on garde ta logique existante "ready_to_trade.jsonl"
+    17	    # Ici on fait simple: on construit/execute 1 trade par tick via trader_exec.py
+    18	    tries = 0
+    19	    while True:
+    20	        tries += 1
+    21	
+    22	        # call trader_exec
+    23	        try:
+    24	            proc = subprocess.run(
+    25	                ["python", "src/trader_exec.py"],
+    26	                check=False,
+    27	                capture_output=False,
+    28	                text=True,
+    29	            )
+    30	        except Exception as e:
+    31	            print("❌ trader_loop cannot run trader_exec:", e)
+    32	
+    33	        if one_shot:
+    34	            print("🧪 ONE_SHOT=1 -> stop after one iteration")
+    35	            return
+    36	
+    37	        time.sleep(sleep_s)
+
+
+========================
+FILE: src/trader_jup.py
+========================
+     1	import asyncio
+     2	import base64
+     3	import json
+     4	import os
+     5	import time
+     6	from pathlib import Path
+     7	from typing import Any, Dict, Optional, List
+     8	
+     9	import aiohttp
+    10	
+    11	
+    12	READY_PATH = Path(os.getenv("READY_PATH", "ready_to_trade.jsonl"))
+    13	STATE_PATH = Path(os.getenv("TRADER_STATE_PATH", "trader_state.json"))
+    14	
+    15	JUP_BASE = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+    16	JUP_API_KEY=***MASKED***
+    17	
+    18	# Base mint (input) = USDC par défaut
+    19	INPUT_MINT = os.getenv("TRADER_INPUT_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
+    20	
+    21	# 1 USDC = 1_000_000 (base units)
+    22	AMOUNT = int(os.getenv("TRADER_AMOUNT", "1000000"))
+    23	
+    24	# slippage en bps (50 = 0.50%)
+    25	SLIPPAGE_BPS = int(os.getenv("TRADER_SLIPPAGE_BPS", "50"))
+    26	
+    27	# polling
+    28	POLL_S = float(os.getenv("TRADER_POLL_S", "1.0"))
+    29	
+    30	# test guards
+    31	MAX_PRICE_IMPACT_PCT = float(os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", "5.0"))
+    32	
+    33	# Par défaut: QUOTE only
+    34	BUILD_SWAP_TX = os.getenv("TRADER_BUILD_SWAP_TX", "0") == "1"
+    35	
+    36	# Pour build une swap tx, il faut un userPublicKey
+    37	USER_PUBLIC_KEY = (os.getenv("TRADER_USER_PUBLIC_KEY") or "").strip()
+    38	
+    39	# ignore obvious bases
+    40	IGNORE_MINTS = {
+    41	    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    42	    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    43	}
+    44	
+    45	LAST_TX_B64_PATH = Path(os.getenv("TRADER_LAST_TX_B64_PATH", "last_swap_tx.b64"))
+    46	
+    47	
+    48	def _jup_headers() -> Dict[str, str]:
+    49	    h = {"accept": "application/json"}
+    50	    if JUP_API_KEY:
+    51	        h["x-api-key"] = JUP_API_KEY
+    52	    return h
+    53	
+    54	
+    55	def load_state() -> Dict[str, Any]:
+    56	    if not STATE_PATH.exists():
+    57	        return {"last_ts": 0}
+    58	    try:
+    59	        return json.loads(STATE_PATH.read_text(encoding="utf-8") or "{}") or {"last_ts": 0}
+    60	    except Exception:
+    61	        return {"last_ts": 0}
+    62	
+    63	
+    64	def save_state(st: Dict[str, Any]) -> None:
+    65	    try:
+    66	        STATE_PATH.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    67	    except Exception:
+    68	        pass
+    69	
+    70	
+    71	def is_valid_mint(m: str) -> bool:
+    72	    # garde simple (évite les 400 Jupiter sur des strings fake)
+    73	    return isinstance(m, str) and 32 <= len(m) <= 60 and " " not in m
+    74	
+    75	
+    76	def parse_jsonl(path: Path) -> List[Dict[str, Any]]:
+    77	    if not path.exists():
+    78	        return []
+    79	    out: List[Dict[str, Any]] = []
+    80	    for line in path.read_text(encoding="utf-8").splitlines():
+    81	        line = line.strip()
+    82	        if not line:
+    83	            continue
+    84	        try:
+    85	            obj = json.loads(line)
+    86	            if isinstance(obj, dict):
+    87	                out.append(obj)
+    88	        except Exception:
+    89	            continue
+    90	    return out
+    91	
+    92	
+    93	async def jup_quote(session: aiohttp.ClientSession, out_mint: str) -> Optional[Dict[str, Any]]:
+    94	    url = f"{JUP_BASE}/swap/v1/swap/v1/quote"
+    95	    params = {
+    96	        "inputMint": INPUT_MINT,
+    97	        "outputMint": out_mint,
+    98	        "amount": str(AMOUNT),
+    99	        "slippageBps": str(SLIPPAGE_BPS),
+   100	        "onlyDirectRoutes": "false",
+   101	    }
+   102	    try:
+   103	        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
+   104	            txt = await r.text()
+   105	            if r.status != 200:
+   106	                print(f"[JUP][HTTP {r.status}] {txt[:400]}")
+   107	                return None
+   108	            return json.loads(txt)
+   109	    except Exception as e:
+   110	        print(f"[JUP][quote] err={e}")
+   111	        return None
+   112	
+   113	
+   114	def quote_is_ok(q: Dict[str, Any]) -> (bool, str):
+   115	    try:
+   116	        pi = q.get("priceImpactPct")
+   117	        # parfois string / parfois float
+   118	        pi_f = float(pi) if pi is not None else 0.0
+   119	        if pi_f * 100.0 > MAX_PRICE_IMPACT_PCT:
+   120	            return False, f"priceImpactPct={pi} > {MAX_PRICE_IMPACT_PCT}%"
+   121	        out_amt = q.get("outAmount")
+   122	        if not out_amt:
+   123	            return False, "no outAmount"
+   124	        return True, "ok"
+   125	    except Exception as e:
+   126	        return False, f"quote_parse_error={e}"
+   127	
+   128	
+   129	def summarize_route(q: Dict[str, Any]) -> str:
+   130	    out_amt = q.get("outAmount")
+   131	    pi = q.get("priceImpactPct")
+   132	    rp = q.get("routePlan") or []
+   133	    hops = len(rp) if isinstance(rp, list) else 0
+   134	    first = ""
+   135	    last = ""
+   136	    try:
+   137	        if hops >= 1:
+   138	            first = str((rp[0] or {}).get("swapInfo", {}).get("label") or "")
+   139	            last = str((rp[-1] or {}).get("swapInfo", {}).get("label") or "")
+   140	    except Exception:
+   141	        pass
+   142	    return f"outAmount={out_amt} priceImpactPct={pi} hops={hops} first={first} last={last}"
+   143	
+   144	
+   145	async def jup_build_swap_tx(session: aiohttp.ClientSession, quote: Dict[str, Any], user_pubkey: str) -> Optional[str]:
+   146	    """
+   147	    Build swap tx (base64) using Jupiter swap endpoint.
+   148	    DOES NOT send it.
+   149	    """
+   150	    url = f"{JUP_BASE}/swap/v1/swap"
+   151	    body = {
+   152	        "quoteResponse": quote,
+   153	        "userPublicKey": user_pubkey,
+   154	        "wrapAndUnwrapSol": True,
+   155	        "dynamicComputeUnitLimit": True,
+   156	        "prioritizationFeeLamports": "auto",
+   157	    }
+   158	    try:
+   159	        async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=25)) as r:
+   160	            txt = await r.text()
+   161	            if r.status != 200:
+   162	                print(f"[JUP][SWAP_BUILD][HTTP {r.status}] {txt[:400]}")
+   163	                return None
+   164	            j = json.loads(txt)
+   165	            tx_b64 = j.get("swapTransaction")
+   166	            if not tx_b64:
+   167	                print("[JUP][SWAP_BUILD] missing swapTransaction")
+   168	                return None
+   169	            return str(tx_b64)
+   170	    except Exception as e:
+   171	        print(f"[JUP][swap_build] err={e}")
+   172	        return None
+   173	
+   174	
+   175	async def main():
+   176	    print("🚀 trader_jup démarré (TEST)")
+   177	    print(f"   ready_file={READY_PATH}")
+   178	    print(f"   jup_base={JUP_BASE}")
+   179	    print(f"   input_mint={INPUT_MINT}")
+   180	    print(f"   amount={AMOUNT} slippage_bps={SLIPPAGE_BPS}")
+   181	    print(f"   max_price_impact={MAX_PRICE_IMPACT_PCT}%")
+   182	    print(f"   build_swap_tx={BUILD_SWAP_TX}")
+   183	    if BUILD_SWAP_TX:
+   184	        print(f"   user_pubkey={(USER_PUBLIC_KEY[:6] + '...' + USER_PUBLIC_KEY[-6:]) if USER_PUBLIC_KEY else '(missing)'}")
+   185	
+   186	    st = load_state()
+   187	    last_ts = int(st.get("last_ts") or 0)
+   188	
+   189	    async with aiohttp.ClientSession(headers=_jup_headers()) as session:
+   190	        while True:
+   191	            rows = parse_jsonl(READY_PATH)
+   192	
+   193	            # traite uniquement les nouveaux (ts > last_ts)
+   194	            new_rows = [r for r in rows if int(r.get("ts") or 0) > last_ts]
+   195	            new_rows.sort(key=lambda r: int(r.get("ts") or 0))
+   196	
+   197	            for r in new_rows:
+   198	                ts = int(r.get("ts") or 0)
+   199	                mint = str(r.get("mint") or "")
+   200	                creator = str(r.get("creator") or "")
+   201	                pump_sig = str(r.get("pump_sig") or "")
+   202	                mint_sig = str(r.get("mint_sig") or "")
+   203	
+   204	                print(f"\n🆕 READY: mint={mint} creator={creator} ts={ts}")
+   205	                if not is_valid_mint(mint):
+   206	                    print("   ⏭️  SKIP (invalid mint format)")
+   207	                    last_ts = max(last_ts, ts)
+   208	                    save_state({"last_ts": last_ts})
+   209	                    continue
+   210	                if mint in IGNORE_MINTS:
+   211	                    print("   ⏭️  SKIP (ignored mint)")
+   212	                    last_ts = max(last_ts, ts)
+   213	                    save_state({"last_ts": last_ts})
+   214	                    continue
+   215	                if mint == INPUT_MINT:
+   216	                    print("   ⏭️  SKIP (output == input)")
+   217	                    last_ts = max(last_ts, ts)
+   218	                    save_state({"last_ts": last_ts})
+   219	                    continue
+   220	
+   221	                q = await jup_quote(session, mint)
+   222	                if not q:
+   223	                    print("   ❌ quote failed")
+   224	                    last_ts = max(last_ts, ts)
+   225	                    save_state({"last_ts": last_ts})
+   226	                    continue
+   227	
+   228	                ok, reason = quote_is_ok(q)
+   229	                print("   📌 route:", summarize_route(q))
+   230	                if not ok:
+   231	                    print(f"   🛑 QUOTE NOT OK: {reason}")
+   232	                    last_ts = max(last_ts, ts)
+   233	                    save_state({"last_ts": last_ts})
+   234	                    continue
+   235	
+   236	                print(f"   ✅ QUOTE OK -> candidate trade mint={mint} pump_sig={pump_sig} mint_sig={mint_sig}")
+   237	
+   238	                if BUILD_SWAP_TX:
+   239	                    if not USER_PUBLIC_KEY:
+   240	                        print("   ⚠️ build_swap_tx=1 mais TRADER_USER_PUBLIC_KEY est vide -> skip build")
+
+
+========================
+FILE: src/trader_exec.py
+========================
+     1	import os, json, time
+     2	from pathlib import Path
+     3	from typing import Any, Dict, List, Optional
+     4	import requests
+     5	
+     6	READY_FILE = os.getenv("TRADER_READY_FILE", "ready_to_trade.jsonl")
+     7	
+     8	JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag")).rstrip("/")
+     9	JUP_API_KEY=***MASKED***
+    10	
+    11	RPC_HTTP = os.getenv("RPC_HTTP", os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")).strip()
+    12	
+    13	SLIPPAGE_BPS = int(os.getenv("TRADER_SLIPPAGE_BPS", os.getenv("SLIPPAGE_BPS", "120")))
+    14	MAX_PRICE_IMPACT_PCT = float(os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", os.getenv("MAX_PRICE_IMPACT_PCT", "1.5")))
+    15	
+    16	ONE_SHOT = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1","true","yes","on")
+    17	DRY_RUN = os.getenv("TRADER_DRY_RUN", "1").strip().lower() in ("1","true","yes","on")
+    18	
+    19	DEFAULT_SOL_AMOUNT = float(os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")))
+    20	
+    21	OUT_TX_B64 = Path("last_swap_tx.b64")
+    22	OUT_META = Path("last_swap_meta.json")
+    23	OUT_ERR = Path("last_swap_error.json")
+    24	OUT_DBG = Path("last_swap_debug.txt")
+    25	
+    26	SOL_MINT = "So11111111111111111111111111111111111111112"
+    27	
+    28	def _headers() -> Dict[str, str]:
+    29	    h = {"accept": "application/json", "content-type": "application/json"}
+    30	    if JUP_API_KEY:
+    31	        h["x-api-key"] = JUP_API_KEY
+    32	    return h
+    33	
+    34	def _write_err(where: str, payload: Any):
+    35	    OUT_ERR.write_text(json.dumps({"where": where, "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
+    36	
+    37	def _append_dbg(s: str):
+    38	    OUT_DBG.write_text((OUT_DBG.read_text(encoding="utf-8") if OUT_DBG.exists() else "") + s + "\n", encoding="utf-8")
+    39	
+    40	def _load_ready() -> List[Dict[str, Any]]:
+    41	    p = Path(READY_FILE)
+    42	    if not p.exists():
+    43	        return []
+    44	    arr: List[Dict[str, Any]] = []
+    45	    for ln in p.read_text(encoding="utf-8").splitlines():
+    46	        ln = ln.strip()
+    47	        if not ln:
+    48	            continue
+    49	        try:
+    50	            obj = json.loads(ln)
+    51	            if isinstance(obj, dict):
+    52	                arr.append(obj)
+    53	        except Exception:
+    54	            continue
+    55	    return arr
+    56	
+    57	def _pick_user_pubkey() -> str:
+    58	    for k in ("WALLET_PUBKEY","TRADER_USER_PUBLIC_KEY","TRADER_USER_PUBKEY","USER_PUBKEY","PUBLIC_KEY","WALLET_PUBLIC_KEY"):
+    59	        v = os.getenv(k, "").strip()
+    60	        if v:
+    61	            return v
+    62	    return ""
+    63	
+    64	def _lamports_from_any(x: Any) -> Optional[int]:
+    65	    try:
+    66	        if x is None:
+    67	            return None
+    68	        if isinstance(x, int):
+    69	            return int(x)
+    70	        s = str(x).strip()
+    71	        if not s:
+    72	            return None
+    73	        if "." in s:
+    74	            return int(float(s) * 1_000_000_000)  # SOL -> lamports
+    75	        return int(s)
+    76	    except Exception:
+    77	        return None
+    78	
+    79	def _get_token_amount_for_sell(mint: str) -> Optional[int]:
+    80	    """
+    81	    On lit l'amount token à vendre depuis env:
+    82	      SELL_TOKEN_AMOUNT (raw) ou SELL_TOKEN_AMOUNT_UI (ui units) + SELL_TOKEN_DECIMALS
+    83	    Minimal pour avancer sans RPC token balance.
+    84	    """
+    85	    raw = os.getenv("SELL_TOKEN_AMOUNT", "").strip()
+    86	    if raw:
+    87	        try: return int(raw)
+    88	        except Exception: pass
+    89	
+    90	    ui = os.getenv("SELL_TOKEN_AMOUNT_UI", "").strip()
+    91	    dec = os.getenv("SELL_TOKEN_DECIMALS", "").strip()
+    92	    if ui and dec:
+    93	        try:
+    94	            ui_f = float(ui)
+    95	            dec_i = int(dec)
+    96	            return int(ui_f * (10 ** dec_i))
+    97	        except Exception:
+    98	            return None
+    99	    return None
+   100	
+   101	def main() -> int:
+   102	    sell_mode = os.getenv("SELL_MODE", "0").strip().lower() in ("1","true","yes","on")
+   103	
+   104	    user_pubkey = _pick_user_pubkey()
+   105	    if not user_pubkey:
+   106	        _write_err("missing_user_pubkey", {"hint": "set WALLET_PUBKEY or TRADER_USER_PUBLIC_KEY"})
+   107	        print("❌ missing public key")
+   108	        return 0
+   109	
+   110	    _append_dbg("==== trader_exec run ====")
+   111	
+   112	    if sell_mode:
+   113	        sell_mint = os.getenv("SELL_MINT", "").strip()
+   114	        sell_fraction = float(os.getenv("SELL_FRACTION", "1.0"))
+   115	        sell_fraction = max(0.0, min(1.0, sell_fraction))
+   116	
+   117	        if not sell_mint:
+   118	            _write_err("sell_missing_mint", {})
+   119	            print("❌ SELL_MODE=1 but SELL_MINT missing")
+   120	            return 0
+   121	
+   122	        # For now: require caller to provide token raw amount.
+   123	        token=***MASKED***
+   124	        if token_amount is None:
+   125	            _write_err("sell_missing_amount", {"hint": "provide SELL_TOKEN_AMOUNT (raw integer) OR SELL_TOKEN_AMOUNT_UI + SELL_TOKEN_DECIMALS"})
+   126	            print("❌ SELL missing token amount env")
+   127	            return 0
+   128	
+   129	        # Apply fraction
+   130	        token=***MASKED***
+   131	        if token=***MASKED***
+   132	            _write_err("sell_amount_zero", {"computed": token_amount})
+   133	            print("❌ SELL computed amount <= 0")
+   134	            return 0
+   135	
+   136	        input_mint = sell_mint
+   137	        output_mint = SOL_MINT
+   138	        amount = token_amount
+   139	
+   140	        print("🚀 trader_exec SELL")
+   141	        print("   mint=", sell_mint, "fraction=", sell_fraction, "amount_raw=", amount)
+   142	        print("   jup_base=", JUP_BASE, "slippage_bps=", SLIPPAGE_BPS, "dry_run=", DRY_RUN)
+   143	
+   144	    else:
+   145	        # BUY from ready_to_trade
+   146	        print("🚀 trader_exec BUY")
+   147	        print("   ready_file=", READY_FILE)
+   148	        print("   jup_base=", JUP_BASE)
+   149	        print("   rpc_http=", RPC_HTTP)
+   150	        print("   input_mint=", SOL_MINT)
+   151	        print("   slippage_bps=", SLIPPAGE_BPS, "max_price_impact=", f"{MAX_PRICE_IMPACT_PCT}%")
+   152	        print("   one_shot=", ONE_SHOT, "dry_run=", DRY_RUN)
+   153	
+   154	        ready = _load_ready()
+   155	        print("   ready_count=", len(ready))
+   156	        if not ready:
+   157	            _write_err("no_ready_candidates", {"ready_file": READY_FILE})
+   158	            print("⚠️ ready_to_trade vide")
+   159	            return 0
+   160	
+   161	        cand = ready[0]
+   162	        output_mint = (cand.get("outputMint") or cand.get("mint") or "").strip()
+   163	        if not output_mint:
+   164	            _write_err("bad_candidate_no_mint", {"candidate": cand})
+   165	            print("⚠️ candidate sans mint/outputMint")
+   166	            return 0
+   167	
+   168	        amount = _lamports_from_any(cand.get("amount"))
+   169	        if amount is None:
+   170	            amount = int(DEFAULT_SOL_AMOUNT * 1_000_000_000)
+   171	
+   172	        input_mint = SOL_MINT
+   173	        print("   pick=", output_mint, "amount_lamports=", amount)
+   174	
+   175	    # QUOTE
+   176	    qurl = f"{JUP_BASE}/swap/v1/quote"
+   177	    params = {
+   178	        "inputMint": input_mint,
+   179	        "outputMint": output_mint,
+   180	        "amount": str(amount),
+   181	        "slippageBps": str(SLIPPAGE_BPS),
+   182	    }
+   183	    try:
+   184	        qr = requests.get(qurl, params=params, headers=_headers(), timeout=25)
+   185	        _append_dbg("QUOTE_URL=" + qr.url)
+   186	        _append_dbg("QUOTE_STATUS=" + str(qr.status_code))
+   187	        _append_dbg("QUOTE_BODY=" + (qr.text[:2000] if qr.text else ""))
+   188	        if qr.status_code != 200:
+   189	            _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
+   190	            print("❌ quote failed http=", qr.status_code)
+   191	            return 0
+   192	        quote = qr.json()
+   193	    except Exception as e:
+   194	        _write_err("quote_exc", {"error": str(e)})
+   195	        print("❌ quote exception:", e)
+   196	        return 0
+   197	
+   198	    # SWAP build
+   199	    surl = f"{JUP_BASE}/swap/v1/swap"
+   200	    body = {"quoteResponse": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": True}
+   201	
+   202	    try:
+   203	        sr = requests.post(surl, headers=_headers(), json=body, timeout=35)
+   204	        _append_dbg("SWAP_STATUS=" + str(sr.status_code))
+   205	        _append_dbg("SWAP_BODY=" + (sr.text[:2000] if sr.text else ""))
+   206	        if sr.status_code != 200:
+   207	            _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
+   208	            print("❌ swap build failed http=", sr.status_code)
+   209	            return 0
+   210	        swap = sr.json()
+   211	        txb64 = swap.get("swapTransaction")
+   212	        if not txb64:
+   213	            _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
+   214	            print("⚠️ swap response sans swapTransaction")
+   215	            return 0
+   216	
+   217	        OUT_TX_B64.write_text(txb64, encoding="utf-8")
+   218	        OUT_META.write_text(json.dumps({
+   219	            "ts": int(time.time()),
+   220	            "mode": "SELL" if sell_mode else "BUY",
+   221	            "inputMint": input_mint,
+   222	            "outputMint": output_mint,
+   223	            "amount": amount,
+   224	            "slippageBps": SLIPPAGE_BPS,
+   225	            "userPublicKey": user_pubkey,
+   226	        }, ensure_ascii=False, indent=2), encoding="utf-8")
+   227	
+   228	        print("✅ built tx -> last_swap_tx.b64")
+   229	        return 0
+   230	
+   231	    except Exception as e:
+   232	        _write_err("swap_exc", {"error": str(e)})
+   233	        print("❌ swap exception:", e)
+   234	        return 0
+   235	
+   236	if __name__ == "__main__":
+   237	    raise SystemExit(main())
+
+
+========================
+FILE: src/trader_sign.py
+========================
+     1	import base64
+     2	import json
+     3	import os
+     4	from pathlib import Path
+     5	
+     6	# Inputs
+     7	IN_TX_B64_PATH = Path(os.getenv("TRADER_LAST_TX_B64_PATH", "last_swap_tx.b64"))
+     8	KEYPAIR=***MASKED***
+     9	
+    10	# Outputs
+    11	OUT_SIGNED_TX_B64_PATH = Path(os.getenv("TRADER_SIGNED_TX_B64_PATH", "last_swap_tx.signed.b64"))
+    12	
+    13	def load_keypair_bytes(path: Path) -> bytes:
+    14	    data = json.loads(path.read_text(encoding="utf-8"))
+    15	    if not isinstance(data, list) or len(data) < 64:
+    16	        raise ValueError("keypair.json invalide: attendu une liste de 64 ints")
+    17	    return bytes(int(x) & 0xFF for x in data[:64])
+    18	
+    19	def main() -> None:
+    20	    if not IN_TX_B64_PATH.exists():
+    21	        raise SystemExit(f"❌ input tx missing: {IN_TX_B64_PATH}")
+    22	    if not KEYPAIR_PATH.exists():
+    23	        raise SystemExit(f"❌ keypair missing: {KEYPAIR_PATH}")
+    24	
+    25	    try:
+    26	        from solders.keypair import Keypair
+    27	        from solders.transaction import VersionedTransaction
+    28	    except Exception as e:
+    29	        raise SystemExit(
+    30	            "❌ solders manquant. Fais:\n"
+    31	            "   pip install -U solders\n"
+    32	            f"   err={e}"
+    33	        )
+    34	
+    35	    tx_b64 = IN_TX_B64_PATH.read_text(encoding="utf-8").strip()
+    36	    raw = base64.b64decode(tx_b64)
+    37	
+    38	    kp = Keypair.from_bytes(load_keypair_bytes(KEYPAIR_PATH))
+    39	
+    40	    # Parse unsigned tx
+    41	    tx = VersionedTransaction.from_bytes(raw)
+    42	
+    43	    # ✅ SIGN PROPERLY: rebuild a new VersionedTransaction using the same message + signer
+    44	    # This ensures signatures array length matches numRequiredSignatures.
+    45	    signed_tx = VersionedTransaction(tx.message, [kp])
+    46	
+    47	    signed_raw = bytes(signed_tx)
+    48	    signed_b64 = base64.b64encode(signed_raw).decode("utf-8")
+    49	
+    50	    OUT_SIGNED_TX_B64_PATH.write_text(signed_b64, encoding="utf-8")
+    51	
+    52	    # txid = first signature (base58)
+    53	    import base58
+    54	    sig0 = base58.b58encode(bytes(signed_tx.signatures[0])).decode("utf-8")
+    55	
+    56	    print("✅ SIGN OK")
+    57	    print("   in :", str(IN_TX_B64_PATH))
+    58	    print("   out:", str(OUT_SIGNED_TX_B64_PATH))
+    59	    print("   tx_bytes:", len(raw))
+    60	    print("   signed_bytes:", len(signed_raw))
+    61	    print("   txid(sig0):", sig0)
+    62	    print("   signer pubkey:", str(kp.pubkey()))
+    63	
+    64	if __name__ == "__main__":
+    65	    main()
+
+
+========================
+FILE: src/trader_send.py
+========================
+     1	import base64
+     2	import json
+     3	import os
+     4	import sqlite3
+     5	import time
+     6	from pathlib import Path
+     7	
+     8	import requests
+     9	
+    10	from src.price_feed import get_prices
+    11	
+    12	RPC_HTTP = os.getenv("SOLANA_RPC_HTTP") or os.getenv("RPC_HTTP") or "https://api.mainnet-beta.solana.com"
+    13	SIGNED_FILE = Path(os.getenv("TRADER_SIGNED_FILE", "last_swap_tx.signed.b64"))
+    14	META_FILE = Path(os.getenv("TRADER_META_FILE", "last_swap_meta.json"))
+    15	DB_PATH = os.getenv("TRADES_DB_PATH", "state/trades.sqlite")
+    16	
+    17	SKIP_PREFLIGHT = (os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1","true","yes","on"))
+    18	MAX_RETRIES = int(os.getenv("TRADER_MAX_RETRIES", "3"))
+    19	TIMEOUT_S = int(os.getenv("TRADER_SEND_TIMEOUT_S", "60"))
+    20	
+    21	CONFIRM_TIMEOUT_S = int(os.getenv("TRADER_CONFIRM_TIMEOUT_S", "60"))
+    22	CONFIRM_POLL_S = float(os.getenv("TRADER_CONFIRM_POLL_S", "2.0"))
+    23	
+    24	def rpc(method: str, params: list):
+    25	    payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
+    26	    r = requests.post(RPC_HTTP, json=payload, timeout=TIMEOUT_S)
+    27	    j = r.json()
+    28	    if "error" in j and j["error"]:
+    29	        raise RuntimeError(json.dumps(j["error"]))
+    30	    return j.get("result")
+    31	
+    32	def read_b64_file(p: Path) -> bytes:
+    33	    b64 = p.read_text(encoding="utf-8").strip()
+    34	    return base64.b64decode(b64)
+    35	
+    36	def load_meta() -> dict:
+    37	    if not META_FILE.exists():
+    38	        return {}
+    39	    return json.loads(META_FILE.read_text(encoding="utf-8"))
+    40	
+    41	def ensure_db():
+    42	    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    43	    con = sqlite3.connect(DB_PATH)
+    44	    cur = con.cursor()
+    45	    cur.execute("""
+    46	    CREATE TABLE IF NOT EXISTS positions(
+    47	      id INTEGER PRIMARY KEY AUTOINCREMENT,
+    48	      mint TEXT NOT NULL,
+    49	      status TEXT NOT NULL,
+    50	      entry_price REAL NOT NULL,
+    51	      peak_price REAL NOT NULL,
+    52	      size_sol REAL NOT NULL,
+    53	      tp_done INTEGER NOT NULL DEFAULT 0,
+    54	      entry_ts INTEGER NOT NULL,
+    55	      tx_sig TEXT NOT NULL DEFAULT ''
+    56	    )
+    57	    """)
+    58	    cur.execute("""
+    59	    CREATE TABLE IF NOT EXISTS events(
+    60	      id INTEGER PRIMARY KEY AUTOINCREMENT,
+    61	      ts INTEGER NOT NULL,
+    62	      mint TEXT NOT NULL,
+    63	      status TEXT NOT NULL,
+    64	      err TEXT NOT NULL DEFAULT ''
+    65	    )
+    66	    """)
+    67	    con.commit()
+    68	    con.close()
+    69	
+    70	def add_event(mint: str, status: str, err: str = ""):
+    71	    ensure_db()
+    72	    con = sqlite3.connect(DB_PATH)
+    73	    cur = con.cursor()
+    74	    cur.execute("INSERT INTO events(ts,mint,status,err) VALUES(?,?,?,?)",
+    75	                (int(time.time()), mint, status, err or ""))
+    76	    con.commit()
+    77	    con.close()
+    78	
+    79	def insert_position(mint: str, status: str, entry_price_usd: float, size_sol: float, tx_sig: str):
+    80	    ensure_db()
+    81	    con = sqlite3.connect(DB_PATH)
+    82	    cur = con.cursor()
+    83	    ts = int(time.time())
+    84	    cur.execute(
+    85	        "INSERT INTO positions(mint,status,entry_price,peak_price,size_sol,tp_done,entry_ts,tx_sig) VALUES(?,?,?,?,?,?,?,?)",
+    86	        (mint, status, float(entry_price_usd), float(entry_price_usd), float(size_sol), 0, ts, tx_sig or "")
+    87	    )
+    88	    con.commit()
+    89	    con.close()
+    90	
+    91	def derive_size_sol_from_meta(meta: dict) -> float:
+    92	    for k in ("inAmount_ui","inputAmount_ui","in_ui","inSol"):
+    93	        if k in meta:
+    94	            try: return float(meta[k])
+    95	            except Exception: pass
+    96	    for k in ("inAmount","inputAmount","in_amount"):
+    97	        if k in meta:
+    98	            try: return float(meta[k]) / 1e9
+    99	            except Exception: pass
+   100	    q = meta.get("quote") or {}
+   101	    if isinstance(q, dict):
+   102	        for k in ("inAmount","inputAmount"):
+   103	            if k in q:
+   104	                try: return float(q[k]) / 1e9
+   105	                except Exception: pass
+   106	    return 0.0
+   107	
+   108	def get_mint_from_meta(meta: dict) -> str:
+   109	    for k in ("outputMint","outMint","mint","targetMint"):
+   110	        m = (meta.get(k) or "").strip()
+   111	        if m:
+   112	            return m
+   113	    q = meta.get("quote") or {}
+   114	    if isinstance(q, dict):
+   115	        for k in ("outputMint","outMint","mint"):
+   116	            m = (q.get(k) or "").strip()
+   117	            if m:
+   118	                return m
+   119	    return ""
+   120	
+   121	def try_entry_price_usd(mint: str) -> float:
+   122	    data = get_prices([mint])
+   123	    info = data.get(mint) or {}
+   124	    if info.get("usdPrice") is None:
+   125	        return 0.0
+   126	    return float(info["usdPrice"])
+   127	
+   128	def confirm_sig(sig: str) -> tuple[bool, str]:
+   129	    """
+   130	    Returns (confirmed, status_str)
+   131	    status_str: confirmed | finalized | processed | failed | timeout | notfound
+   132	    """
+   133	    deadline = time.time() + CONFIRM_TIMEOUT_S
+   134	    while time.time() < deadline:
+   135	        try:
+   136	            res = rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}]) or {}
+   137	            arr = res.get("value") if isinstance(res, dict) else None
+   138	            st = (arr[0] if arr and len(arr) else None) or None
+   139	            if st is None:
+   140	                time.sleep(CONFIRM_POLL_S)
+   141	                continue
+   142	            if st.get("err"):
+   143	                return (False, "failed")
+   144	            conf = st.get("confirmationStatus") or ""
+   145	            if conf in ("confirmed", "finalized"):
+   146	                return (True, conf)
+   147	            # still processed
+   148	            time.sleep(CONFIRM_POLL_S)
+   149	            continue
+   150	        except Exception:
+   151	            time.sleep(CONFIRM_POLL_S)
+   152	            continue
+   153	    return (False, "timeout")
+   154	
+   155	def main():
+   156	    print("🚀 trader_send")
+   157	    print("   rpc_http=", RPC_HTTP)
+   158	    print("   signed_file=", str(SIGNED_FILE))
+   159	    print("   meta_file=", str(META_FILE))
+   160	    print("   skip_preflight=", SKIP_PREFLIGHT, "max_retries=", MAX_RETRIES, "timeout_s=", TIMEOUT_S)
+   161	
+   162	    if not SIGNED_FILE.exists():
+   163	        raise SystemExit("❌ signed tx file missing: " + str(SIGNED_FILE))
+   164	
+   165	    meta = load_meta()
+   166	    mint = get_mint_from_meta(meta) or "UNKNOWN_MINT"
+   167	    tx_bytes = read_b64_file(SIGNED_FILE)
+   168	
+   169	    # sendTransaction
+   170	    payload = {"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[
+   171	        base64.b64encode(tx_bytes).decode("utf-8"),
+   172	        {
+   173	            "encoding":"base64",
+   174	            "skipPreflight": bool(SKIP_PREFLIGHT),
+   175	            "preflightCommitment":"processed",
+   176	            "maxRetries": int(MAX_RETRIES),
+   177	        }
+   178	    ]}
+   179	    r = requests.post(RPC_HTTP, json=payload, timeout=TIMEOUT_S)
+   180	    j = r.json()
+   181	
+   182	    if "error" in j and j["error"]:
+   183	        add_event(mint, "SEND_FAIL", json.dumps(j["error"]))
+   184	        raise SystemExit("❌ SEND_FAIL: " + json.dumps(j["error"]))
+   185	
+   186	    sig = j.get("result")
+   187	    if not sig:
+   188	        add_event(mint, "SEND_FAIL", "no result signature")
+   189	        raise SystemExit("❌ SEND_FAIL: no result signature")
+   190	
+   191	    print("✅ sent sig =", sig)
+   192	
+   193	    ok, st = confirm_sig(sig)
+   194	    if ok:
+   195	        print("🎯 CONFIRMED status=", st)
+   196	        add_event(mint, "CONFIRMED", st)
+   197	        pos_status = "OPEN"
+   198	    else:
+   199	        print("⚠️ confirm status=", st, "(position saved as PENDING)")
+   200	        add_event(mint, "CONFIRM_PENDING", st)
+   201	        pos_status = "PENDING"
+   202	
+   203	    # record position (even if pending)
+   204	    try:
+   205	        size_sol = derive_size_sol_from_meta(meta)
+   206	        entry_price = try_entry_price_usd(mint)
+   207	        if entry_price <= 0.0:
+   208	            print("⚠️ entry_price_usd unavailable -> set 0.0")
+   209	            entry_price = 0.0
+   210	        insert_position(mint, pos_status, entry_price, size_sol, sig)
+   211	        print("✅ position saved", "status=", pos_status, "mint=", mint[:6]+"...", "size_sol=", size_sol, "entry_usd=", entry_price)
+   212	    except Exception as e:
+   213	        add_event(mint, "POSITION_FAIL", str(e))
+   214	        print("❌ position record failed:", e)
+   215	
+   216	if __name__ == "__main__":
+   217	    main()
+
+
+========================
+FILE: src/trader_sell.py
+========================
+     1	import json
+     2	import os
+     3	import subprocess
+     4	import time
+     5	from pathlib import Path
+     6	
+     7	from src.rpc_token_balance import get_token_ui_amount
+     8	
+     9	# Files
+    10	READY = Path(os.getenv("TRADER_READY_FILE", "ready_to_trade.jsonl"))
+    11	META = Path(os.getenv("TRADER_LAST_META_FILE", "last_swap_meta.json"))
+    12	
+    13	USER = (os.getenv("TRADER_USER_PUBLIC_KEY","") or "").strip()
+    14	if not USER:
+    15	    raise SystemExit("❌ TRADER_USER_PUBLIC_KEY manquant")
+    16	
+    17	def run(cmd):
+    18	    env = os.environ.copy()
+    19	    return subprocess.call(cmd, env=env)
+    20	
+    21	def main():
+    22	    mint = (os.getenv("SELL_MINT","") or "").strip()
+    23	    pct = float(os.getenv("SELL_PCT","25"))
+    24	    if not mint:
+    25	        raise SystemExit("❌ SELL_MINT manquant")
+    26	
+    27	    bal = float(get_token_ui_amount(os.getenv("SOLANA_RPC_HTTP","https://api.mainnet-beta.solana.com"), USER, mint) or 0.0)
+    28	    if bal <= 0:
+    29	        print("⏭️  no token balance to sell for", mint[:6]+"...")
+    30	        return
+    31	
+    32	    amt = bal * (pct/100.0)
+    33	    if amt <= 0:
+    34	        print("⏭️  computed sell amount <=0")
+    35	        return
+    36	
+    37	    # inject ready event for trader_exec (it reads ready_to_trade.jsonl)
+    38	    rec = {"ts": int(time.time()), "mint": mint, "creator": "PUMP_RIDER_SELL", "pump_sig": "X", "mint_sig": "Y"}
+    39	    READY.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    40	
+    41	    # IMPORTANT: sell = input mint is token=***MASKED***
+    42	    os.environ["TRADER_INPUT_MINT"] = mint
+    43	    os.environ["TRADER_OUTPUT_MINT"] = "So11111111111111111111111111111111111111112"
+    44	
+    45	    # pass token amount in UI units (your trader_exec must read this env if present)
+    46	    os.environ["TRADER_FORCE_TOKEN=***MASKED***
+    47	
+    48	    print(f"🧾 SELL request mint={mint[:6]}... pct={pct}% bal={bal:.6f} -> amt={amt:.6f}")
+    49	
+    50	    if run(["python","src/trader_exec.py"]) != 0:
+    51	        raise SystemExit("❌ trader_exec sell failed")
+    52	    if run(["python","src/trader_sign.py"]) != 0:
+    53	        raise SystemExit("❌ trader_sign failed")
+    54	    if run(["python","src/trader_send.py"]) != 0:
+    55	        raise SystemExit("❌ trader_send failed")
+    56	
+    57	if __name__ == "__main__":
+    58	    main()
+
+
+========================
+FILE: src/trader_exit.py
+========================
+     1	import os
+     2	import json
+     3	import time
+     4	import requests
+     5	from pathlib import Path
+     6	
+     7	from src.positions import load_positions, mark_closed
+     8	
+     9	JUP = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+    10	KEY = (os.getenv("JUPITER_API_KEY") or "").strip()
+    11	
+    12	OWNER = (os.getenv("TRADER_USER_PUBLIC_KEY","") or "").strip()
+    13	SOL = "So11111111111111111111111111111111111111112"
+    14	
+    15	TP_PCT = float(os.getenv("EXIT_TP_PCT", "0.25"))     # +25%
+    16	SL_PCT = float(os.getenv("EXIT_SL_PCT", "0.12"))     # -12%
+    17	MAX_HOLD_S = int(os.getenv("EXIT_MAX_HOLD_S", str(6*3600)))
+    18	
+    19	SLIPPAGE_BPS = int(os.getenv("EXIT_SLIPPAGE_BPS", "120"))
+    20	DRY_RUN = (os.getenv("EXIT_DRY_RUN", "1").strip().lower() in ("1","true","yes","on"))
+    21	
+    22	def _headers():
+    23	    h = {"accept":"application/json"}
+    24	    if KEY:
+    25	        h["x-api-key"] = KEY
+    26	    return h
+    27	
+    28	def quote_token_to_sol(mint: str, amount_raw: int):
+    29	    params = {
+    30	        "inputMint": mint,
+    31	        "outputMint": SOL,
+    32	        "amount": str(int(amount_raw)),
+    33	        "slippageBps": str(int(SLIPPAGE_BPS)),
+    34	    }
+    35	    r = requests.get(f"{JUP}/swap/v1/quote", params=params, headers=_headers(), timeout=25)
+    36	    r.raise_for_status()
+    37	    return r.json()
+    38	
+    39	def main():
+    40	    if not OWNER:
+    41	        raise SystemExit("❌ TRADER_USER_PUBLIC_KEY manquant")
+    42	
+    43	    pos = load_positions()
+    44	    now = int(time.time())
+    45	    open_pos = [p for p in pos if not p.get("closed_ts")]
+    46	
+    47	    print("🧠 trader_exit open_positions=", len(open_pos), "dry_run=", DRY_RUN)
+    48	
+    49	    for p in open_pos:
+    50	        mint = (p.get("mint") or "").strip()
+    51	        open_ts = int(p.get("open_ts") or 0)
+    52	        sol_spent = float(p.get("sol_spent") or 0.0)
+    53	
+    54	        # token amount: on essaie token_ui_amount * 10^dec (approx)
+    55	        ui_amt = float(p.get("token_ui_amount") or 0.0)
+    56	        dec = int(p.get("token_decimals") or 0)
+    57	        amt_raw = int(ui_amt * (10 ** dec))
+    58	
+    59	        if amt_raw <= 0:
+    60	            print("   ⏭️ skip mint(no amount)", mint[:6], "ui_amt=", ui_amt, "dec=", dec)
+    61	            continue
+    62	
+    63	        # timeout
+    64	        held_s = now - open_ts
+    65	        timeout_hit = held_s >= MAX_HOLD_S
+    66	
+    67	        # quote token->SOL
+    68	        try:
+    69	            q = quote_token_to_sol(mint, amt_raw)
+    70	        except Exception as e:
+    71	            print("   ⚠️ quote fail", mint[:6], e)
+    72	            continue
+    73	
+    74	        out_lamports = int(q.get("outAmount") or 0)
+    75	        sol_now = out_lamports / 1e9
+    76	
+    77	        # pnl
+    78	        if sol_spent <= 0:
+    79	            pnl = 0.0
+    80	        else:
+    81	            pnl = (sol_now - sol_spent) / sol_spent
+    82	
+    83	        tp_hit = pnl >= TP_PCT
+    84	        sl_hit = pnl <= -SL_PCT
+    85	
+    86	        print(f"   mint={mint[:6]} held={held_s//60}m sol_spent={sol_spent:.6f} sol_now={sol_now:.6f} pnl={pnl*100:.1f}% tp={tp_hit} sl={sl_hit} timeout={timeout_hit}")
+    87	
+    88	        if not (tp_hit or sl_hit or timeout_hit):
+    89	            continue
+    90	
+    91	        reason = "TP" if tp_hit else ("SL" if sl_hit else "TIMEOUT")
+    92	        if DRY_RUN:
+    93	            print("   ✅ would SELL reason=", reason)
+    94	            continue
+    95	
+    96	        # Pour SELL réel : on réutilise TON pipeline existant (build/sign/send) mais il faut un SELL builder.
+    97	        # On garde ça simple ici: on marque "signal sell" et on laisse un autre module builder la tx.
+    98	        # (On ajoute le builder SELL à l’étape suivante)
+    99	        print("   🔥 SELL SIGNAL ->", reason, "mint=", mint)
+   100	        # mark as closed signal only (no tx yet)
+   101	        mark_closed(mint, close_sig="PENDING", reason=reason)
+   102	
+   103	if __name__ == "__main__":
+   104	    main()
+
+
+========================
+FILE: src/store.py
+========================
+     1	import json
+     2	import sqlite3
+     3	import time
+     4	from dataclasses import dataclass
+     5	from pathlib import Path
+     6	from typing import Any, Dict, Optional, Tuple
+     7	
+     8	
+     9	@dataclass
+    10	class TradeEvent:
+    11	    ts: int
+    12	    mint: str
+    13	    status: str
+    14	    data: Dict[str, Any]
+    15	    err: str = ""
+    16	
+    17	
+    18	class TradeStore:
+    19	    """
+    20	    SQLite store: idempotence + historique.
+    21	    Status: SEEN -> READY -> BUILT -> SIGNED -> SIM_OK/SIM_FAIL -> SENT
+    22	    """
+    23	    def __init__(self, db_path: Path):
+    24	        self.db_path = Path(db_path)
+    25	        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    26	        self._conn = sqlite3.connect(str(self.db_path))
+    27	        self._conn.execute("PRAGMA journal_mode=WAL;")
+    28	        self._conn.execute("PRAGMA synchronous=NORMAL;")
+    29	        self._init_schema()
+    30	
+    31	    def close(self) -> None:
+    32	        try:
+    33	            self._conn.close()
+    34	        except Exception:
+    35	            pass
+    36	
+    37	    def _init_schema(self) -> None:
+    38	        cur = self._conn.cursor()
+    39	        cur.execute(
+    40	            """
+    41	            CREATE TABLE IF NOT EXISTS trades (
+    42	              mint TEXT PRIMARY KEY,
+    43	              first_seen_ts INTEGER NOT NULL,
+    44	              last_ts INTEGER NOT NULL,
+    45	              status TEXT NOT NULL,
+    46	              last_error TEXT NOT NULL DEFAULT '',
+    47	              payload_json TEXT NOT NULL DEFAULT '{}'
+    48	            )
+    49	            """
+    50	        )
+    51	        cur.execute(
+    52	            """
+    53	            CREATE TABLE IF NOT EXISTS events (
+    54	              id INTEGER PRIMARY KEY AUTOINCREMENT,
+    55	              ts INTEGER NOT NULL,
+    56	              mint TEXT NOT NULL,
+    57	              status TEXT NOT NULL,
+    58	              err TEXT NOT NULL DEFAULT '',
+    59	              data_json TEXT NOT NULL DEFAULT '{}'
+    60	            )
+    61	            """
+    62	        )
+    63	        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_mint_ts ON events(mint, ts);")
+    64	        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
+    65	        self._conn.commit()
+    66	
+    67	    def upsert_trade(self, mint: str, status: str, payload: Optional[Dict[str, Any]] = None, err: str = "") -> None:
+    68	        now = int(time.time())
+    69	        payload = payload or {}
+    70	        pj = json.dumps(payload, ensure_ascii=False)
+    71	
+    72	        cur = self._conn.cursor()
+    73	        cur.execute("SELECT mint FROM trades WHERE mint=? LIMIT 1", (mint,))
+    74	        row = cur.fetchone()
+    75	
+    76	        if row is None:
+    77	            cur.execute(
+    78	                """
+    79	                INSERT INTO trades(mint, first_seen_ts, last_ts, status, last_error, payload_json)
+    80	                VALUES(?, ?, ?, ?, ?, ?)
+    81	                """,
+    82	                (mint, now, now, status, err, pj),
+    83	            )
+    84	        else:
+    85	            cur.execute(
+    86	                """
+    87	                UPDATE trades
+    88	                SET last_ts=?, status=?, last_error=?, payload_json=?
+    89	                WHERE mint=?
+    90	                """,
+    91	                (now, status, err, pj, mint),
+    92	            )
+    93	
+    94	        cur.execute(
+    95	            "INSERT INTO events(ts, mint, status, err, data_json) VALUES(?, ?, ?, ?, ?)",
+    96	            (now, mint, status, err, pj),
+    97	        )
+    98	        self._conn.commit()
+    99	
+   100	    def seen_before(self, mint: str) -> bool:
+   101	        cur = self._conn.cursor()
+   102	        cur.execute("SELECT 1 FROM trades WHERE mint=? LIMIT 1", (mint,))
+   103	        return cur.fetchone() is not None
+   104	
+   105	    def get_trade(self, mint: str) -> Optional[Tuple[str, str]]:
+   106	        cur = self._conn.cursor()
+   107	        cur.execute("SELECT status, payload_json FROM trades WHERE mint=?", (mint,))
+   108	        row = cur.fetchone()
+   109	        return row if row else None
+   110	
+   111	    # Convenience
+   112	    def mark_seen(self, mint: str, payload: Dict[str, Any]) -> None:
+   113	        self.upsert_trade(mint, "SEEN", payload)
+   114	
+   115	    def mark_ready(self, mint: str, payload: Dict[str, Any]) -> None:
+   116	        self.upsert_trade(mint, "READY", payload)
+   117	
+   118	    def mark_built(self, mint: str, payload: Dict[str, Any]) -> None:
+   119	        self.upsert_trade(mint, "BUILT", payload)
+   120	
+   121	    def mark_signed(self, mint: str, payload: Dict[str, Any]) -> None:
+   122	        self.upsert_trade(mint, "SIGNED", payload)
+   123	
+   124	    def mark_sim_ok(self, mint: str, payload: Dict[str, Any]) -> None:
+   125	        self.upsert_trade(mint, "SIM_OK", payload)
+   126	
+   127	    def mark_sim_fail(self, mint: str, payload: Dict[str, Any], err: str) -> None:
+   128	        self.upsert_trade(mint, "SIM_FAIL", payload, err=err)
+   129	
+   130	    def mark_sent(self, mint: str, payload: Dict[str, Any]) -> None:
+   131	        self.upsert_trade(mint, "SENT", payload)
+   132	
+   133	
+   134	    def update_status(self, mint: str, status: str, ts: int, data: dict, err: str = "") -> None:
+   135	        cur = self._conn.cursor()
+   136	        cur.execute(
+   137	            """
+   138	            INSERT INTO trades (mint, status, last_ts, last_error, data)
+   139	            VALUES (?, ?, ?, ?, ?)
+   140	            ON CONFLICT(mint) DO UPDATE SET
+   141	                status=excluded.status,
+   142	                last_ts=excluded.last_ts,
+   143	                last_error=excluded.last_error,
+   144	                data=excluded.data
+   145	            """,
+   146	            (mint, status, ts, err, json.dumps(data))
+   147	        )
+   148	        cur.execute(
+   149	            "INSERT INTO events (ts, mint, status, err) VALUES (?, ?, ?, ?)",
+   150	            (ts, mint, status, err)
+   151	        )
+   152	        self._conn.commit()
+   153	
+   154	    def update_status(self, mint: str, status: str, ts: int, data: dict, err: str = ""):
+   155	        cur = self._conn.cursor()
+   156	        cur.execute("""
+   157	            INSERT INTO trades(mint,status,first_seen_ts,last_ts,last_error)
+   158	            VALUES(?,?,?,?,?)
+   159	            ON CONFLICT(mint) DO UPDATE SET
+   160	                status=excluded.status,
+   161	                first_seen_ts=COALESCE(trades.first_seen_ts, excluded.first_seen_ts),
+   162	                last_ts=excluded.last_ts,
+   163	                last_error=excluded.last_error
+   164	        """, (mint, status, ts, ts, err))
+   165	
+   166	        cur.execute("""
+   167	            INSERT INTO events(ts,mint,status,err,data_json) VALUES(?,?,?,?,?)
+   168	        """, (ts, mint, status, err, json.dumps(data)))
+   169	        self._conn.commit()
+   170	
+   171	
+   172	# ===============================
+   173	# SELL ENGINE HELPERS
+   174	# ===============================
+   175	
+   176	import json as _json
+   177	import sqlite3 as _sqlite3
+   178	
+   179	def _row_to_dict(_cur, _row):
+   180	    return {desc[0]: _row[i] for i, desc in enumerate(_cur.description)}
+   181	
+   182	def _connect(db_path: str):
+   183	    con = _sqlite3.connect(db_path)
+   184	    con.execute("PRAGMA journal_mode=WAL;")
+   185	    con.execute("PRAGMA synchronous=NORMAL;")
+   186	    return con
+   187	
+   188	def _ensure_positions_table(con):
+   189	    con.execute("""
+   190	    CREATE TABLE IF NOT EXISTS positions(
+   191	        mint TEXT PRIMARY KEY,
+   192	        entry_price REAL NOT NULL,
+   193	        entry_ts INTEGER NOT NULL,
+   194	        size_sol REAL NOT NULL,
+   195	        peak_price REAL,
+   196	        tp_done INTEGER DEFAULT 0,
+   197	        status TEXT DEFAULT 'OPEN',
+   198	        meta_json TEXT DEFAULT ''
+   199	    )
+   200	    """)
+   201	    con.commit()
+   202	
+   203	def _ensure_events_cols(con):
+   204	    # events doit avoir data_json; si pas, on ignore (déjà géré chez toi)
+   205	    return
+   206	
+   207	class _SellMixin:
+   208	    def get_open_positions(self):
+   209	        con = _connect(self.db_path)
+   210	        _ensure_positions_table(con)
+   211	        cur = con.cursor()
+   212	        cur.execute("SELECT mint,entry_price,entry_ts,size_sol,peak_price,tp_done,status,meta_json FROM positions WHERE status='OPEN'")
+   213	        rows = cur.fetchall()
+   214	        cols = [d[0] for d in cur.description]
+   215	        out = []
+   216	        for r in rows:
+   217	            d = dict(zip(cols, r))
+   218	            # meta_json -> dict
+   219	            try:
+   220	                d["meta"] = _json.loads(d.get("meta_json") or "{}")
+   221	            except Exception:
+   222	                d["meta"] = {}
+   223	            out.append(d)
+   224	        con.close()
+   225	        return out
+   226	
+   227	    def update_peak(self, mint: str, peak_price: float):
+   228	        con = _connect(self.db_path)
+   229	        _ensure_positions_table(con)
+   230	        con.execute("UPDATE positions SET peak_price=? WHERE mint=?", (float(peak_price), mint))
+   231	        con.commit()
+   232	        con.close()
+   233	
+   234	    def mark_partial_tp(self, mint: str, tp_pct: float):
+   235	        # ici: on marque tp_done=1 (et on log l'intention). L'exécution SELL on l’ajoute ensuite.
+   236	        con = _connect(self.db_path)
+   237	        _ensure_positions_table(con)
+   238	        con.execute("UPDATE positions SET tp_done=1 WHERE mint=?", (mint,))
+   239	        con.commit()
+   240	        con.close()
+
+
+========================
+FILE: src/positions.py
+========================
+     1	import json
+     2	import time
+     3	from pathlib import Path
+     4	from typing import Any, Dict, List
+     5	
+     6	POSITIONS_PATH = Path("state/positions_live.json")
+     7	
+     8	def load_positions() -> List[Dict[str, Any]]:
+     9	    if not POSITIONS_PATH.exists():
+    10	        return []
+    11	    try:
+    12	        return json.loads(POSITIONS_PATH.read_text(encoding="utf-8"))
+    13	    except Exception:
+    14	        return []
+    15	
+    16	def save_positions(pos: List[Dict[str, Any]]) -> None:
+    17	    POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    18	    POSITIONS_PATH.write_text(json.dumps(pos, indent=2), encoding="utf-8")
+    19	
+    20	def upsert_position(p: Dict[str, Any]) -> None:
+    21	    pos = load_positions()
+    22	    mint = str(p.get("mint") or "").strip()
+    23	    pos = [x for x in pos if str(x.get("mint") or "").strip() != mint]
+    24	    pos.append(p)
+    25	    save_positions(pos)
+    26	
+    27	def mark_closed(mint: str, close_sig: str, reason: str) -> None:
+    28	    pos = load_positions()
+    29	    now = int(time.time())
+    30	    for x in pos:
+    31	        if str(x.get("mint") or "").strip() == mint and not x.get("closed_ts"):
+    32	            x["closed_ts"] = now
+    33	            x["close_sig"] = close_sig
+    34	            x["close_reason"] = reason
+    35	    save_positions(pos)
+
+
+========================
+FILE: src/risk_engine.py
+========================
+     1	import json
+     2	import os
+     3	import time
+     4	from pathlib import Path
+     5	from typing import Any, Dict, List, Tuple
+     6	
+     7	import requests
+     8	
+     9	# ---------------------------
+    10	# Files: blacklist dev / mint
+    11	# ---------------------------
+    12	
+    13	
+    14	def ultra_get_dev(mint: str) -> str:
+    15	    """
+    16	    Récupère l'adresse dev/creator depuis Jupiter Ultra search.
+    17	    Best-effort: retourne "" si introuvable.
+    18	    """
+    19	    import os, requests
+    20	    JUP = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+    21	    KEY = (os.getenv("JUPITER_API_KEY") or "").strip()
+    22	    h = {"accept": "application/json"}
+    23	    if KEY:
+    24	        h["x-api-key"] = KEY
+    25	
+    26	    try:
+    27	        r = requests.get(f"{JUP}/ultra/v1/search", params={"query": mint}, headers=h, timeout=20)
+    28	        r.raise_for_status()
+    29	        arr = r.json() or []
+    30	        if not arr:
+    31	            return ""
+    32	        t = arr[0]
+    33	        dev = (t.get("dev") or "").strip()
+    34	        return dev
+    35	    except Exception:
+    36	        return ""
+    37	
+    38	BLACKLIST_DEV_PATH = Path("state/blacklist_dev.json")
+    39	BLACKLIST_MINT_PATH = Path("state/blacklist_mint.json")
+    40	
+    41	
+    42	def _load_json(path: Path, default):
+    43	    if not path.exists():
+    44	        return default
+    45	    try:
+    46	        return json.loads(path.read_text(encoding="utf-8") or "")
+    47	    except Exception:
+    48	        return default
+    49	
+    50	
+    51	def _save_json(path: Path, obj: Any):
+    52	    path.parent.mkdir(parents=True, exist_ok=True)
+    53	    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    54	
+    55	
+    56	def _load_blacklist_dev() -> Dict[str, str]:
+    57	    return _load_json(BLACKLIST_DEV_PATH, {})
+    58	
+    59	
+    60	def blacklist_dev(dev: str, reason: str):
+    61	    dev = (dev or "").strip()
+    62	    if not dev:
+    63	        return
+    64	    bl = _load_blacklist_dev()
+    65	    bl[dev] = reason or "BAD_DEV"
+    66	    _save_json(BLACKLIST_DEV_PATH, bl)
+    67	    print(f"⛔ DEV BLACKLISTED {dev[:6]}… reason={reason}")
+    68	
+    69	
+    70	def is_dev_blacklisted(dev: str) -> bool:
+    71	    dev = (dev or "").strip()
+    72	    if not dev:
+    73	        return False
+    74	    return dev in _load_blacklist_dev()
+    75	
+    76	
+    77	def _load_blacklist_mint() -> Dict[str, Dict[str, Any]]:
+    78	    # format: { mint: {"reason": "...", "until": epoch} }
+    79	    return _load_json(BLACKLIST_MINT_PATH, {})
+    80	
+    81	
+    82	def blacklist_mint(mint: str, reason: str, ttl_sec: int = 900):
+    83	    mint = (mint or "").strip()
+    84	    if not mint:
+    85	        return
+    86	    bl = _load_blacklist_mint()
+    87	    bl[mint] = {"reason": reason or "BAD_MINT", "until": int(time.time()) + int(ttl_sec)}
+    88	    _save_json(BLACKLIST_MINT_PATH, bl)
+    89	    print(f"⛔ TOKEN BLACKLISTED {mint[:6]}… {reason}")
+    90	
+    91	
+    92	def is_mint_blacklisted(mint: str) -> bool:
+    93	    mint = (mint or "").strip()
+    94	    if not mint:
+    95	        return False
+    96	    bl = _load_blacklist_mint()
+    97	    now = int(time.time())
+    98	
+    99	    # expire
+   100	    changed = False
+   101	    for k in list(bl.keys()):
+   102	        until = int(bl[k].get("until") or 0)
+   103	        if until and until < now:
+   104	            del bl[k]
+   105	            changed = True
+   106	    if changed:
+   107	        _save_json(BLACKLIST_MINT_PATH, bl)
+   108	
+   109	    return mint in bl
+   110	
+   111	
+   112	# ---------------------------
+   113	# Jupiter Ultra risk scoring
+   114	# ---------------------------
+   115	def _jup_headers() -> Dict[str, str]:
+   116	    h = {"accept": "application/json"}
+   117	    key = (os.getenv("JUPITER_API_KEY") or os.getenv("JUPITER_KEY") or "").strip()
+   118	    if key:
+   119	        h["x-api-key"] = key
+   120	    return h
+   121	
+   122	
+   123	def _ultra_lookup_by_mint(mint: str) -> Dict[str, Any]:
+   124	    """
+   125	    On interroge Ultra search avec le mint lui-même (ça marche très bien en pratique).
+   126	    On prend l'item dont id == mint si présent, sinon le premier.
+   127	    """
+   128	    base = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+   129	    url = f"{base}/ultra/v1/search"
+   130	    r = requests.get(url, params={"query": mint}, headers=_jup_headers(), timeout=25)
+   131	    r.raise_for_status()
+   132	    arr = r.json() or []
+   133	    if not arr:
+   134	        return {}
+   135	    for it in arr:
+   136	        if str(it.get("id") or "") == mint:
+   137	            return it
+   138	    return arr[0] or {}
+   139	
+   140	
+   141	def risk_check(mint: str) -> Tuple[bool, int, List[str], Dict[str, Any]]:
+   142	    """
+   143	    Retour: (ok, score, reasons, details)
+   144	    - ok: bool
+   145	    - score: 0..100
+   146	    - reasons: liste
+   147	    - details: dict debug
+   148	    """
+   149	    mint = (mint or "").strip()
+   150	    if not mint or not (32 <= len(mint) <= 60):
+   151	        return (False, 0, ["INVALID_MINT"], {})
+   152	
+   153	    if is_mint_blacklisted(mint):
+   154	        bl = _load_blacklist_mint().get(mint, {})
+   155	        return (False, 0, ["MINT_BLACKLISTED"], {"blacklist": bl})
+   156	
+   157	    # seuils (tu peux ajuster via env)
+   158	    MIN_LIQ_USD = float(os.getenv("RISK_MIN_LIQ_USD", "150000"))      # 150k$
+   159	    MAX_TOP_HOLD_PCT = float(os.getenv("RISK_MAX_TOP_HOLD_PCT", "35"))# <=35%
+   160	    MIN_HOLDERS = int(os.getenv("RISK_MIN_HOLDERS", "5000"))          # 5k holders
+   161	    REQUIRE_AUTH_DISABLED = os.getenv("RISK_REQUIRE_AUTH_DISABLED", "1") == "1"  # mint+freeze off
+   162	
+   163	    try:
+   164	        it = _ultra_lookup_by_mint(mint)
+   165	    except Exception as e:
+   166	        # fallback SAFE (ne bloque pas tout)
+   167	        return (True, 50, ["ULTRA_ERROR_FALLBACK"], {"err": str(e)})
+   168	
+   169	    if not it:
+   170	        # pas de data -> fallback SAFE mais score moyen
+   171	        return (True, 45, ["NO_ULTRA_DATA_FALLBACK"], {})
+   172	
+   173	    audit = it.get("audit") or {}
+   174	    dev = (it.get("dev") or "").strip()
+   175	    liquidity = float(it.get("liquidity") or 0.0)      # Ultra renvoie souvent une "liquidity" (souvent USD)
+   176	    holders = int(it.get("holderCount") or 0)
+   177	    verified = bool(it.get("isVerified") or False)
+   178	
+   179	    mintAuthDisabled = bool(audit.get("mintAuthorityDisabled") is True)
+   180	    freezeAuthDisabled = bool(audit.get("freezeAuthorityDisabled") is True)
+   181	    topHoldPct = float(audit.get("topHoldersPercentage") or 100.0)
+   182	
+   183	    details = {
+   184	        "name": it.get("name"),
+   185	        "symbol": it.get("symbol"),
+   186	        "dev": dev,
+   187	        "liquidity": liquidity,
+   188	        "holderCount": holders,
+   189	        "isVerified": verified,
+   190	        "audit": audit,
+   191	        "topHoldersPercentage": topHoldPct,
+   192	        "mintAuthorityDisabled": mintAuthDisabled,
+   193	        "freezeAuthorityDisabled": freezeAuthDisabled,
+   194	    }
+   195	
+   196	    # DEV blacklist
+   197	    if dev and is_dev_blacklisted(dev):
+   198	        return (False, 0, ["DEV_BLACKLISTED"], details)
+   199	
+   200	    # Règles hard reject (anti-rug)
+   201	    reasons: List[str] = []
+   202	    if REQUIRE_AUTH_DISABLED:
+   203	        if not mintAuthDisabled:
+   204	            reasons.append("MINT_AUTH_NOT_DISABLED")
+   205	        if not freezeAuthDisabled:
+   206	            reasons.append("FREEZE_AUTH_NOT_DISABLED")
+   207	
+   208	    if topHoldPct > MAX_TOP_HOLD_PCT:
+   209	        reasons.append(f"TOP_HOLDERS_TOO_HIGH:{topHoldPct:.2f}%")
+   210	
+   211	    if liquidity > 0 and liquidity < MIN_LIQ_USD:
+   212	        reasons.append(f"LOW_LIQ:{liquidity:.0f}")
+   213	
+   214	    if holders > 0 and holders < MIN_HOLDERS:
+   215	        reasons.append(f"LOW_HOLDERS:{holders}")
+   216	
+   217	    # score (simple & lisible)
+   218	    score = 80
+   219	    if verified:
+   220	        score += 10
+   221	    if liquidity >= MIN_LIQ_USD:
+   222	        score += 5
+   223	    if topHoldPct <= 25:
+   224	        score += 5
+   225	
+   226	    # pénalités
+   227	    if reasons:
+   228	        score = max(0, 30 - 5 * len(reasons))
+   229	
+   230	    ok = (len(reasons) == 0)
+   231	    return (ok, int(score), reasons, details)
+
+
+========================
+FILE: src/strategy.py
+========================
+     1	import os
+     2	from dataclasses import dataclass
+     3	from typing import Dict, Any, Tuple
+     4	
+     5	LAMPORTS_PER_SOL = 1_000_000_000
+     6	
+     7	def _f(name, d): 
+     8	    try: return float(os.getenv(name, d))
+     9	    except: return float(d)
+    10	
+    11	def _i(name, d):
+    12	    try: return int(os.getenv(name, d))
+    13	    except: return int(d)
+    14	
+    15	@dataclass(frozen=True)
+    16	class Strategy:
+    17	    max_trade_sol: float
+    18	    max_pct_balance: float
+    19	    fee_buffer_sol: float
+    20	    max_price_impact_pct: float
+    21	    slippage_bps: int
+    22	
+    23	    @classmethod
+    24	    def from_env(cls):
+    25	        return cls(
+    26	            max_trade_sol=_f("STRAT_MAX_TRADE_SOL","0.02"),
+    27	            max_pct_balance=_f("STRAT_MAX_PCT_BALANCE","0.18"),
+    28	            fee_buffer_sol=_f("STRAT_FEE_BUFFER_SOL","0.03"),
+    29	            max_price_impact_pct=_f("TRADER_MAX_PRICE_IMPACT_PCT","1.5"),
+    30	            slippage_bps=_i("TRADER_SLIPPAGE_BPS","120"),
+    31	        )
+    32	
+    33	    def trade_lamports(self, wallet_lamports: int) -> Tuple[int,str]:
+    34	        buf = int(self.fee_buffer_sol * LAMPORTS_PER_SOL)
+    35	        if wallet_lamports <= buf: 
+    36	            return 0,"buffer"
+    37	        by_pct = int(wallet_lamports * self.max_pct_balance)
+    38	        by_cap = int(self.max_trade_sol * LAMPORTS_PER_SOL)
+    39	        amt = min(by_pct, by_cap)
+    40	        if wallet_lamports - amt < buf:
+    41	            amt = max(0, wallet_lamports - buf)
+    42	        return (amt,"ok") if amt>0 else (0,"zero")
+    43	
+    44	    def quote_ok(self, q: Dict[str,Any]):
+    45	        pi = float(q.get("priceImpactPct",0))
+    46	        if pi*100 > self.max_price_impact_pct:
+    47	            return False,"impact"
+    48	        return True,"ok"
+    49	
+    50	    def pick_amount_lamports(self, balance_lamports: int):
+    51	        """
+    52	        Choisit un montant SOL sécurisé en lamports
+    53	        """
+    54	        sol = balance_lamports / 1e9
+    55	
+    56	        # max par trade
+    57	        trade_sol = min(
+    58	            self.max_trade_sol,
+    59	            sol * self.max_pct_balance
+    60	        )
+    61	
+    62	        # buffer fees
+    63	        trade_sol = trade_sol - self.fee_buffer_sol
+    64	        if trade_sol <= 0:
+    65	            return 0, "INSUFFICIENT_BALANCE_AFTER_FEES"
+    66	
+    67	        lamports = int(trade_sol * 1e9)
+    68	        return lamports, "OK"
+
+
+========================
+FILE: src/price_feed.py
+========================
+     1	import os
+     2	import requests
+     3	
+     4	JUP = (os.getenv("JUPITER_BASE_URL") or "https://api.jup.ag").rstrip("/")
+     5	KEY = (os.getenv("JUPITER_API_KEY") or "").strip()
+     6	TIMEOUT = int(os.getenv("PRICE_TIMEOUT_S", "20"))
+     7	
+     8	def _headers():
+     9	    h = {"accept": "application/json"}
+    10	    if KEY:
+    11	        h["x-api-key"] = KEY
+    12	    return h
+    13	
+    14	def get_prices(mints: list[str]) -> dict:
+    15	    mints = [m for m in (mints or []) if m]
+    16	    if not mints:
+    17	        return {}
+    18	    # Price v3: /price/v3?ids=A,B,C (max 50)
+    19	    ids = ",".join(mints[:50])
+    20	    url = f"{JUP}/price/v3"
+    21	    r = requests.get(url, params={"ids": ids}, headers=_headers(), timeout=TIMEOUT)
+    22	    r.raise_for_status()
+    23	    data = r.json() or {}
+    24	    # data = { "<mint>": { "usdPrice": ..., "decimals": ..., ... }, ... }
+    25	    return data
+    26	
+    27	def get_price(mint: str) -> float:
+    28	    mint = (mint or "").strip()
+    29	    if not mint:
+    30	        raise ValueError("mint empty")
+    31	    data = get_prices([mint])
+    32	    info = data.get(mint)
+    33	    if not info or info.get("usdPrice") is None:
+    34	        raise ValueError(f"price unavailable for {mint}")
+    35	    return float(info["usdPrice"])
+    36	
+    37	def get_sol_usd() -> float:
+    38	    SOL = "So11111111111111111111111111111111111111112"
+    39	    return get_price(SOL)
+
+
+========================
+FILE: src/rpc_client.py
+========================
+     1	import asyncio
+     2	import json
+     3	from typing import Any, Dict, Optional, List
+     4	
+     5	import aiohttp
+     6	
+     7	
+     8	class RpcError(RuntimeError):
+     9	    pass
+    10	
+    11	
+    12	class SolanaRPC:
+    13	    def __init__(self, rpc_http: str, timeout_s: int = 25):
+    14	        self.rpc_http = (rpc_http or "").strip()
+    15	        self.timeout_s = timeout_s
+    16	
+    17	    async def call(self, session: aiohttp.ClientSession, method: str, params: list) -> Any:
+    18	        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    19	        async with session.post(self.rpc_http, json=payload, timeout=self.timeout_s) as r:
+    20	            txt = await r.text()
+    21	            try:
+    22	                j = json.loads(txt)
+    23	            except Exception:
+    24	                raise RpcError(f"RPC non-JSON response: {txt[:200]}")
+    25	
+    26	            if "error" in j and j["error"]:
+    27	                raise RpcError(json.dumps(j["error"]))
+    28	            return j.get("result")
+    29	
+    30	    async def get_latest_blockhash(self, session: aiohttp.ClientSession, commitment: str = "processed") -> str:
+    31	        res = await self.call(session, "getLatestBlockhash", [{"commitment": commitment}])
+    32	        return res["value"]["blockhash"]
+    33	
+    34	    async def get_balance_lamports(self, session: aiohttp.ClientSession, pubkey: str, commitment: str = "processed") -> int:
+    35	        res = await self.call(session, "getBalance", [pubkey, {"commitment": commitment}])
+    36	        return int(res["value"])
+    37	
+    38	    async def get_account_info(self, session: aiohttp.ClientSession, pubkey: str, encoding: str = "jsonParsed") -> Dict[str, Any]:
+    39	        # encoding=jsonParsed permet de lire facilement les mints SPL (Tokenkeg)
+    40	        res = await self.call(session, "getAccountInfo", [pubkey, {"encoding": encoding}])
+    41	        return res
+    42	
+    43	    async def get_token_largest_accounts(self, session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+    44	        res = await self.call(session, "getTokenLargestAccounts", [mint])
+    45	        return res
+    46	
+    47	    async def simulate_transaction(
+    48	        self,
+    49	        session: aiohttp.ClientSession,
+    50	        tx_b64: str,
+    51	        commitment: str = "processed",
+    52	        replace_recent_blockhash: bool = True,
+    53	        sig_verify: bool = False,
+    54	    ) -> Dict[str, Any]:
+    55	        opts = {
+    56	            "encoding": "base64",
+    57	            "commitment": commitment,
+    58	            "replaceRecentBlockhash": replace_recent_blockhash,
+    59	            "sigVerify": sig_verify,
+    60	        }
+    61	        res = await self.call(session, "simulateTransaction", [tx_b64, opts])
+    62	        return res
+    63	
+    64	    async def send_transaction(
+    65	        self,
+    66	        session: aiohttp.ClientSession,
+    67	        tx_b64: str,
+    68	        skip_preflight: bool = False,
+    69	        preflight_commitment: str = "processed",
+    70	        max_retries: int = 3,
+    71	    ) -> str:
+    72	        opts = {
+    73	            "encoding": "base64",
+    74	            "skipPreflight": bool(skip_preflight),
+    75	            "preflightCommitment": preflight_commitment,
+    76	            "maxRetries": int(max_retries),
+    77	        }
+    78	        res = await self.call(session, "sendTransaction", [tx_b64, opts])
+    79	        return str(res)
+    80	
+    81	    async def get_signature_statuses(self, session: aiohttp.ClientSession, sigs: List[str]) -> Dict[str, Any]:
+    82	        res = await self.call(session, "getSignatureStatuses", [sigs, {"searchTransactionHistory": True}])
+    83	        return res
+
+
+========================
+FILE: src/rpc_token_balance.py
+========================
+     1	import json
+     2	import os
+     3	import requests
+     4	from typing import Optional, Tuple
+     5	
+     6	RPC = (os.getenv("SOLANA_RPC_HTTP") or "https://api.mainnet-beta.solana.com").strip()
+     7	
+     8	def _rpc(method: str, params: list):
+     9	    r = requests.post(RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=25)
+    10	    r.raise_for_status()
+    11	    j = r.json()
+    12	    if "error" in j and j["error"]:
+    13	        raise RuntimeError(json.dumps(j["error"]))
+    14	    return j.get("result")
+    15	
+    16	def get_token_ui_amount(owner: str, mint: str) -> Tuple[float, int]:
+    17	    # retourne (ui_amount, decimals)
+    18	    res = _rpc("getTokenAccountsByOwner", [owner, {"mint": mint}, {"encoding":"jsonParsed"}])
+    19	    value = (res or {}).get("value") or []
+    20	    total_ui = 0.0
+    21	    dec = 0
+    22	    for it in value:
+    23	        info = (((it.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+    24	        ta = info.get("tokenAmount") or {}
+    25	        dec = int(ta.get("decimals") or dec)
+    26	        ui = float(ta.get("uiAmount") or 0.0)
+    27	        total_ui += ui
+    28	    return total_ui, dec
+
+
+========================
+FILE: src/sell_engine.py
+========================
+     1	import os, json, time, sqlite3
+     2	from pathlib import Path
+     3	from typing import Optional, Dict, Any
+     4	import requests
+     5	
+     6	DB_PATH = os.getenv("DB_PATH", os.getenv("TRADES_DB_PATH", "state/trades.sqlite"))
+     7	CHECK_INTERVAL = float(os.getenv("SELL_CHECK_INTERVAL", os.getenv("CHECK_INTERVAL", "8")))
+     8	
+     9	# TP/Stops (tu peux override via .env.real)
+    10	STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.15"))                 # -15%
+    11	TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "0.03"))  # +3% active
+    12	TRAILING_FROM_HIGH_PCT = float(os.getenv("TRAILING_FROM_HIGH_PCT", "0.05"))    # -5% from peak
+    13	
+    14	TP1_GAIN_PCT = float(os.getenv("TP1_GAIN_PCT", "0.25"))                   # +25%
+    15	TP1_SELL_FRAC = float(os.getenv("TP1_SELL_FRACTION_INITIAL", "0.50"))     # sell 50%
+    16	TP2_GAIN_PCT = float(os.getenv("TP2_GAIN_PCT", "0.60"))                   # +60%
+    17	TP2_SELL_FRAC = float(os.getenv("TP2_SELL_FRACTION_INITIAL", "0.25"))     # sell 25%
+    18	
+    19	JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag")).rstrip("/")
+    20	JUP_API_KEY=***MASKED***
+    21	SOL_MINT = "So11111111111111111111111111111111111111112"
+    22	
+    23	# pour estimer un prix token en SOL via quote
+    24	PRICE_SOL_IN_LAMPORTS = int(float(os.getenv("SELL_PRICE_PROBE_SOL", "0.01")) * 1_000_000_000)
+    25	
+    26	def _headers():
+    27	    h={"accept":"application/json"}
+    28	    if JUP_API_KEY:
+    29	        h["x-api-key"]=JUP_API_KEY
+    30	    return h
+    31	
+    32	def _db():
+    33	    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    34	    return sqlite3.connect(DB_PATH, timeout=30)
+    35	
+    36	def _event(conn, ts: int, mint: str, status: str, err: str = "", data: Optional[Dict[str, Any]] = None):
+    37	    data = data or {}
+    38	    conn.execute(
+    39	        "INSERT INTO events(ts,mint,status,err,data_json,data) VALUES(?,?,?,?,?,?)",
+    40	        (ts, mint, status, err, json.dumps(data, ensure_ascii=False), json.dumps(data, ensure_ascii=False)),
+    41	    )
+    42	    conn.commit()
+    43	
+    44	def _get_price_sol_per_token(mint: str) -> Optional[float]:
+    45	    """
+    46	    Approx price via Jupiter quote:
+    47	      input SOL amount -> output token amount
+    48	    price (SOL/token=***MASKED***
+    49	    """
+    50	    try:
+    51	        url = f"{JUP_BASE}/swap/v1/quote"
+    52	        params = {
+    53	            "inputMint": SOL_MINT,
+    54	            "outputMint": mint,
+    55	            "amount": str(PRICE_SOL_IN_LAMPORTS),
+    56	            "slippageBps": "50",
+    57	        }
+    58	        r = requests.get(url, params=params, headers=_headers(), timeout=20)
+    59	        if r.status_code != 200:
+    60	            return None
+    61	        q = r.json()
+    62	        out_amt = float(q.get("outAmount") or 0)
+    63	        if out_amt <= 0:
+    64	            return None
+    65	        sol_in = PRICE_SOL_IN_LAMPORTS / 1_000_000_000
+    66	        return sol_in / out_amt
+    67	    except Exception:
+    68	        return None
+    69	
+    70	def _load_positions(conn):
+    71	    cur = conn.execute("SELECT mint, entry_price, entry_ts, size_sol, peak_price, tp_done, status, meta_json FROM positions WHERE status='OPEN'")
+    72	    rows = cur.fetchall()
+    73	    out=[]
+    74	    for r in rows:
+    75	        out.append({
+    76	            "mint": r[0],
+    77	            "entry_price": float(r[1]),
+    78	            "entry_ts": int(r[2]),
+    79	            "size_sol": float(r[3]),
+    80	            "peak_price": (float(r[4]) if r[4] is not None else None),
+    81	            "tp_done": int(r[5] or 0),
+    82	            "status": r[6],
+    83	            "meta_json": r[7] or "",
+    84	        })
+    85	    return out
+    86	
+    87	def _update_peak(conn, mint: str, peak: float):
+    88	    conn.execute("UPDATE positions SET peak_price=? WHERE mint=?", (peak, mint))
+    89	    conn.commit()
+    90	
+    91	def _set_tp_done(conn, mint: str, tp_done: int):
+    92	    conn.execute("UPDATE positions SET tp_done=? WHERE mint=?", (tp_done, mint))
+    93	    conn.commit()
+    94	
+    95	def _close_position(conn, mint: str, why: str):
+    96	    conn.execute("UPDATE positions SET status='CLOSED' WHERE mint=?", (mint,))
+    97	    conn.execute("UPDATE trades SET status=? WHERE mint=?", (why, mint))
+    98	    conn.commit()
+    99	
+   100	def _ensure_trades_row(conn, mint: str):
+   101	    ts=int(time.time())
+   102	    conn.execute(
+   103	        "INSERT OR IGNORE INTO trades(mint, first_seen_ts, last_ts, status, last_error, payload_json) VALUES(?,?,?,?,?,?)",
+   104	        (mint, ts, ts, "OPEN", "", "{}")
+   105	    )
+   106	    conn.commit()
+   107	
+   108	def _call_sell_build(mint: str, fraction: float, token_amount_raw: int):
+   109	    """
+   110	    On BUILD la tx de sell via trader_exec.py (mode SELL)
+   111	    SIGN/SEND = ta pipeline existante.
+   112	    """
+   113	    env = os.environ.copy()
+   114	    env["SELL_MODE"] = "1"
+   115	    env["SELL_MINT"] = mint
+   116	    env["SELL_FRACTION"] = str(fraction)
+   117	    env["SELL_TOKEN=***MASKED***
+   118	    # one shot
+   119	    env["TRADER_ONE_SHOT"] = "1"
+   120	
+   121	    import subprocess
+   122	    subprocess.run(["python", "src/trader_exec.py"], env=env, check=False)
+   123	
+   124	def sell_engine():
+   125	    print("🔥 sell_engine started")
+   126	    print("   db_path=", DB_PATH)
+   127	    print("   TP1=", TP1_GAIN_PCT, "frac=", TP1_SELL_FRAC, "| TP2=", TP2_GAIN_PCT, "frac=", TP2_SELL_FRAC)
+   128	    print("   SL=", STOP_LOSS_PCT, "| trail_act=", TRAILING_ACTIVATION_PCT, "trail_from_high=", TRAILING_FROM_HIGH_PCT)
+   129	
+   130	    while True:
+   131	        ts = int(time.time())
+   132	        try:
+   133	            conn = _db()
+   134	            try:
+   135	                positions = _load_positions(conn)
+   136	                for p in positions:
+   137	                    mint = p["mint"]
+   138	                    _ensure_trades_row(conn, mint)
+   139	
+   140	                    price = _get_price_sol_per_token(mint)
+   141	                    if price is None:
+   142	                        _event(conn, ts, mint, "PRICE_FAIL", "no_quote_price", {})
+   143	                        continue
+   144	
+   145	                    entry = p["entry_price"]
+   146	                    peak = p["peak_price"] if p["peak_price"] is not None else entry
+   147	                    # peak update
+   148	                    if price > peak:
+   149	                        peak = price
+   150	                        _update_peak(conn, mint, peak)
+   151	
+   152	                    gain = (price - entry) / entry  # +0.25 == +25%
+   153	                    drawdown_from_peak = (peak - price) / peak if peak > 0 else 0.0
+   154	
+   155	                    # HARD STOP (loss)
+   156	                    if gain <= -STOP_LOSS_PCT:
+   157	                        _event(conn, ts, mint, "SELL_SIGNAL", "HARD_STOP", {"gain": gain, "price": price, "entry": entry})
+   158	                        # NOTE: without token balance, we can't compute raw amount to sell.
+   159	                        # Use meta_json hook if you store token_amount_raw there.
+   160	                        meta={}
+   161	                        try: meta=json.loads(p["meta_json"] or "{}")
+   162	                        except Exception: meta={}
+   163	                        token=***MASKED***
+   164	                        if token=***MASKED***
+   165	                            _event(conn, ts, mint, "SELL_BLOCKED", "missing_token_amount_raw_in_meta_json", {"hint":"store token_amount_raw in positions.meta_json"})
+   166	                            continue
+   167	                        _call_sell_build(mint, 1.0, token_raw)
+   168	                        _close_position(conn, mint, "CLOSED_HARD_STOP")
+   169	                        continue
+   170	
+   171	                    # TP1/TP2
+   172	                    tp_done = p["tp_done"]
+   173	                    meta={}
+   174	                    try: meta=json.loads(p["meta_json"] or "{}")
+   175	                    except Exception: meta={}
+   176	                    token=***MASKED***
+   177	
+   178	                    if token=***MASKED***
+   179	                        # we can still track peak/trailing even if we cannot sell yet
+   180	                        _event(conn, ts, mint, "META_WARN", "missing_token_amount_raw_in_meta_json", {"gain": gain})
+   181	                    else:
+   182	                        if tp_done < 1 and gain >= TP1_GAIN_PCT:
+   183	                            _event(conn, ts, mint, "SELL_SIGNAL", "TP1", {"gain": gain, "price": price})
+   184	                            _call_sell_build(mint, TP1_SELL_FRAC, token_raw)
+   185	                            _set_tp_done(conn, mint, 1)
+   186	                            tp_done = 1
+   187	
+   188	                        if tp_done < 2 and gain >= TP2_GAIN_PCT:
+   189	                            _event(conn, ts, mint, "SELL_SIGNAL", "TP2", {"gain": gain, "price": price})
+   190	                            _call_sell_build(mint, TP2_SELL_FRAC, token_raw)
+   191	                            _set_tp_done(conn, mint, 2)
+   192	                            tp_done = 2
+   193	
+   194	                    # TRAILING (only once activated)
+   195	                    if gain >= TRAILING_ACTIVATION_PCT and drawdown_from_peak >= TRAILING_FROM_HIGH_PCT:
+   196	                        _event(conn, ts, mint, "SELL_SIGNAL", "TRAILING", {"gain": gain, "dd": drawdown_from_peak, "price": price, "peak": peak})
+   197	                        if token=***MASKED***
+   198	                            _event(conn, ts, mint, "SELL_BLOCKED", "missing_token_amount_raw_in_meta_json", {})
+   199	                            continue
+   200	                        _call_sell_build(mint, 1.0, token_raw)
+   201	                        _close_position(conn, mint, "CLOSED_TRAIL")
+   202	                        continue
+   203	
+   204	            finally:
+   205	                conn.close()
+   206	
+   207	        except Exception as e:
+   208	            try:
+   209	                conn = _db()
+   210	                _event(conn, int(time.time()), "GLOBAL", "SELL_ENGINE_ERR", str(e), {})
+   211	                conn.close()
+   212	            except Exception:
+   213	                pass
+   214	
+   215	        time.sleep(CHECK_INTERVAL)
+   216	
+   217	if __name__ == "__main__":
+   218	    sell_engine()
+
+
+===== CALL GRAPH QUICK =====
+
+===== DB WRITES =====
+
+===== SIGN/SEND =====

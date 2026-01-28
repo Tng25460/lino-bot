@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+import os
+
+from core.executor import Executor, Fill
+
+try:
+    from core.raydium_client import RaydiumClient
+except Exception:
+    RaydiumClient = None  # type: ignore
+
+
+class RealExecutor(Executor):
+    """
+    Exécuteur REAL qui appelle RaydiumClient SANS le modifier.
+    - DRY_RUN_REAL=1 => n'initialise pas RaydiumClient (aucun besoin de RPC)
+    - DRY_RUN_REAL=0 => initialise RaydiumClient avec rpc_url et/ou solana_client si dispo
+    """
+
+    def __init__(self, wallet: Any, logger: Any):
+        self.wallet = wallet
+        self.logger = logger
+
+        self.dry_run = os.getenv("DRY_RUN_REAL", "1") == "1"
+        self.rpc_url = os.getenv("RPC_URL") or ""
+        self.slippage_bps = int(os.getenv("SLIPPAGE_BPS", "800"))  # 8% par défaut meme coins
+        self.priority_fee = int(os.getenv("PRIORITY_FEE_MICROLAMPORTS", "20000"))
+        self.confirm_level = os.getenv("CONFIRM_LEVEL", "confirmed")
+
+        # ✅ En DRY_RUN: on ne crée pas RaydiumClient -> pas d'erreur rpc/solana_client
+        self.client = None
+        if self.dry_run:
+            self.logger.warning("[RealExecutor] DRY_RUN_REAL=1 -> RaydiumClient non initialisé (safe)")
+            return
+
+        if RaydiumClient is None:
+            raise RuntimeError("RaydiumClient introuvable. core/raydium_client.py manque ou import impossible.")
+
+        # Tentative: créer un solana_client si ton projet en a un
+        solana_client = None
+        try:
+            from core.solana_client import SolanaClient  # si existe dans ton repo
+            try:
+                solana_client = SolanaClient(rpc_url=self.rpc_url)  # certains constructeurs prennent rpc_url
+            except TypeError:
+                solana_client = SolanaClient()  # sinon constructeur sans args
+        except Exception:
+            solana_client = None
+
+        # Instanciation robuste de RaydiumClient selon sa signature
+        last_err: Optional[Exception] = None
+        for kwargs in (
+            {"solana_client": solana_client, "rpc_url": self.rpc_url},
+            {"solana_client": solana_client},
+            {"rpc_url": self.rpc_url},
+            {},
+        ):
+            try:
+                # retire None/vides
+                kwargs = {k: v for k, v in kwargs.items() if v not in (None, "", {})}
+                self.client = RaydiumClient(**kwargs)  # type: ignore
+                self.logger.info(f"[RealExecutor] RaydiumClient initialisé avec {list(kwargs.keys())}")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                self.client = None
+
+        if self.client is None:
+            raise RuntimeError(f"Impossible d'initialiser RaydiumClient (RPC_URL='{self.rpc_url}'): {last_err}")
+
+    def buy(self, mint: str, price: float, sol_amount: float) -> Fill:
+        if self.dry_run:
+            self.logger.warning(f"[DRY_RUN_REAL BUY] mint={mint} sol={sol_amount} price~{price}")
+            return Fill(ok=False, price=price, reason="dry_run")
+
+        assert self.client is not None
+
+        for method_name in ("buy_sol_to_token", "swap_sol_to_token", "swap_sol_for_token", "buy"):
+            fn = getattr(self.client, method_name, None)
+            if callable(fn):
+                try:
+                    self.logger.info(f"[REAL BUY] RaydiumClient.{method_name} mint={mint} sol={sol_amount}")
+                    fn(
+                        mint=mint,
+                        sol_amount=sol_amount,
+                        slippage_bps=self.slippage_bps,
+                        priority_fee_microlamports=self.priority_fee,
+                        confirm_level=self.confirm_level,
+                        wallet=self.wallet,
+                    )
+                    return Fill(ok=True, price=price, reason=f"raydium:{method_name}")
+                except Exception as e:
+                    self.logger.error(f"[REAL BUY] RaydiumClient.{method_name} error: {e}")
+                    return Fill(ok=False, price=price, reason=str(e))
+
+        self.logger.error("[REAL BUY] Aucune méthode de swap trouvée dans RaydiumClient.")
+        return Fill(ok=False, price=price, reason="no_swap_method")
+
+    def sell(self, mint: str, price: float, reason: str) -> Fill:
+        if self.dry_run:
+            self.logger.warning(f"[DRY_RUN_REAL SELL] mint={mint} reason={reason} price~{price}")
+            return Fill(ok=False, price=price, reason="dry_run")
+
+        assert self.client is not None
+
+        for method_name in ("sell_token_to_sol", "swap_token_to_sol", "swap_token_for_sol", "sell"):
+            fn = getattr(self.client, method_name, None)
+            if callable(fn):
+                try:
+                    self.logger.info(f"[REAL SELL] RaydiumClient.{method_name} mint={mint} reason={reason}")
+                    fn(
+                        mint=mint,
+                        slippage_bps=self.slippage_bps,
+                        priority_fee_microlamports=self.priority_fee,
+                        confirm_level=self.confirm_level,
+                        wallet=self.wallet,
+                        reason=reason,
+                    )
+                    return Fill(ok=True, price=price, reason=f"raydium:{method_name}:{reason}")
+                except Exception as e:
+                    self.logger.error(f"[REAL SELL] RaydiumClient.{method_name} error: {e}")
+                    return Fill(ok=False, price=price, reason=str(e))
+
+        self.logger.error("[REAL SELL] Aucune méthode de swap trouvée dans RaydiumClient.")
+        return Fill(ok=False, price=price, reason="no_swap_method")

@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import requests
+
+# solders + solana-py rpc types (solana-py utilise solders en backend)
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solana.rpc.api import Client
+from solana.rpc.types import TxOpts
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+READY_FILE = Path(os.getenv("READY_FILE", "ready_to_trade.jsonl"))
+OUT_TX_B64 = Path(os.getenv("OUT_TX_B64", "last_swap_tx.b64"))
+OUT_META = Path(os.getenv("OUT_META", "last_swap_meta.json"))
+OUT_ERR = Path(os.getenv("OUT_ERR", "last_swap_error.json"))
+
+RPC_HTTP = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")).strip()
+JUP_BASE = (os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag"))).rstrip("/")
+JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
+JUP_SWAP_URL = os.getenv("JUP_SWAP_URL", f"{JUP_BASE}/swap/v1/swap")
+
+ONE_SHOT = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1", "true", "yes", "on")
+DRY_RUN = os.getenv("TRADER_DRY_RUN", os.getenv("DRY_RUN", "1")).strip().lower() in ("1", "true", "yes", "on")
+SKIP_PREFLIGHT = os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1", "true", "yes", "on")
+
+SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", os.getenv("TRADER_SLIPPAGE_BPS", "120")))
+MAX_PRICE_IMPACT_PCT = float(os.getenv("MAX_PRICE_IMPACT_PCT", os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", "1.5")))
+
+# Buffer SOL pour frais/ATA/etc (en SOL)
+MIN_SOL_BUFFER = float(os.getenv("MIN_SOL_BUFFER", "0.003"))  # ~0.003 SOL
+# Garde-fou: ne trade pas si balance < MIN_SOL_TO_TRADE
+MIN_SOL_TO_TRADE = float(os.getenv("MIN_SOL_TO_TRADE", "0.0"))
+
+DEFAULT_SOL_AMOUNT_RAW = os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")).strip()
+
+def _write_err(where: str, payload: Dict[str, Any]) -> None:
+    OUT_ERR.write_text(json.dumps({"where": where, "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _headers() -> Dict[str, str]:
+    h = {"accept": "application/json"}
+    k = os.getenv("JUPITER_API_KEY") or os.getenv("JUP_API_KEY") or ""
+    if k:
+        h["x-api-key"] = k
+    return h
+
+def _load_ready() -> list[Dict[str, Any]]:
+    if not READY_FILE.exists():
+        return []
+    rows: list[Dict[str, Any]] = []
+    for line in READY_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+def _get_balance_lamports(rpc_http: str, pubkey: str) -> int:
+    # simple JSON-RPC (requests)
+    r = requests.post(
+        rpc_http,
+        json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]},
+        timeout=20,
+    )
+    j = r.json()
+    return int(j["result"]["value"])
+
+def _parse_sol_amount_to_lamports(sol_amount_raw: str, bal_lamports: int) -> int:
+    s = (sol_amount_raw or "").strip().upper()
+    if s in ("ALL", "MAX"):
+        # utilise (balance - buffer)
+        buffer_lamports = int(MIN_SOL_BUFFER * 1_000_000_000)
+        amt = max(0, bal_lamports - buffer_lamports)
+        return int(amt)
+    # float normal
+    sol = float(sol_amount_raw)
+    return int(sol * 1_000_000_000)
+
+def _load_keypair(path: str) -> Keypair:
+    if not path:
+        raise RuntimeError("Missing SOLANA_KEYPAIR=/path/to/keypair.json")
+    arr = json.load(open(path, "r"))
+    if not isinstance(arr, list) or len(arr) not in (64, 32):
+        raise RuntimeError("Invalid keypair json (expected [64] or [32] ints)")
+    b = bytes([int(x) for x in arr])
+    # solders Keypair expects 64-byte secret key; if 32 provided, interpret as seed
+    if len(b) == 64:
+        return Keypair.from_bytes(b)
+    return Keypair.from_seed(b)
+
+def _sign_and_send_versioned_tx(txb64: str, rpc_http: str, keypair_path: str) -> str:
+    kp = _load_keypair(keypair_path)
+    raw = base64.b64decode(txb64)
+    tx = VersionedTransaction.from_bytes(raw)
+    # Rebuild with our signature
+    signed = VersionedTransaction(tx.message, [kp])
+
+    client = Client(rpc_http)
+    opts = TxOpts(skip_preflight=SKIP_PREFLIGHT, preflight_commitment="processed")
+    resp = client.send_raw_transaction(bytes(signed), opts=opts)
+    # solana-py returns RPCResponse-like dict
+    if isinstance(resp, dict) and "result" in resp:
+        return str(resp["result"])
+    return str(resp)
+
+def main() -> int:
+    # wallet pubkey
+    user_pubkey = (os.getenv("TRADER_USER_PUBLIC_KEY") or os.getenv("WALLET_PUBKEY") or "").strip()
+    if not user_pubkey:
+        print("❌ missing WALLET_PUBKEY/TRADER_USER_PUBLIC_KEY")
+        return 0
+
+    # guard MIN_SOL_TO_TRADE
+    bal_lamports = _get_balance_lamports(RPC_HTTP, user_pubkey)
+    bal_sol = bal_lamports / 1e9
+    if MIN_SOL_TO_TRADE > 0 and bal_sol < MIN_SOL_TO_TRADE:
+        print(f"❌ MIN_SOL_TO_TRADE block: balance {bal_sol:.6f} < MIN_SOL_TO_TRADE {MIN_SOL_TO_TRADE:.6f}")
+        return 0
+
+    # pick mint
+    ready = _load_ready()
+    print("🚀 trader_exec BUY")
+    print("   ready_file=", str(READY_FILE))
+    print("   jup_base=", JUP_BASE)
+    print("   rpc_http=", RPC_HTTP)
+    print("   input_mint=", SOL_MINT)
+    print("   slippage_bps=", SLIPPAGE_BPS, "max_price_impact=", f"{MAX_PRICE_IMPACT_PCT}%")
+    print("   one_shot=", ONE_SHOT, "dry_run=", DRY_RUN)
+    print("   ready_count=", len(ready))
+    if not ready:
+        _write_err("no_ready_candidates", {"ready_file": str(READY_FILE)})
+        print("⚠️ ready_to_trade vide")
+        return 0
+
+    cand = ready[0]
+    output_mint = (cand.get("outputMint") or cand.get("mint") or "").strip()
+    if not output_mint:
+        _write_err("bad_candidate_no_mint", {"candidate": cand})
+        print("⚠️ candidate sans mint/outputMint")
+        return 0
+
+    # amount
+    amt_raw = str(cand.get("amount") or DEFAULT_SOL_AMOUNT_RAW).strip()
+    try:
+        amount_lamports = _parse_sol_amount_to_lamports(amt_raw, bal_lamports)
+    except Exception as e:
+        _write_err("bad_amount", {"amount_raw": amt_raw, "err": str(e)})
+        print("❌ bad amount:", amt_raw, "err=", e)
+        return 0
+
+    # buffer guard: amount + buffer <= balance
+    buffer_lamports = int(MIN_SOL_BUFFER * 1_000_000_000)
+    need = int(amount_lamports + buffer_lamports)
+    if bal_lamports < need:
+        print(f"❌ insufficient SOL balance: {bal_lamports} need~ {need} (amount {amount_lamports} + buffer {buffer_lamports} )")
+        return 0
+
+    print("   pick=", output_mint, "amount_lamports=", amount_lamports)
+
+    # QUOTE
+    params = {
+        "inputMint": SOL_MINT,
+        "outputMint": output_mint,
+        "amount": str(amount_lamports),
+        "slippageBps": str(SLIPPAGE_BPS),
+    }
+    try:
+        qr = requests.get(JUP_QUOTE_URL, params=params, headers=_headers(), timeout=25)
+        if qr.status_code != 200:
+            _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
+            print("❌ quote failed http=", qr.status_code)
+            return 0
+        quote = qr.json()
+    except Exception as e:
+        _write_err("quote_exc", {"error": str(e)})
+        print("❌ quote exception:", e)
+        return 0
+
+    # SWAP build
+    body = {"quoteResponse": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": True}
+    try:
+        sr = requests.post(JUP_SWAP_URL, headers=_headers(), json=body, timeout=35)
+        if sr.status_code != 200:
+            _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
+            print("❌ swap build failed http=", sr.status_code)
+            return 0
+        swap = sr.json()
+        txb64 = swap.get("swapTransaction")
+        if not txb64:
+            _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
+            print("⚠️ swap response sans swapTransaction")
+            return 0
+
+        OUT_TX_B64.write_text(txb64, encoding="utf-8")
+        OUT_META.write_text(
+            json.dumps(
+                {
+                    "ts": int(time.time()),
+                    "mode": "BUY",
+                    "inputMint": SOL_MINT,
+                    "outputMint": output_mint,
+                    "amountLamports": amount_lamports,
+                    "slippageBps": SLIPPAGE_BPS,
+                    "userPublicKey": user_pubkey,
+                    "quoteUrl": qr.url,
+                    "swapUrl": JUP_SWAP_URL,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        print("✅ built tx -> last_swap_tx.b64")
+
+        if DRY_RUN:
+            print("🧪 DRY_RUN=1 -> not sending")
+            return 0
+
+        keypair_path = os.getenv("SOLANA_KEYPAIR", "").strip()
+        if not keypair_path:
+            print("❌ Missing SOLANA_KEYPAIR=/path/to/keypair.json (needed to sign+send)")
+            return 0
+
+        txsig = _sign_and_send_versioned_tx(txb64, RPC_HTTP, keypair_path)
+        print("✅ sent txsig=", txsig)
+        return 0
+
+    except Exception as e:
+        _write_err("swap_exc", {"error": str(e)})
+        print("❌ swap exception:", e)
+        return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

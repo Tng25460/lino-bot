@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import aiohttp
+
+
+logger = logging.getLogger("TokenScanner")
+
+DEX_BASE = "https://api.dexscreener.com"
+DEX_SEARCH = DEX_BASE + "/latest/dex/search?q={q}"
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LinoBot/1.0",
+}
+
+
+def _cfg_get(cfg: Any, *names: str, default: Any = None) -> Any:
+    """Retourne cfg.<name> pour le 1er name existant, sinon default."""
+    for n in names:
+        if hasattr(cfg, n):
+            return getattr(cfg, n)
+    return default
+
+
+class _RateLimiter:
+    """Simple rate limiter (req/s) multi-coroutines."""
+    def __init__(self, rps: float):
+        self.rps = max(0.01, float(rps or 1.0))
+        self._lock = asyncio.Lock()
+        self._next_ts = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._next_ts:
+                await asyncio.sleep(self._next_ts - now)
+            # slot suivant
+            self._next_ts = max(self._next_ts, time.monotonic()) + (1.0 / self.rps)
+
+
+@dataclass
+class ScannerConfig:
+    # Compat main.py (vu dans tes erreurs/logs)
+    new_listing_limit: int = 30          # ancien nom “limit”
+    global_rps: float = 2.0              # req/s
+    max_concurrency: int = 1             # aiohttp concurrent
+    scan_interval_seconds: int = 25      # loop sleep
+
+    # DexScreener scope
+    chain: str = "solana"
+    dexes: List[str] = field(default_factory=lambda: ["raydium", "pumpfun"])
+    queries: List[str] = field(default_factory=lambda: ["pump", "raydium", "bonk", "wif", "sol"])
+
+    # Filtres “qualité”
+    min_liquidity_usd: float = 2500.0
+    min_volume_m5_usd: float = 0.0
+    min_txns_m5: int = 0
+
+    # Réseau / debug
+    timeout_sec: int = 20
+    debug_log_raw: bool = False
+
+    # Compat éventuelle si ailleurs tu utilises scan_limit
+    @property
+    def scan_limit(self) -> int:
+        return int(self.new_listing_limit)
+
+    @scan_limit.setter
+    def scan_limit(self, v: int) -> None:
+        self.new_listing_limit = int(v)
+
+
+class TokenScanner:
+    """
+    TokenScanner basé sur DexScreener search.
+    IMPORTANT compat TradingEngine:
+      - TradingEngine lit ov['data'] (raw DexScreener pair)
+      - On fournit AUSSI ov['_raw'] (même objet) et des champs flatten pratiques.
+    """
+
+    def __init__(self, cfg: Union[ScannerConfig, Any]):
+        # cfg peut être ScannerConfig ou module config.settings
+        if isinstance(cfg, ScannerConfig):
+            self.cfg = cfg
+        else:
+            self.cfg = ScannerConfig(
+                new_listing_limit=int(_cfg_get(cfg, "new_listing_limit", "scan_limit", "SCAN_LIMIT", default=30) or 30),
+                global_rps=float(_cfg_get(cfg, "global_rps", "scanner_rps", "RPS", default=2.0) or 2.0),
+                max_concurrency=int(_cfg_get(cfg, "max_concurrency", "scanner_concurrency", "CONCURRENCY", default=1) or 1),
+                scan_interval_seconds=int(_cfg_get(cfg, "SCAN_INTERVAL_SECONDS", "scan_interval_seconds", default=25) or 25),
+                chain=str(_cfg_get(cfg, "SCANNER_CHAIN", "chain", default="solana") or "solana"),
+                dexes=list(_cfg_get(cfg, "SCANNER_DEXES", "dexes", default=["raydium", "pumpfun"]) or ["raydium", "pumpfun"]),
+                queries=list(_cfg_get(cfg, "SCANNER_QUERIES", "queries", default=["pump", "raydium", "bonk", "wif", "sol"]) or ["pump", "raydium", "bonk", "wif", "sol"]),
+                min_liquidity_usd=float(_cfg_get(cfg, "MIN_LIQUIDITY_USD", "min_liquidity_usd", default=2500.0) or 2500.0),
+                min_volume_m5_usd=float(_cfg_get(cfg, "MIN_VOLUME_M5_USD", "min_volume_m5_usd", default=0.0) or 0.0),
+                min_txns_m5=int(_cfg_get(cfg, "MIN_TXNS_M5", "min_txns_m5", default=0) or 0),
+                timeout_sec=int(_cfg_get(cfg, "SCANNER_TIMEOUT_SEC", "timeout_sec", default=20) or 20),
+                debug_log_raw=bool(_cfg_get(cfg, "SCANNER_DEBUG_RAW", "debug_log_raw", default=False)),
+            )
+
+        self._rl = _RateLimiter(self.cfg.global_rps)
+        self._sem = asyncio.Semaphore(max(1, int(self.cfg.max_concurrency)))
+
+        logger.info("[Scanner] ✅ limit=%s rps=%s conc=%s", self.cfg.new_listing_limit, self.cfg.global_rps, self.cfg.max_concurrency)
+
+    # -------------------------
+    # Public API (compat)
+    # -------------------------
+    async def scan_once_async(self) -> List[Dict[str, Any]]:
+        pairs = await self._fetch_pairs()
+        ovs = [self._pair_to_overview(p) for p in pairs]
+        ovs = [o for o in ovs if o is not None]
+
+        # tri: score desc
+        ovs.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        return ovs[: int(self.cfg.new_listing_limit)]
+
+    async def get_overviews(self) -> List[Dict[str, Any]]:
+        return await self.scan_once_async()
+
+    async def fetch_overviews(self) -> List[Dict[str, Any]]:
+        return await self.scan_once_async()
+
+    async def scan_overviews(self) -> List[Dict[str, Any]]:
+        return await self.scan_once_async()
+
+    async def scan(self) -> List[Dict[str, Any]]:
+        return await self.scan_once_async()
+
+    # -------------------------
+    # DexScreener fetch
+    # -------------------------
+    async def _dex_search(self, session: aiohttp.ClientSession, q: str) -> List[Dict[str, Any]]:
+        url = DEX_SEARCH.format(q=aiohttp.helpers.quote(q, safe=""))
+        await self._rl.wait()
+        async with self._sem:
+            async with session.get(
+                url,
+                headers=DEFAULT_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=self.cfg.timeout_sec),
+            ) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    logger.warning("[DEX] status=%s url=%s body=%s", resp.status, url, txt[:200])
+                    return []
+                js = await resp.json(content_type=None)
+                pairs = js.get("pairs") or []
+                if self.cfg.debug_log_raw:
+                    logger.info("[DBG_DEX] q=%s pairs=%s", q, len(pairs))
+                return pairs
+
+    async def _fetch_pairs(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        timeout = aiohttp.ClientTimeout(total=self.cfg.timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for q in (self.cfg.queries or []):
+                try:
+                    ps = await self._dex_search(session, str(q))
+                except Exception as e:
+                    logger.exception("[DEX] search error q=%s: %s", q, e)
+                    continue
+                out.extend(ps)
+
+        # scope chain/dex + dedupe par pairAddress
+        chain = (self.cfg.chain or "").lower().strip()
+        dexes = {d.lower().strip() for d in (self.cfg.dexes or []) if d}
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for p in out:
+            if not isinstance(p, dict):
+                continue
+            if chain and (str(p.get("chainId") or "").lower() != chain):
+                continue
+            dex = str(p.get("dexId") or "").lower()
+            if dexes and dex not in dexes:
+                continue
+            pa = str(p.get("pairAddress") or "")
+            if not pa:
+                continue
+            # garde le meilleur score brut DexScreener si dispo
+            if pa not in dedup:
+                dedup[pa] = p
+            else:
+                old = dedup[pa]
+                if float(p.get("liquidity", {}).get("usd") or 0) > float(old.get("liquidity", {}).get("usd") or 0):
+                    dedup[pa] = p
+
+        return list(dedup.values())
+
+    # -------------------------
+    # Transform + scoring
+    # -------------------------
+    def _pair_to_overview(self, pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            base = pair.get("baseToken") or {}
+            mint = base.get("address")
+            sym = base.get("symbol") or base.get("name")
+
+            liq_usd = float(((pair.get("liquidity") or {}).get("usd")) or 0.0)
+            vol_m5 = float(((pair.get("volume") or {}).get("m5")) or 0.0)
+            tx_m5 = (pair.get("txns") or {}).get("m5") or {}
+            buys = int(tx_m5.get("buys") or 0)
+            sells = int(tx_m5.get("sells") or 0)
+            txns_m5 = buys + sells
+            tpm = txns_m5 / 5.0 if txns_m5 > 0 else 0.0
+
+            # filtres basiques
+            if liq_usd < float(self.cfg.min_liquidity_usd or 0.0):
+                return None
+            if vol_m5 < float(self.cfg.min_volume_m5_usd or 0.0):
+                return None
+            if txns_m5 < int(self.cfg.min_txns_m5 or 0):
+                return None
+
+            score = self._score(liq_usd, vol_m5, txns_m5)
+
+            ov: Dict[str, Any] = {
+                "mint": mint,
+                "sym": sym,
+                "symbol": sym,
+                "ticker": sym,
+
+                "chainId": pair.get("chainId"),
+                "dexId": pair.get("dexId"),
+                "pairAddress": pair.get("pairAddress"),
+                "url": pair.get("url"),
+
+                # flatten (compat logs)
+                "liq": liq_usd,
+                "liquidity_usd": liq_usd,
+                "liquidity": {"usd": liq_usd},
+
+                "vol_m5": vol_m5,
+                "volume_m5_usd": vol_m5,
+                "volume": {"m5": vol_m5},
+
+                "txns_m5": txns_m5,
+                "tpm": tpm,
+                "tx_per_min": tpm,
+                "tx_per_minute": tpm,
+                "txns": {"m5": {"buys": buys, "sells": sells}},
+
+                "marketCap": float(pair.get("marketCap") or 0.0),
+                "fdv": float(pair.get("fdv") or 0.0),
+
+                "priceUsd": pair.get("priceUsd"),
+                "priceNative": pair.get("priceNative"),
+
+                "score": float(score),
+
+                # *** LE POINT CRITIQUE : compat TradingEngine ***
+                # trading.py lit ov['data'] (raw DexScreener)
+                "data": pair,
+                "_raw": pair,
+            }
+            return ov
+        except Exception as e:
+            logger.exception("[TokenScanner] pair_to_overview error: %s", e)
+            return None
+
+    @staticmethod
+    def _score(liq_usd: float, vol_m5: float, txns_m5: int) -> float:
+        # Simple, stable, monotonic (pas “magique”)
+        # log1p pour éviter explosion et garder tri correct.
+        s_liq = math.log1p(max(0.0, liq_usd))
+        s_vol = math.log1p(max(0.0, vol_m5))
+        s_tx = math.log1p(max(0.0, float(txns_m5)))
+        # pondération proche de ce qu’on utilisait implicitement
+        return (2.2 * s_tx) + (1.4 * s_vol) + (0.9 * s_liq)

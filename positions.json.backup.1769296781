@@ -1,0 +1,16 @@
+{
+  "2Fn6TnU1RgHAynu1omNPeT1E14PBYdeqyiWBGhwcFd88": {
+    "buy_ts": 1769290951.1892607,
+    "entry_price": 7.371e-06,
+    "high_price": 7.371e-06,
+    "sol_amount": 0.02,
+    "status": "OPEN"
+  },
+  "DGNyjioKPqJuhPj2yDXxQfWXHK8u2T2ShuWSkBuj7nDh": {
+    "buy_ts": 1769292238.8266344,
+    "entry_price": 2.188e-05,
+    "high_price": 2.188e-05,
+    "sol_amount": 0.02,
+    "status": "OPEN"
+  }
+}

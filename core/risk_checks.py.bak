@@ -1,0 +1,28 @@
+# /home/tng25/lino/core/risk_checks.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple
+
+from config.settings import MIN_LIQUIDITY_USD, MAX_MARKET_CAP_USD
+
+@dataclass
+class RiskChecker:
+    logger: Any
+
+    def allow_buy(self, ov: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        ov: overview Birdeye (dict)
+        On s'appuie sur ov["data"].
+        """
+        data = ov.get("data") or {}
+
+        liq = float(data.get("liquidity") or 0.0)
+        mc = float(data.get("marketCap") or 0.0)
+
+        if liq < MIN_LIQUIDITY_USD:
+            return False, f"liquidity trop faible ({liq:.2f} < {MIN_LIQUIDITY_USD:.2f})"
+
+        if mc > MAX_MARKET_CAP_USD:
+            return False, f"marketcap trop élevé ({mc:.2f} > {MAX_MARKET_CAP_USD:.2f})"
+
+        return True, "ok"
