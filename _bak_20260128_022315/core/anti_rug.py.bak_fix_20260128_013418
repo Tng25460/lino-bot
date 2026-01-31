@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import base64
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, List
+
+# Program IDs (classiques)
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+def _now() -> float:
+    return time.time()
+
+@dataclass
+class AntiRugResult:
+    ok: bool
+    reason: str
+    details: Dict[str, Any]
+
+class AntiRug:
+    """
+    Checks on-chain via RPC:
+    - mint authority / freeze authority must be None (renounced)
+    - token program allowlist + optional Token-2022 block
+    - top holders concentration via getTokenLargestAccounts
+    """
+
+    def __init__(self, rpc: Any, logger: Any, *, block_token_2022: bool = True):
+        self.rpc = rpc
+        self.logger = logger
+        self.block_token_2022 = block_token_2022
+
+    async def _get_account_owner(self, mint: str) -> Optional[str]:
+        # getAccountInfo gives owner program id
+        resp = await self.rpc.get_account_info(mint, encoding="base64")
+        val = (resp.get("result") or {}).get("value")
+        if not val:
+            return None
+        return val.get("owner")
+
+    async def _get_mint_authorities(self, mint: str) -> Tuple[Optional[str], Optional[str]]:
+        # Uses getTokenSupply? Not enough. We decode Mint account (spl-token Mint layout).
+        # Mint layout (SPL Token): https://docs.solana.com/developing/programming-model/accounts
+        # We'll decode minimal fields:
+        # mint_authority_option (u32), mint_authority (32), supply (u64),
+        # decimals (u8), is_initialized (u8), freeze_authority_option (u32), freeze_authority (32)
+        resp = await self.rpc.get_account_info(mint, encoding="base64")
+        val = (resp.get("result") or {}).get("value")
+        if not val or not val.get("data"):
+            return None, None
+        data_b64 = val["data"][0]
+        raw = base64.b64decode(data_b64)
+
+        if len(raw) < 82:
+            return None, None
+
+        def u32_le(off: int) -> int:
+            return int.from_bytes(raw[off:off+4], "little")
+
+        mint_auth_opt = u32_le(0)
+        mint_auth = raw[4:36]
+        freeze_auth_opt = u32_le(46)  # after supply(8), decimals(1), init(1) => 4+32+8+1+1 = 46
+        freeze_auth = raw[50:82]
+
+        def pk_to_str(pk: bytes) -> str:
+            # avoid dependency; base58 is required to display, but we only need None vs set.
+            # If option==0 => None, else "SET".
+            return "SET"
+
+        mint_auth_str = None if mint_auth_opt == 0 else pk_to_str(mint_auth)
+        freeze_auth_str = None if freeze_auth_opt == 0 else pk_to_str(freeze_auth)
+        return mint_auth_str, freeze_auth_str
+
+    async def _top_holders_pct(self, mint: str) -> Tuple[float, float]:
+        # returns (top1_pct, top10_pct) of total supply
+        supply_resp = await self.rpc.get_token_supply(mint)
+        supply_val = (supply_resp.get("result") or {}).get("value") or {}
+        total_ui = float(supply_val.get("uiAmount") or 0.0)
+        if total_ui <= 0:
+            return 0.0, 0.0
+
+        largest = await self.rpc.get_token_largest_accounts(mint)
+        items = (largest.get("result") or {}).get("value") or []
+        ui_amounts = []
+        for it in items[:10]:
+            ui_amounts.append(float(it.get("uiAmount") or 0.0))
+
+        top1 = ui_amounts[0] if ui_amounts else 0.0
+        top10 = sum(ui_amounts)
+        return top1 / total_ui, top10 / total_ui
+
+    async def check(self, mint: str, *, max_top1: float, max_top10: float, require_renounced: bool) -> AntiRugResult:
+        details: Dict[str, Any] = {}
+
+        owner = await self._get_account_owner(mint)
+        details["program_owner"] = owner
+
+        if owner is None:
+            return AntiRugResult(False, "mint introuvable (RPC)", details)
+
+        if self.block_token_2022 and owner == TOKEN_2022_PROGRAM_ID:
+            return AntiRugResult(False, "Token-2022 bloqué (risque fees/extensions)", details)
+
+        if owner not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+            return AntiRugResult(False, f"programme token inconnu: {owner}", details)
+
+        mint_auth, freeze_auth = await self._get_mint_authorities(mint)
+        details["mint_authority"] = mint_auth
+        details["freeze_authority"] = freeze_auth
+
+        if require_renounced:
+            if mint_auth is not None:
+                return AntiRugResult(False, "mint authority active (remint possible)", details)
+            if freeze_auth is not None:
+                return AntiRugResult(False, "freeze authority active (gel possible)", details)
+
+        try:
+            top1, top10 = await self._top_holders_pct(mint)
+            details["top1_pct"] = top1
+            details["top10_pct"] = top10
+            if top1 > max_top1:
+                return AntiRugResult(False, f"top1 trop concentré ({top1:.1%})", details)
+            if top10 > max_top10:
+                return AntiRugResult(False, f"top10 trop concentré ({top10:.1%})", details)
+        except Exception as e:
+            # En "early", certains tokens ont des données bizarres au début -> on refuse en REAL
+            return AntiRugResult(False, f"holders check fail: {e}", details)
+
+        return AntiRugResult(True, "ok", details)

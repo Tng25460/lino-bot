@@ -1,0 +1,109 @@
+import os
+import json
+import base64
+import aiohttp
+from typing import Dict, Any
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+
+from core.solana_rpc_async import SolanaRPCAsync
+
+JUP_BASE = os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag").rstrip("/")
+SLIPPAGE_BPS = int(os.getenv("JUP_SLIPPAGE_BPS", "250"))
+PRIORITY_FEE_MICROLAMPORTS = int(os.getenv("JUP_PRIORITY_FEE_MICROLAMPORTS", "0"))
+JUP_TIMEOUT_S = float(os.getenv("JUP_TIMEOUT_S", "15"))
+JUP_RETRIES = int(os.getenv("JUP_RETRIES", "3"))
+
+SELL_DRY_RUN = os.getenv("SELL_DRY_RUN", "1").strip() not in ("0", "false", "False")
+
+
+async def _post_json(session: aiohttp.ClientSession, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    last_err = None
+    for _ in range(JUP_RETRIES):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S)) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    raise RuntimeError(f"Jupiter HTTP {r.status}: {txt[:300]}")
+                return await r.json()
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Jupiter POST failed after {JUP_RETRIES} tries: {last_err}")
+
+
+async def jup_build_swap_tx(
+    session: aiohttp.ClientSession,
+    user_pubkey: str,
+    input_mint: str,
+    output_mint: str,
+    amount_in: int,
+) -> str:
+    qurl = f"{JUP_BASE}/swap/v1/quote"
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount_in),
+        "slippageBps": str(SLIPPAGE_BPS),
+    }
+    _ex = os.getenv("JUP_EXCLUDE_DEXES","").strip()
+    if _ex:
+        params["excludeDexes"] = _ex
+
+    async with session.get(qurl, params=params, timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S)) as r:
+        qt = await r.text()
+        if r.status >= 400:
+            raise RuntimeError(f"Jupiter quote HTTP {r.status}: {qt[:300]}")
+        quote = await r.json()
+
+    surl = f"{JUP_BASE}/swap/v1/swap"
+    body: Dict[str, Any] = {
+        "quoteResponse": quote,
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+    }
+    if PRIORITY_FEE_MICROLAMPORTS > 0:
+        body["prioritizationFeeLamports"] = PRIORITY_FEE_MICROLAMPORTS
+
+    resp = await _post_json(session, surl, body)
+    tx_b64 = resp.get("swapTransaction")
+    if not tx_b64:
+        raise RuntimeError(f"Jupiter swap response missing swapTransaction keys={list(resp.keys())}")
+    return tx_b64
+
+
+async def jup_sign_and_send(
+    rpc: SolanaRPCAsync,
+    wallet: Keypair,
+    tx_b64: str,
+) -> str:
+    raw = base64.b64decode(tx_b64)
+    vtx = VersionedTransaction.from_bytes(raw)
+    sig_tx = VersionedTransaction(vtx.message, [wallet])
+
+    if SELL_DRY_RUN:
+        return "DRY_RUN_NO_TX_SENT"
+
+    txsig = await rpc.send_transaction(bytes(sig_tx), skip_preflight=False, max_retries=3)
+    return txsig
+
+
+async def jup_sell_exact_in(
+    rpc: SolanaRPCAsync,
+    wallet: Keypair,
+    input_mint: str,
+    output_mint: str,
+    amount_in: int,
+,
+    allowed_dexes: list[str] | None = None
+) -> str:
+    user_pubkey = str(wallet.pubkey())
+    async with aiohttp.ClientSession() as session:
+        tx_b64 = await jup_build_swap_tx(
+            session=session,
+            user_pubkey=user_pubkey,
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount_in=amount_in,
+        )
+    return await jup_sign_and_send(rpc=rpc, wallet=wallet, tx_b64=tx_b64)

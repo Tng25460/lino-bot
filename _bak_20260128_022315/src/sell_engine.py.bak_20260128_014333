@@ -1,0 +1,218 @@
+import os, json, time, sqlite3
+from pathlib import Path
+from typing import Optional, Dict, Any
+import requests
+
+DB_PATH = os.getenv("DB_PATH", os.getenv("TRADES_DB_PATH", "state/trades.sqlite"))
+CHECK_INTERVAL = float(os.getenv("SELL_CHECK_INTERVAL", os.getenv("CHECK_INTERVAL", "8")))
+
+# TP/Stops (tu peux override via .env.real)
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.15"))                 # -15%
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "0.03"))  # +3% active
+TRAILING_FROM_HIGH_PCT = float(os.getenv("TRAILING_FROM_HIGH_PCT", "0.05"))    # -5% from peak
+
+TP1_GAIN_PCT = float(os.getenv("TP1_GAIN_PCT", "0.25"))                   # +25%
+TP1_SELL_FRAC = float(os.getenv("TP1_SELL_FRACTION_INITIAL", "0.50"))     # sell 50%
+TP2_GAIN_PCT = float(os.getenv("TP2_GAIN_PCT", "0.60"))                   # +60%
+TP2_SELL_FRAC = float(os.getenv("TP2_SELL_FRACTION_INITIAL", "0.25"))     # sell 25%
+
+JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag")).rstrip("/")
+JUP_API_KEY = os.getenv("JUP_API_KEY", os.getenv("JUPITER_API_KEY", "")).strip()
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+# pour estimer un prix token en SOL via quote
+PRICE_SOL_IN_LAMPORTS = int(float(os.getenv("SELL_PRICE_PROBE_SOL", "0.01")) * 1_000_000_000)
+
+def _headers():
+    h={"accept":"application/json"}
+    if JUP_API_KEY:
+        h["x-api-key"]=JUP_API_KEY
+    return h
+
+def _db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+def _event(conn, ts: int, mint: str, status: str, err: str = "", data: Optional[Dict[str, Any]] = None):
+    data = data or {}
+    conn.execute(
+        "INSERT INTO events(ts,mint,status,err,data_json,data) VALUES(?,?,?,?,?,?)",
+        (ts, mint, status, err, json.dumps(data, ensure_ascii=False), json.dumps(data, ensure_ascii=False)),
+    )
+    conn.commit()
+
+def _get_price_sol_per_token(mint: str) -> Optional[float]:
+    """
+    Approx price via Jupiter quote:
+      input SOL amount -> output token amount
+    price (SOL/token) = sol_in / token_out
+    """
+    try:
+        url = f"{JUP_BASE}/swap/v1/quote"
+        params = {
+            "inputMint": SOL_MINT,
+            "outputMint": mint,
+            "amount": str(PRICE_SOL_IN_LAMPORTS),
+            "slippageBps": "50",
+        }
+        r = requests.get(url, params=params, headers=_headers(), timeout=20)
+        if r.status_code != 200:
+            return None
+        q = r.json()
+        out_amt = float(q.get("outAmount") or 0)
+        if out_amt <= 0:
+            return None
+        sol_in = PRICE_SOL_IN_LAMPORTS / 1_000_000_000
+        return sol_in / out_amt
+    except Exception:
+        return None
+
+def _load_positions(conn):
+    cur = conn.execute("SELECT mint, entry_price, entry_ts, size_sol, peak_price, tp_done, status, meta_json FROM positions WHERE status='OPEN'")
+    rows = cur.fetchall()
+    out=[]
+    for r in rows:
+        out.append({
+            "mint": r[0],
+            "entry_price": float(r[1]),
+            "entry_ts": int(r[2]),
+            "size_sol": float(r[3]),
+            "peak_price": (float(r[4]) if r[4] is not None else None),
+            "tp_done": int(r[5] or 0),
+            "status": r[6],
+            "meta_json": r[7] or "",
+        })
+    return out
+
+def _update_peak(conn, mint: str, peak: float):
+    conn.execute("UPDATE positions SET peak_price=? WHERE mint=?", (peak, mint))
+    conn.commit()
+
+def _set_tp_done(conn, mint: str, tp_done: int):
+    conn.execute("UPDATE positions SET tp_done=? WHERE mint=?", (tp_done, mint))
+    conn.commit()
+
+def _close_position(conn, mint: str, why: str):
+    conn.execute("UPDATE positions SET status='CLOSED' WHERE mint=?", (mint,))
+    conn.execute("UPDATE trades SET status=? WHERE mint=?", (why, mint))
+    conn.commit()
+
+def _ensure_trades_row(conn, mint: str):
+    ts=int(time.time())
+    conn.execute(
+        "INSERT OR IGNORE INTO trades(mint, first_seen_ts, last_ts, status, last_error, payload_json) VALUES(?,?,?,?,?,?)",
+        (mint, ts, ts, "OPEN", "", "{}")
+    )
+    conn.commit()
+
+def _call_sell_build(mint: str, fraction: float, token_amount_raw: int):
+    """
+    On BUILD la tx de sell via trader_exec.py (mode SELL)
+    SIGN/SEND = ta pipeline existante.
+    """
+    env = os.environ.copy()
+    env["SELL_MODE"] = "1"
+    env["SELL_MINT"] = mint
+    env["SELL_FRACTION"] = str(fraction)
+    env["SELL_TOKEN_AMOUNT"] = str(token_amount_raw)
+    # one shot
+    env["TRADER_ONE_SHOT"] = "1"
+
+    import subprocess
+    subprocess.run(["python", "src/trader_exec.py"], env=env, check=False)
+
+def sell_engine():
+    print("🔥 sell_engine started")
+    print("   db_path=", DB_PATH)
+    print("   TP1=", TP1_GAIN_PCT, "frac=", TP1_SELL_FRAC, "| TP2=", TP2_GAIN_PCT, "frac=", TP2_SELL_FRAC)
+    print("   SL=", STOP_LOSS_PCT, "| trail_act=", TRAILING_ACTIVATION_PCT, "trail_from_high=", TRAILING_FROM_HIGH_PCT)
+
+    while True:
+        ts = int(time.time())
+        try:
+            conn = _db()
+            try:
+                positions = _load_positions(conn)
+                for p in positions:
+                    mint = p["mint"]
+                    _ensure_trades_row(conn, mint)
+
+                    price = _get_price_sol_per_token(mint)
+                    if price is None:
+                        _event(conn, ts, mint, "PRICE_FAIL", "no_quote_price", {})
+                        continue
+
+                    entry = p["entry_price"]
+                    peak = p["peak_price"] if p["peak_price"] is not None else entry
+                    # peak update
+                    if price > peak:
+                        peak = price
+                        _update_peak(conn, mint, peak)
+
+                    gain = (price - entry) / entry  # +0.25 == +25%
+                    drawdown_from_peak = (peak - price) / peak if peak > 0 else 0.0
+
+                    # HARD STOP (loss)
+                    if gain <= -STOP_LOSS_PCT:
+                        _event(conn, ts, mint, "SELL_SIGNAL", "HARD_STOP", {"gain": gain, "price": price, "entry": entry})
+                        # NOTE: without token balance, we can't compute raw amount to sell.
+                        # Use meta_json hook if you store token_amount_raw there.
+                        meta={}
+                        try: meta=json.loads(p["meta_json"] or "{}")
+                        except Exception: meta={}
+                        token_raw = int(meta.get("token_amount_raw") or 0)
+                        if token_raw <= 0:
+                            _event(conn, ts, mint, "SELL_BLOCKED", "missing_token_amount_raw_in_meta_json", {"hint":"store token_amount_raw in positions.meta_json"})
+                            continue
+                        _call_sell_build(mint, 1.0, token_raw)
+                        _close_position(conn, mint, "CLOSED_HARD_STOP")
+                        continue
+
+                    # TP1/TP2
+                    tp_done = p["tp_done"]
+                    meta={}
+                    try: meta=json.loads(p["meta_json"] or "{}")
+                    except Exception: meta={}
+                    token_raw = int(meta.get("token_amount_raw") or 0)
+
+                    if token_raw <= 0:
+                        # we can still track peak/trailing even if we cannot sell yet
+                        _event(conn, ts, mint, "META_WARN", "missing_token_amount_raw_in_meta_json", {"gain": gain})
+                    else:
+                        if tp_done < 1 and gain >= TP1_GAIN_PCT:
+                            _event(conn, ts, mint, "SELL_SIGNAL", "TP1", {"gain": gain, "price": price})
+                            _call_sell_build(mint, TP1_SELL_FRAC, token_raw)
+                            _set_tp_done(conn, mint, 1)
+                            tp_done = 1
+
+                        if tp_done < 2 and gain >= TP2_GAIN_PCT:
+                            _event(conn, ts, mint, "SELL_SIGNAL", "TP2", {"gain": gain, "price": price})
+                            _call_sell_build(mint, TP2_SELL_FRAC, token_raw)
+                            _set_tp_done(conn, mint, 2)
+                            tp_done = 2
+
+                    # TRAILING (only once activated)
+                    if gain >= TRAILING_ACTIVATION_PCT and drawdown_from_peak >= TRAILING_FROM_HIGH_PCT:
+                        _event(conn, ts, mint, "SELL_SIGNAL", "TRAILING", {"gain": gain, "dd": drawdown_from_peak, "price": price, "peak": peak})
+                        if token_raw <= 0:
+                            _event(conn, ts, mint, "SELL_BLOCKED", "missing_token_amount_raw_in_meta_json", {})
+                            continue
+                        _call_sell_build(mint, 1.0, token_raw)
+                        _close_position(conn, mint, "CLOSED_TRAIL")
+                        continue
+
+            finally:
+                conn.close()
+
+        except Exception as e:
+            try:
+                conn = _db()
+                _event(conn, int(time.time()), "GLOBAL", "SELL_ENGINE_ERR", str(e), {})
+                conn.close()
+            except Exception:
+                pass
+
+        time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    sell_engine()

@@ -1,14 +1,215 @@
-
-
 from __future__ import annotations
-
 import os
 
-USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
-BUY_COOLDOWN_S = int(os.getenv("BUY_COOLDOWN_S", "3600"))  # per-mint rebuy cooldown (seconds)
-BYPASS_COOLDOWN = os.getenv("BYPASS_COOLDOWN","0") == "1"
-LAST_BUYS_FILE = os.getenv("LAST_BUYS_FILE", "state/last_buys.json")
+# === POSTBUY_RESYNC_DB (autofill trades.qty_token + create/update positions) ===
+def _db_cols(con, table: str):
+    cur = con.cursor()
+    return [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
 
+def _pick_col(cols, *names):
+    for n in names:
+        if n in cols:
+            return n
+    return None
+
+def _onchain_ui_balance_stable(mint: str, tries: int = 3, sleep_s: float = 0.6, timeout_s: float = 4.0) -> float:
+    import os, time, json
+    import requests
+    from solders.keypair import Keypair
+
+    rpc = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+    keypath = os.getenv("KEYPAIR_PATH", "keypair.json")
+
+    try:
+        secret = json.load(open(keypath, "r", encoding="utf-8"))
+        kp = Keypair.from_bytes(bytes(secret))
+        owner = str(kp.pubkey())
+    except Exception:
+        return 0.0
+
+    payload = {"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
+               "params":[owner, {"mint": mint}, {"encoding":"jsonParsed"}]}
+
+    t0 = time.time()
+    prev = None
+    for _ in range(max(1, tries)):
+        if time.time() - t0 > timeout_s:
+            break
+        try:
+            j = requests.post(rpc, json=payload, timeout=25).json()
+        except Exception:
+            j = {}
+        total = 0.0
+        for a in j.get("result",{}).get("value",[]) or []:
+            try:
+                ui = a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0
+                total += float(ui)
+            except Exception:
+                pass
+        v = float(total)
+        if prev is not None and abs(v - prev) <= max(1e-12, abs(prev)*0.005):
+            return v
+        prev = v
+        time.sleep(max(0.0, sleep_s))
+    return float(prev or 0.0)
+
+
+def _postbuy_resync_db(mint: str, symbol: str, price_usd: float, route: str, txsig: str, ts: int):
+    """
+    Robust post-buy resync:
+    - read on-chain ui balance (stable sampler w/ timeout)
+    - update trades.qty_token by tx_sig
+    - ensure OPEN position exists and qty_token matches
+    - if on-chain=0 -> tag trade err=sold_out_or_missing_balance
+    Returns qty_token (float) or 0.0
+    """
+    import os, time, json, sqlite3
+    import requests
+    from solders.keypair import Keypair
+
+    dbp = os.getenv("TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite"))
+    rpc = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+    keypath = os.getenv("KEYPAIR_PATH", "keypair.json")
+
+    # knobs
+    try:
+        tries = int(os.getenv("STABLE_ONCHAIN_UI_TRIES", "6") or 6)
+    except Exception:
+        tries = 6
+    try:
+        sleep_s = float(os.getenv("STABLE_ONCHAIN_UI_SLEEP_S", "0.8") or 0.8)
+    except Exception:
+        sleep_s = 0.8
+    try:
+        tol = float(os.getenv("STABLE_ONCHAIN_UI_TOL", "0.005") or 0.005)
+    except Exception:
+        tol = 0.005
+    try:
+        timeout_s = float(os.getenv("STABLE_ONCHAIN_UI_TIMEOUT_S", "7.0") or 7.0)
+    except Exception:
+        timeout_s = 7.0
+
+    try:
+        secret = json.load(open(keypath, "r", encoding="utf-8"))
+        kp = Keypair.from_bytes(bytes(secret))
+        owner = str(kp.pubkey())
+    except Exception as e:
+        print(f"⚠️ POSTBUY_RESYNC_DB keypair load failed err={e}", flush=True)
+        return 0.0
+
+    def onchain_ui_once() -> float:
+        payload = {"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
+                   "params":[owner, {"mint": mint}, {"encoding":"jsonParsed"}]}
+        try:
+            j = requests.post(rpc, json=payload, timeout=25).json()
+        except Exception:
+            return 0.0
+        total = 0.0
+        for a in j.get("result",{}).get("value",[]) or []:
+            try:
+                ui = a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0
+                total += float(ui)
+            except Exception:
+                pass
+        return float(total)
+
+    def stable_onchain_ui() -> float:
+        t0 = time.time()
+        prev = None
+        for _ in range(max(1, tries)):
+            if time.time() - t0 > timeout_s:
+                break
+            v = onchain_ui_once()
+            if prev is not None:
+                if abs(v - prev) <= max(1e-12, abs(prev) * tol):
+                    return float(v)
+            prev = float(v)
+            time.sleep(max(0.0, sleep_s))
+        return float(prev or 0.0)
+
+    q = stable_onchain_ui()
+
+    con = sqlite3.connect(dbp, timeout=30)
+    cur = con.cursor()
+
+    # detect columns
+    tcols = {r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()}
+    pcols = {r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()}
+    tx_col = "tx_sig" if "tx_sig" in tcols else ("txsig" if "txsig" in tcols else None)
+    if not tx_col:
+        print("⚠️ POSTBUY_RESYNC_DB: trades missing tx_sig/txsig column", flush=True)
+        con.close()
+        return float(q or 0.0)
+
+    if q <= 0.0:
+        # tag trade as missing balance
+        cur.execute(f"UPDATE trades SET err=COALESCE(NULLIF(err,''), ?) WHERE {tx_col}=?", ("sold_out_or_missing_balance", txsig))
+        con.commit()
+        con.close()
+        return 0.0
+
+    # update trade qty_token if empty
+    if "qty_token" in tcols:
+        cur.execute(f"UPDATE trades SET qty_token=? WHERE {tx_col}=? AND (qty_token IS NULL OR qty_token=0)", (float(q), txsig))
+
+    # ensure OPEN position exists
+    pos = cur.execute("SELECT rowid FROM positions WHERE mint=? ORDER BY rowid DESC LIMIT 1", (mint,)).fetchone()
+    if pos is None:
+        cols = ["mint","symbol","status","qty_token","entry_ts"]
+        vals = [mint, symbol or "", "OPEN", float(q), int(ts or int(time.time()))]
+        if "wallet" in pcols:
+            try:
+                from solders.keypair import Keypair as _KP
+                vals.append("")  # wallet optional
+            except Exception:
+                pass
+        if "entry_price_usd" in pcols:
+            cols.append("entry_price_usd"); vals.append(float(price_usd or 0.0))
+        if "entry_price" in pcols:
+            cols.append("entry_price"); vals.append(float(price_usd or 0.0))
+        if "high_water" in pcols:
+            cols.append("high_water"); vals.append(float(price_usd or 0.0))
+        cur.execute(f"INSERT INTO positions({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals)
+    else:
+        cur.execute("UPDATE positions SET qty_token=?, status='OPEN' WHERE rowid=?", (float(q), pos[0]))
+        # also set entry/high_water if missing and we have a price
+        if float(price_usd or 0.0) > 0.0:
+            sets = []
+            vals = []
+            if "entry_price_usd" in pcols:
+                sets.append("entry_price_usd=COALESCE(NULLIF(entry_price_usd,0), ?)"); vals.append(float(price_usd))
+            if "entry_price" in pcols:
+                sets.append("entry_price=COALESCE(NULLIF(entry_price,0), ?)"); vals.append(float(price_usd))
+            if "high_water" in pcols:
+                sets.append("high_water=CASE WHEN COALESCE(high_water,0)>0 THEN high_water ELSE ? END"); vals.append(float(price_usd))
+            if sets:
+                vals.append(pos[0])
+                cur.execute(f"UPDATE positions SET {', '.join(sets)} WHERE rowid=?", vals)
+
+    con.commit()
+    con.close()
+    return float(q)
+
+# === END POSTBUY_RESYNC_DB ===
+
+def _append_skip_mint(mint: str):
+    from pathlib import Path
+    fp = Path(os.getenv('SKIP_MINTS_FILE','state/skip_mints_runtime.txt'))
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with fp.open('a', encoding='utf-8') as f:
+            f.write(mint.strip() + '\n')
+    except Exception as e:
+        print(f"⚠️ autoskip write failed: {e}")
+
+def _autoskip_mint(mint: str):
+    from pathlib import Path
+    fp = Path(os.getenv('SKIP_MINTS_FILE','state/skip_mints_runtime.txt'))
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    with fp.open('a', encoding='utf-8') as f:
+        f.write(mint.strip() + '\n')
+
+USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
 SKIP_MINTS_FILE = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
 SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
 BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
@@ -31,7 +232,6 @@ def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
         return top[0]
 
 
-import os
 import json
 import time
 import base64
@@ -79,6 +279,9 @@ def _get_token_ui_balance(owner_pubkey: str, mint: str) -> float:
     except Exception:
         return 0.0
 
+BUY_COOLDOWN_S = int(os.getenv("BUY_COOLDOWN_S", "3600"))  # per-mint rebuy cooldown (seconds)
+BYPASS_COOLDOWN = os.getenv("BYPASS_COOLDOWN","0") == "1"
+LAST_BUYS_FILE = os.getenv("LAST_BUYS_FILE", "state/last_buys.json")
 
 
 def _load_last_buys() -> dict:
@@ -136,7 +339,6 @@ def _score_candidate(c: dict) -> (float, dict):
     mc  = _f(c.get("marketcap_usd") or c.get("mc_usd") or c.get("fdv_usd") or c.get("fdv"), 0.0)
 
     # gates (env) — si pas set => défauts raisonnables
-    import os
     MIN_LIQ_USD   = _f(os.getenv("MIN_LIQ_USD", "15000"), 15000)
     MIN_VOL5M_USD = _f(os.getenv("MIN_VOL5M_USD", "3000"), 3000)
     MIN_CHG5M_PCT = _f(os.getenv("MIN_CHG5M_PCT", "5"), 5)
@@ -368,7 +570,27 @@ def main() -> int:
 
     # IMPORTANT: trader_exec ne score PAS. Le scoring/filters doivent être upstream (core/trading.py)
 
-    cand = ready[0]
+    # pick first candidate not in skiplist (avoid getting stuck on ready[0])
+    cand = None
+    try:
+        _skip = set()
+        try:
+            _skip = set(_load_skip_mints() or [])
+        except Exception:
+            _skip = set()
+        for _c in ready:
+            _m = (_c.get("outputMint") or _c.get("mint") or _c.get("address") or "").strip()
+            if not _m:
+                continue
+            if _m in _skip:
+                continue
+            cand = _c
+            break
+    except Exception:
+        cand = None
+
+    if cand is None:
+        cand = ready[0]
 
     output_mint = (cand.get("outputMint") or cand.get("mint") or cand.get("address") or "").strip()
     FORCE_OUTPUT_MINT = os.getenv("FORCE_OUTPUT_MINT")
@@ -384,10 +606,16 @@ def main() -> int:
     except Exception:
         pass
     if SKIP_IF_BAG:
-        ui = _get_token_ui_balance(WALLET_PUBKEY, output_mint)
+        ui = _get_token_ui_balance(WALLET_PUBKEY, output_mint) or 0.0
+        IGNORE_DUST = float(os.getenv("IGNORE_HOLDING_BELOW", "0"))
+
+        if ui < IGNORE_DUST:
+            ui = 0.0
+
         if ui > BAG_MIN_UI:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
             return 0
+
 
     if not output_mint:
 
@@ -453,6 +681,15 @@ def main() -> int:
         if qr.status_code != 200:
             _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
             print("❌ quote failed http=", qr.status_code)
+            # --- AUTO_SKIP_NO_ROUTE: avoid looping on mints with no Jupiter route ---
+            try:
+                _sk = os.getenv('SKIP_MINTS_FILE','state/skip_mints.txt')
+                Path(_sk).parent.mkdir(parents=True, exist_ok=True)
+                with open(_sk, 'a', encoding='utf-8') as f:
+                    f.write(str(output_mint).strip() + "\n")
+                print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={{output_mint}} to SKIP_MINTS_FILE={{_sk}}", flush=True)
+            except Exception as _e:
+                print(f"⚠️ AUTO_SKIP_NO_ROUTE failed mint={{output_mint}} err={{repr(_e)}}", flush=True)
             return 0
         quote = qr.json()
     except Exception as e:
@@ -501,6 +738,71 @@ def main() -> int:
             txsig = _send_signed_b64(txb64, RPC_HTTP)
             OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
             print("✅ sent txsig=", txsig)
+            # --- DB HOOK: record BUY into SQLite (best-effort) ---
+            try:
+                import time, sqlite3
+                dbp = os.getenv("TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite"))
+                now = int(time.time())
+                wallet = str(WALLET_PUBKEY)
+                mint = output_mint
+                sym = str(cand.get("symbol") or cand.get("symbolBase") or "")
+                txsig = str(txsig)
+                meta = {"ready_file": str(READY_FILE), "candidate": cand, "amount_lamports": int(amount_lamports)}
+                con = sqlite3.connect(dbp, timeout=30)
+                cur = con.cursor()
+                cur.execute(
+                    """INSERT INTO trades
+                    (ts, side, mint, symbol, qty, price, txsig, pnl_usd, meta_json, wallet, qty_token, price_usd, notional_usd, tx_sig, route, err, created_ts, updated_ts)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now, "BUY", mint, sym, 0.0, 0.0, txsig, 0.0, json.dumps(meta, ensure_ascii=False, default=str), wallet, 0.0, 0.0, 0.0, txsig, "", "", now, now),
+                )
+                cur.execute(
+                    """INSERT OR REPLACE INTO positions
+                    (mint, symbol, dex, entry_ts, entry_price, qty, cost_usd, status, high_water, trailing_stop, tp1_done, tp2_done, meta_json, wallet, qty_token, entry_price_usd, entry_cost_usd, close_price_usd, close_ts, close_reason)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (mint, sym, "", now, 0.0, 0.0, 0.0, "OPEN", 0.0, 0.0, 0, 0, json.dumps(meta, ensure_ascii=False, default=str), wallet, 0.0, 0.0, 0.0, 0.0, None, ""),
+                )
+                con.commit()
+
+                # --- POSTBUY_RESYNC_DB_RETRY_V1: always log + retry on-chain balance ---
+                try:
+                    import time as _t
+                    _m = output_mint
+                    _sym = str((cand or {}).get("symbol") or (cand or {}).get("symbolBase") or "")
+                    _px = float((cand or {}).get("price_usd") or 0.0)
+                    _rt = str((cand or {}).get("route") or "")
+                    _ts = int(now)
+                    _sig = str(txsig)
+
+                    print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 start mint={_m} sym={_sym} px={_px} rt={_rt} sig={_sig[:10]} ts={_ts}", flush=True)
+
+                    q = 0.0
+                    if _m and _sig:
+                        # balance can appear a bit later after swap -> retry
+                        for _attempt in range(1, 8):
+                            q = float(_postbuy_resync_db(str(_m), _sym, _px, _rt, _sig, _ts) or 0.0)
+                            print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 attempt={_attempt} qty_token={q}", flush=True)
+                            if q > 0:
+                                break
+                            _t.sleep(1.5)  # small wait
+
+                    print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 done mint={_m} qty_token={q}", flush=True)
+
+                except Exception as _e:
+                    print(f"⚠️ POSTBUY_RESYNC_DB_RETRY_V1 failed err={_e}", flush=True)
+                con.close()
+                print(f"✅ DB: BUY recorded db={dbp} mint={mint} sig={txsig}", flush=True)
+            except Exception as _e:
+                print(f"⚠️ DB record failed: {_e}", flush=True)
+            # --- end DB HOOK ---
+
+
+            # autoskip: éviter rebuy du même mint après BUY OK
+            try:
+                if output_mint:
+                    _autoskip_mint(output_mint)
+            except Exception as e:
+                print('⚠️ autoskip failed:', e)
             # record_last_buy
             try:
                 import time as _time

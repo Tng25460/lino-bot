@@ -1,81 +1,78 @@
+import sys
+import asyncio
 import os
-import threading
-import time
+from pathlib import Path as _Path
 
-from trader_loop import trader_loop
-from sell_engine import sell_engine
+import faulthandler, signal
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+print("🧯 SIGUSR1 enabled: kill -USR1 <pid> to dump stack", flush=True)
+ROOT = str(_Path(__file__).resolve().parents[1])
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-
-# --- LOAD_ENV_FILE_PATCH_V1 ---
-import os
-from pathlib import Path
-
-def _load_env_file(path: str) -> None:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return
-        for line in p.read_text(encoding='utf-8', errors='ignore').splitlines():
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k,v = line.split('=',1)
-            k=k.strip(); v=v.strip()
-            if k and (k not in os.environ):
-                os.environ[k]=v
-    except Exception:
-        pass
-
-_load_env_file('state/jup_endpoints.env')
-
-def _ensure_alias_env():
-    # Jupiter
-    os.environ.setdefault("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag"))
-    os.environ.setdefault("JUP_TOKENS_BASE", os.getenv("JUP_TOKENS_BASE", os.environ["JUP_BASE"].rstrip("/") + "/tokens/v2"))
-    os.environ.setdefault("JUP_API_KEY", os.getenv("JUP_API_KEY", os.getenv("JUPITER_API_KEY", "")))
-
-    # RPC
-    os.environ.setdefault("RPC_HTTP", os.getenv("RPC_HTTP", os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")))
-
-    # Wallet pubkey
-    os.environ.setdefault("WALLET_PUBKEY", os.getenv("WALLET_PUBKEY", os.getenv("TRADER_USER_PUBLIC_KEY", "")))
-
-    # Trade sizing / slippage
-    os.environ.setdefault("TRADER_SOL_AMOUNT", os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")))
-    os.environ.setdefault("TRADER_SLIPPAGE_BPS", os.getenv("TRADER_SLIPPAGE_BPS", os.getenv("SLIPPAGE_BPS", "120")))
-    os.environ.setdefault("TRADER_MAX_PRICE_IMPACT_PCT", os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", os.getenv("MAX_PRICE_IMPACT_PCT", "1.5")))
+from core.sell_engine import SellEngine
+from core.positions_db_adapter import PositionsDBAdapter
+from core.price_feed_dex import DexScreenerPriceFeed
+from src.trader_loop import trader_loop
 
 
-
-def _real_mode_safety_guard():
-    mode = (os.getenv("MODE","PAPER") or "PAPER").upper()
-    if mode != "REAL":
-        return
-    pub = (os.getenv("WALLET_PUBKEY") or os.getenv("TRADER_USER_PUBLIC_KEY") or "").strip()
-    keypair = os.getenv("TRADER_KEYPAIR_PATH", "keypair.json")
-    if not pub:
-        raise SystemExit("❌ MODE=REAL but missing WALLET_PUBKEY/TRADER_USER_PUBLIC_KEY")
-    from pathlib import Path
-    if not Path(keypair).exists():
-        raise SystemExit(f"❌ MODE=REAL but missing keypair file: {keypair}")
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
 
 
-def main():
-    _ensure_alias_env()
-    _real_mode_safety_guard()
-
+async def main():
     print("🚀 run_live: starting sell_engine + trader_loop", flush=True)
 
-    # sell_engine en background (sinon il bloque)
-    t = threading.Thread(target=sell_engine, name="sell_engine", daemon=True)
-    t.start()
+    db_path = os.getenv("DB_PATH", "state/trades.sqlite")
+    db = PositionsDBAdapter(db_path)
 
-    # petite pause pour logs
-    time.sleep(0.2)
+    price_feed = DexScreenerPriceFeed()
+    try:
+        sell_engine = SellEngine(db=db, price_feed=price_feed)
+    except TypeError:
+        # compat old SellEngine signature: (db, price_feed, trader)
+        sell_engine = SellEngine(db=db, price_feed=price_feed, trader=None)
+    print("✅ sell_engine: using step loop SellEngine.run_once()", flush=True)
 
-    # trader loop au premier plan
-    trader_loop()
+    sleep_s = float(os.getenv("LOOP_SLEEP_S", "10"))
+    # --- SELL_ONLY mode (skip trader_loop) ---
+    if os.getenv("SELL_ONLY","0") == "1":
+        print("🛑 SELL_ONLY=1 -> sell_engine ONLY (skip trader_loop)", flush=True)
+        while True:
+            print("💰 SELL_TICK: running sell_engine.run_once()", flush=True)
+            try:
+                sell_engine.run_once()
+            except Exception as err:
+                print("❌ sell_engine tick error: " + str(err), flush=True)
+            await asyncio.sleep(sleep_s)
+    # --- end SELL_ONLY ---
+    one_shot = os.getenv("ONE_SHOT", "0") in ("1", "true", "True")
+
+    while True:
+        print("💰 SELL_TICK: running sell_engine.run_once()", flush=True)
+        try:
+            # SellEngine est sync -> pas besoin d'await
+            sell_engine.run_once()
+        except Exception as err:
+            print("❌ sell_engine tick error: " + str(err), flush=True)
+
+        print("🧠 trader_loop (universe_builder -> exec -> sign -> send)", flush=True)
+        try:
+            # trader_loop peut être sync ou async -> safe
+            await _maybe_await(trader_loop())
+        except Exception as err:
+            print("❌ trader_loop error: " + str(err), flush=True)
+
+        # NOTE: trader_loop a son propre TRADER_ONE_SHOT.
+        # ONE_SHOT ici ne sert que si tu utilises run_live comme loop unique.
+        if one_shot:
+            print("🧪 ONE_SHOT=1 -> stop after one iteration", flush=True)
+            break
+
+        await asyncio.sleep(sleep_s)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

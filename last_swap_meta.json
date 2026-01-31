@@ -1,9 +1,9 @@
 {
-  "ts": 1769607166,
+  "ts": 1769783445,
   "mode": "BUY",
   "inputMint": "So11111111111111111111111111111111111111112",
-  "outputMint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-  "amount": 200000,
-  "slippageBps": 120,
+  "outputMint": "4vGHdzcNrDf8XVE8H19Rqea86RULz7xi89ew1sSJpump",
+  "amount": 10000000,
+  "slippageBps": 300,
   "userPublicKey": "9U69xxU9eWRebdQ99FSo2FBwfafQZYjL4DT6ZFLqwmga"
 }

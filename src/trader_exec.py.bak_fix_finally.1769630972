@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import asyncio
+from pathlib import Path
+
+# Ensure project root in sys.path so "core" imports work when running src/trader_exec.py directly
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from solders.keypair import Keypair
+from core.solana_rpc_async import SolanaRPCAsync
+import core.jupiter_exec as jx
+
+WSOL_MINT = os.getenv("WSOL_MINT", "So11111111111111111111111111111111111111112")
+
+async def buy_with_strict_routing(buy_func, rpc, wallet, out_mint: str, amount_in: int, allowed_dexes):
+    """
+    Try strict routing per dex, then fallback ANY if enabled.
+    """
+    import os
+
+    fallback_any = os.getenv("JUP_DEX_FALLBACK_ANY", "1") not in ("0", "false", "False")
+
+    last_err = None
+
+    for dex in allowed_dexes or []:
+        try:
+            print(f"🧭 routing_try strict dex_only={dex}", flush=True)
+            return await buy_func(
+                rpc,
+                wallet,
+                WSOL_MINT,
+                out_mint,
+                amount_in,
+                allowed_dexes=[dex],
+            )
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ routing_try failed dex_only={dex} err={e}", flush=True)
+
+    if fallback_any:
+        print("🧭 routing_fallback ANY", flush=True)
+        return await buy_func(
+            rpc,
+            wallet,
+            WSOL_MINT,
+            out_mint,
+            amount_in,
+            allowed_dexes=None,
+        )
+
+    raise RuntimeError(f"All strict routing attempts failed: {last_err}")
+
+def _load_keypair() -> Keypair:
+    kp_path = os.getenv("KEYPAIR_PATH", str(ROOT / "keypair.json"))
+    b = Path(kp_path).read_text(encoding="utf-8", errors="ignore")
+    arr = json.loads(b)
+    return Keypair.from_bytes(bytes(arr))
+
+def load_ready(path: str):
+    rows = []
+    p = Path(path)
+    if not p.exists():
+        return rows
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
+
+def score_used(o):
+    if o.get("score_v4") is not None:
+        return float(o.get("score_v4"))
+    if o.get("score2") is not None:
+        return float(o.get("score2"))
+    if o.get("score") is not None:
+        return float(o.get("score"))
+    return 0.0
+
+def pick_best(rows):
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda x: score_used(x), reverse=True)
+    return rows[0]
+
+def build_allowed_dexes(best):
+    dexes = best.get("dexes") or []
+    dexes = [str(d).lower() for d in dexes]
+    origin = (best.get("origin") or "").lower()
+
+    pref = ["meteora", "raydium", "orca"]
+    if origin == "pumpfun":
+        pref = ["raydium", "meteora", "orca"]
+
+    allowed = [d for d in pref if d in dexes]
+    if not allowed:
+        # if we don't know dexes list, keep a sane order
+        allowed = pref
+    return allowed
+
+def dex_label(d: str) -> str:
+    d = d.lower()
+    if d == "meteora":
+        return "Meteora+DLMM"
+    if d == "raydium":
+        return "Raydium"
+    if d == "orca":
+        return "Orca"
+    return d
+
+async def _buy_try(buy_func, rpc, wallet, out_mint: str, amount_in: int, dex_list, fallback_any: bool):
+    # Control Jupiter internal fallback behavior from core/jupiter_exec.py
+    os.environ["JUP_DEX_FALLBACK_ANY"] = "1" if fallback_any else "0"
+    try:
+        return await buy_func(
+            rpc=rpc,
+            wallet=wallet,
+            input_mint=WSOL_MINT,
+            output_mint=out_mint,
+            amount_in=amount_in,
+            allowed_dexes=dex_list,
+        )
+    finally:
+        # keep env (useful for logs) - no delete
+
+
+def _pick_jup_buy_func():
+    # Prefer our stable wrapper name
+    if hasattr(jx, "jup_buy_exact_in"):
+        return jx.jup_buy_exact_in, "jup_buy_exact_in"
+    raise RuntimeError("No Jupiter BUY function found in core.jupiter_exec.py")
+
+async def main_async():
+    ready_file = os.getenv("READY_FILE", "ready_to_trade_ranked_v4_orca.jsonl")
+    dry_run = os.getenv("TRADER_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+    rpc_http = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")).strip()
+    buy_amount_sol = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))
+    amount_in = int(buy_amount_sol * 1_000_000_000)
+
+    print("🚀 trader_exec BUY", flush=True)
+    print("   ready_file=", ready_file, flush=True)
+    print("   rpc_http=", rpc_http, flush=True)
+    print("   dry_run=", dry_run, flush=True)
+
+    rows = load_ready(ready_file)
+    print("   ready_count=", len(rows), flush=True)
+    best = pick_best(rows)
+    if not best:
+        print("💤 no candidates", flush=True)
+        return 0
+
+    mint = best.get("mint")
+    liq = best.get("liquidity_usd") or best.get("liq_usd") or best.get("liquidity")
+    vol24 = best.get("vol_24h") or best.get("volume_24h")
+    tx1h = best.get("txns_1h") or best.get("tx1h")
+    chg1h = best.get("chg_1h") or best.get("change_1h")
+    origin = best.get("origin")
+    dexes = best.get("dexes") or []
+    su = score_used(best)
+
+    print(f"[DECISION] PICK mint={mint} score_used={su} origin={origin} dexes={dexes} liq={liq} vol24={vol24} tx1h={tx1h} chg1h={chg1h}", flush=True)
+
+    allowed_dexes = build_allowed_dexes(best)
+    # print with friendly labels
+    labels = [dex_label(d) for d in allowed_dexes]
+    print(f"🔀 route_policy allowed_dexes={allowed_dexes} labels={labels}", flush=True)
+
+    # Enforce dry run at Jupiter send layer too
+    if dry_run:
+        os.environ["SELL_DRY_RUN"] = "1"
+
+    wallet = _load_keypair()
+    rpc = SolanaRPCAsync(rpc_http)
+
+    buy_func, buy_name = _pick_jup_buy_func()
+    print("💸 BUY_AMOUNT_SOL=", buy_amount_sol, f"(lamports={amount_in})", flush=True)
+    print("🧩 using jupiter func:", buy_name, flush=True)
+
+    try:
+        # STRICT routing attempts
+        res = await buy_with_strict_routing(buy_func, rpc, wallet, mint, amount_in, allowed_dexes)
+        print("✅ jupiter build result:", res, flush=True)
+    except Exception as e:
+        print("❌ jupiter buy build failed:", e, flush=True)
+        return 2
+    finally:
+        await rpc.aclose()
+
+    if dry_run:
+        print("🧪 TRADER_DRY_RUN=1 -> not sending tx", flush=True)
+        return 0
+
+    return 0
+
+def main():
+    return asyncio.run(main_async())
+
+if __name__ == "__main__":
+    raise SystemExit(main())

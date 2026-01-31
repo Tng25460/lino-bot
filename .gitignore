@@ -1,51 +1,7 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
+.env*
+state/
 *.sqlite
-*.db
-
-# Virtualenv
-.venv/
-venv/
-
-# Secrets / keys
-keypair.json
-*.key
-*.pem
-*.env
-
-# Local runtime files
-positions.json
-lino.log
-recent_sells.json
-dev_db.json
-cache/
-tmp/
-
-# OS
-.DS_Store
-
-# backups / dumps
-_bak_*/
-_bak_fix_*/
-**/*.bak
-**/*.bak.*
-**/*.BAK*
-**/*.BROKEN*
-**/*.broken*
-
-# runtime / state
-state/*.json
-state/*.log
 *.log
-lino.pid
-last_swap_*
-ready_to_trade*.jsonl
-
-# secrets
-.env
-.env.*
 keypair.json
+__pycache__/
+.venv/

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path so `import core.*` works when running src/*.py directly
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import os
+import json
+import sys
+import asyncio
+
+from solders.keypair import Keypair
+
+# RPC client (note: class name is SolanaRPCAsync in your repo)
+from core.solana_rpc_async import SolanaRPCAsync
+
+# Jupiter exec (autodetect)
+import core.jupiter_exec as jx
+
+READY_FILE = os.getenv("READY_FILE", "ready_to_trade_ranked_v4_orca.jsonl")
+DRY_RUN = os.getenv("TRADER_DRY_RUN", "0") in ("1","true","True")
+
+KEYPAIR_PATH = os.getenv("KEYPAIR_PATH", "/home/tng25/lino/keypair.json")
+RPC_HTTP = os.getenv("RPC_HTTP", "https://api.mainnet-beta.solana.com")
+
+# Buy sizing (exact input SOL->token)
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))
+WSOL_MINT = os.getenv("WSOL_MINT", "So11111111111111111111111111111111111111112")
+
+def load_ready(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+    except FileNotFoundError:
+        print(f"❌ READY_FILE not found: {path}", flush=True)
+    return rows
+
+
+def _try_buy_with_routing(buy_func, rpc, wallet, wsol_mint, out_mint, amount_in, allowed_dexes):
+    """
+    Strict routing attempts:
+      1) try each dex alone with JUP_DEX_FALLBACK_ANY=0
+      2) finally fallback ANY with JUP_DEX_FALLBACK_ANY=1
+    """
+    import os
+    import asyncio
+
+    dexes = [d for d in (allowed_dexes or []) if d]
+    tried = []
+
+    async def _call(dex_list, fallback_any: bool):
+        old = os.environ.get("JUP_DEX_FALLBACK_ANY")
+        os.environ["JUP_DEX_FALLBACK_ANY"] = "1" if fallback_any else "0"
+        try:
+            return await buy_func(
+                rpc=rpc,
+                wallet=wallet,
+                input_mint=wsol_mint,
+                output_mint=out_mint,
+                amount_in=amount_in,
+                allowed_dexes=dex_list,
+            )
+        finally:
+            if old is None:
+                os.environ.pop("JUP_DEX_FALLBACK_ANY", None)
+            else:
+                os.environ["JUP_DEX_FALLBACK_ANY"] = old
+
+    # 1) strict per-dex
+    for d in dexes:
+        tried.append(d)
+        print(f"🧭 routing_try strict dex_only={d}", flush=True)
+        try:
+            return asyncio.run(_call([d], fallback_any=False))
+        except Exception as e:
+            print(f"⚠️ routing_try failed dex_only={d} err={e}", flush=True)
+
+    # 2) strict with all (optional)
+    if dexes:
+        print(f"🧭 routing_try strict dex_list={dexes}", flush=True)
+        try:
+            return asyncio.run(_call(dexes, fallback_any=False))
+        except Exception as e:
+            print(f"⚠️ routing_try failed dex_list={dexes} err={e}", flush=True)
+
+    # 3) fallback ANY
+    print("🧭 routing_fallback ANY", flush=True)
+    return asyncio.run(_call(None, fallback_any=True))
+
+
+def score_used(o):
+    if o.get("score_v4") is not None:
+        return float(o["score_v4"])
+    if o.get("score2") is not None:
+        return float(o["score2"])
+    return float(o.get("score", 0.0))
+
+def pick_best(rows):
+    return max(rows, key=score_used)
+
+def _pick_jup_buy_func():
+    # Prefer jup_buy_exact_in if present, else fallback to whatever exists
+    for name in ("jup_buy_exact_in", "jup_swap_exact_in", "jup_swap"):
+        if hasattr(jx, name):
+            return getattr(jx, name), name
+    raise RuntimeError("No Jupiter BUY function found in core.jupiter_exec.py")
+
+async def main_async():
+    print("🚀 trader_exec BUY", flush=True)
+    print(f"   ready_file= {READY_FILE}", flush=True)
+    print(f"   rpc_http= {RPC_HTTP}", flush=True)
+    print(f"   dry_run= {DRY_RUN}", flush=True)
+
+    rows = load_ready(READY_FILE)
+    print(f"   ready_count= {len(rows)}", flush=True)
+    if not rows:
+        print("⚠️ no candidates", flush=True)
+        return 0
+
+    best = pick_best(rows)
+
+    mint = best.get("mint")
+    score = score_used(best)
+    origin = best.get("origin")
+    dexes = best.get("dexes", [])
+    liq = best.get("liquidity_usd") or best.get("liq_usd")
+    vol24 = best.get("vol_24h")
+    tx1h = best.get("txns_1h")
+    chg1h = best.get("chg_1h")
+
+    print(
+        f"[DECISION] PICK mint={mint} score_used={score:.4f} origin={origin} "
+        f"dexes={dexes} liq={liq} vol24={vol24} tx1h={tx1h} chg1h={chg1h}",
+        flush=True
+    )
+
+    # Route policy (preferred DEX order)
+    dexes = best.get("dexes") or []
+    origin = (best.get("origin") or "").lower()
+
+    # Default preference order
+    pref = ["meteora","raydium","orca"]
+
+    # Pumpfun ultra-early: try Raydium first (most likely route), then Meteora, then Orca
+    if origin == "pumpfun":
+        pref = ["raydium","meteora","orca"]
+
+    allowed_dexes = []
+    for d in pref:
+        if d in dexes:
+            allowed_dexes.append(d)
+
+    if not allowed_dexes:
+        # if dex list missing, still try the preference order
+        allowed_dexes = pref[:]
+
+    print(f"🔀 route_policy allowed_dexes={allowed_dexes}", flush=True)
+
+    # Build BUY tx (SOL -> token)
+    try:
+        kp = Keypair.from_json(open(KEYPAIR_PATH, "r").read())
+    except Exception as e:
+        print(f"❌ cannot load keypair {KEYPAIR_PATH}: {e}", flush=True)
+        return 1
+
+    rpc = SolanaRPCAsync(RPC_HTTP)
+    buy_func, buy_name = _pick_jup_buy_func()
+
+    amount_in_lamports = int(BUY_AMOUNT_SOL * 1_000_000_000)
+    print(f"💸 BUY_AMOUNT_SOL={BUY_AMOUNT_SOL} (lamports={amount_in_lamports})", flush=True)
+    print(f"🧩 using jupiter func: {buy_name}", flush=True)
+
+    try:
+        # Try to call with allowed_dexes if function accepts it; else call without
+        import inspect
+        sig = str(inspect.signature(buy_func))
+        kwargs = dict(
+            rpc=rpc,
+            wallet=kp,
+            input_mint=WSOL_MINT,
+            output_mint=mint,
+            amount_in=amount_in_lamports,
+        )
+        if "allowed_dexes" in sig:
+            kwargs["allowed_dexes"] = allowed_dexes
+
+        txsig_or_info = await buy_func(**kwargs)
+
+        # Many implementations return txsig (if sent). In DRY_RUN, could return dict/str.
+        print(f"✅ jupiter build result: {txsig_or_info}", flush=True)
+
+        if DRY_RUN:
+            print("🧪 TRADER_DRY_RUN=1 -> not sending tx", flush=True)
+        else:
+            print("⚠️ LIVE: if this path sends automatically, you should see txsig above.", flush=True)
+
+    except Exception as e:
+        print(f"❌ jupiter buy build failed: {e}", flush=True)
+    finally:
+        await rpc.aclose()
+
+    return 0
+
+def main():
+    return asyncio.run(main_async())
+
+if __name__ == "__main__":
+    raise SystemExit(main())

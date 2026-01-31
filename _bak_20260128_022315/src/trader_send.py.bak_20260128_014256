@@ -1,0 +1,232 @@
+import base64
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+import requests
+
+from src.price_feed import get_prices
+
+RPC_HTTP = os.getenv("SOLANA_RPC_HTTP") or os.getenv("RPC_HTTP") or "https://api.mainnet-beta.solana.com"
+SIGNED_FILE = Path(os.getenv("TRADER_SIGNED_FILE", "last_swap_tx.signed.b64"))
+META_FILE = Path(os.getenv("TRADER_META_FILE", "last_swap_meta.json"))
+DB_PATH = os.getenv("TRADES_DB_PATH", "state/trades.sqlite")
+
+SKIP_PREFLIGHT = (os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1","true","yes","on"))
+MAX_RETRIES = int(os.getenv("TRADER_MAX_RETRIES", "3"))
+TIMEOUT_S = int(os.getenv("TRADER_SEND_TIMEOUT_S", "60"))
+
+CONFIRM_TIMEOUT_S = int(os.getenv("TRADER_CONFIRM_TIMEOUT_S", "60"))
+CONFIRM_POLL_S = float(os.getenv("TRADER_CONFIRM_POLL_S", "2.0"))
+
+def rpc(method: str, params: list):
+    payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
+    r = requests.post(RPC_HTTP, json=payload, timeout=TIMEOUT_S)
+    j = r.json()
+    if "error" in j and j["error"]:
+        raise RuntimeError(json.dumps(j["error"]))
+    return j.get("result")
+
+def read_b64_file(p: Path) -> bytes:
+    b64 = p.read_text(encoding="utf-8").strip()
+    return base64.b64decode(b64)
+
+def load_meta() -> dict:
+    if not META_FILE.exists():
+        return {}
+    return json.loads(META_FILE.read_text(encoding="utf-8"))
+
+def ensure_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    cur = con.cursor()
+
+    # Apply unified schema (safe, idempotent)
+    schema_path = Path("state/schema.sql")
+    if schema_path.exists():
+        cur.executescript(schema_path.read_text(encoding="utf-8"))
+    else:
+        # Minimal fallback (should not happen)
+        cur.execute("""CREATE TABLE IF NOT EXISTS trades(
+          mint TEXT PRIMARY KEY,
+          first_seen_ts INTEGER NOT NULL,
+          last_ts INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          last_error TEXT NOT NULL DEFAULT '',
+          payload_json TEXT NOT NULL DEFAULT '{}'
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS positions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mint TEXT NOT NULL,
+          status TEXT NOT NULL,
+          entry_price REAL NOT NULL,
+          peak_price REAL,
+          size_sol REAL NOT NULL,
+          tp_done INTEGER NOT NULL DEFAULT 0,
+          entry_ts INTEGER NOT NULL,
+          tx_sig TEXT NOT NULL DEFAULT '',
+          meta_json TEXT NOT NULL DEFAULT ''
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          mint TEXT NOT NULL,
+          status TEXT NOT NULL,
+          err TEXT NOT NULL DEFAULT '',
+          data_json TEXT NOT NULL DEFAULT '{}',
+          data TEXT NOT NULL DEFAULT '{}'
+        )""")
+
+    con.commit()
+    con.close()
+
+def add_event(mint: str, status: str, err: str = ""):
+    ensure_db()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT INTO events(ts,mint,status,err) VALUES(?,?,?,?)",
+                (int(time.time()), mint, status, err or ""))
+    con.commit()
+    con.close()
+
+def insert_position(mint: str, status: str, entry_price_usd: float, size_sol: float, tx_sig: str):
+    ensure_db()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    ts = int(time.time())
+    cur.execute(
+        "INSERT INTO positions(mint,status,entry_price,peak_price,size_sol,tp_done,entry_ts,tx_sig) VALUES(?,?,?,?,?,?,?,?)",
+        (mint, status, float(entry_price_usd), float(entry_price_usd), float(size_sol), 0, ts, tx_sig or "")
+    )
+    con.commit()
+    con.close()
+
+def derive_size_sol_from_meta(meta: dict) -> float:
+    for k in ("inAmount_ui","inputAmount_ui","in_ui","inSol"):
+        if k in meta:
+            try: return float(meta[k])
+            except Exception: pass
+    for k in ("inAmount","inputAmount","in_amount"):
+        if k in meta:
+            try: return float(meta[k]) / 1e9
+            except Exception: pass
+    q = meta.get("quote") or {}
+    if isinstance(q, dict):
+        for k in ("inAmount","inputAmount"):
+            if k in q:
+                try: return float(q[k]) / 1e9
+                except Exception: pass
+    return 0.0
+
+def get_mint_from_meta(meta: dict) -> str:
+    for k in ("outputMint","outMint","mint","targetMint"):
+        m = (meta.get(k) or "").strip()
+        if m:
+            return m
+    q = meta.get("quote") or {}
+    if isinstance(q, dict):
+        for k in ("outputMint","outMint","mint"):
+            m = (q.get(k) or "").strip()
+            if m:
+                return m
+    return ""
+
+def try_entry_price_usd(mint: str) -> float:
+    data = get_prices([mint])
+    info = data.get(mint) or {}
+    if info.get("usdPrice") is None:
+        return 0.0
+    return float(info["usdPrice"])
+
+def confirm_sig(sig: str) -> tuple[bool, str]:
+    """
+    Returns (confirmed, status_str)
+    status_str: confirmed | finalized | processed | failed | timeout | notfound
+    """
+    deadline = time.time() + CONFIRM_TIMEOUT_S
+    while time.time() < deadline:
+        try:
+            res = rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}]) or {}
+            arr = res.get("value") if isinstance(res, dict) else None
+            st = (arr[0] if arr and len(arr) else None) or None
+            if st is None:
+                time.sleep(CONFIRM_POLL_S)
+                continue
+            if st.get("err"):
+                return (False, "failed")
+            conf = st.get("confirmationStatus") or ""
+            if conf in ("confirmed", "finalized"):
+                return (True, conf)
+            # still processed
+            time.sleep(CONFIRM_POLL_S)
+            continue
+        except Exception:
+            time.sleep(CONFIRM_POLL_S)
+            continue
+    return (False, "timeout")
+
+def main():
+    print("🚀 trader_send")
+    print("   rpc_http=", RPC_HTTP)
+    print("   signed_file=", str(SIGNED_FILE))
+    print("   meta_file=", str(META_FILE))
+    print("   skip_preflight=", SKIP_PREFLIGHT, "max_retries=", MAX_RETRIES, "timeout_s=", TIMEOUT_S)
+
+    if not SIGNED_FILE.exists():
+        raise SystemExit("❌ signed tx file missing: " + str(SIGNED_FILE))
+
+    meta = load_meta()
+    mint = get_mint_from_meta(meta) or "UNKNOWN_MINT"
+    tx_bytes = read_b64_file(SIGNED_FILE)
+
+    # sendTransaction
+    payload = {"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[
+        base64.b64encode(tx_bytes).decode("utf-8"),
+        {
+            "encoding":"base64",
+            "skipPreflight": bool(SKIP_PREFLIGHT),
+            "preflightCommitment":"processed",
+            "maxRetries": int(MAX_RETRIES),
+        }
+    ]}
+    r = requests.post(RPC_HTTP, json=payload, timeout=TIMEOUT_S)
+    j = r.json()
+
+    if "error" in j and j["error"]:
+        add_event(mint, "SEND_FAIL", json.dumps(j["error"]))
+        raise SystemExit("❌ SEND_FAIL: " + json.dumps(j["error"]))
+
+    sig = j.get("result")
+    if not sig:
+        add_event(mint, "SEND_FAIL", "no result signature")
+        raise SystemExit("❌ SEND_FAIL: no result signature")
+
+    print("✅ sent sig =", sig)
+
+    ok, st = confirm_sig(sig)
+    if ok:
+        print("🎯 CONFIRMED status=", st)
+        add_event(mint, "CONFIRMED", st)
+        pos_status = "OPEN"
+    else:
+        print("⚠️ confirm status=", st, "(position saved as PENDING)")
+        add_event(mint, "CONFIRM_PENDING", st)
+        pos_status = "PENDING"
+
+    # record position (even if pending)
+    try:
+        size_sol = derive_size_sol_from_meta(meta)
+        entry_price = try_entry_price_usd(mint)
+        if entry_price <= 0.0:
+            print("⚠️ entry_price_usd unavailable -> set 0.0")
+            entry_price = 0.0
+        insert_position(mint, pos_status, entry_price, size_sol, sig)
+        print("✅ position saved", "status=", pos_status, "mint=", mint[:6]+"...", "size_sol=", size_sol, "entry_usd=", entry_price)
+    except Exception as e:
+        add_event(mint, "POSITION_FAIL", str(e))
+        print("❌ position record failed:", e)
+
+if __name__ == "__main__":
+    main()

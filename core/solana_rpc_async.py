@@ -65,6 +65,29 @@ class SolanaRPCAsync:
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
+
+    async def send_transaction(self, tx_bytes: bytes, skip_preflight: bool = False, max_retries: int = 3) -> str:
+        """
+        Send a signed transaction (raw bytes) via JSON-RPC sendTransaction.
+        Returns the transaction signature string.
+        """
+        import base64
+
+        if not isinstance(tx_bytes, (bytes, bytearray)):
+            raise TypeError(f"tx_bytes must be bytes, got {type(tx_bytes)}")
+
+        b64 = base64.b64encode(bytes(tx_bytes)).decode("ascii")
+
+        opts = {
+            "encoding": "base64",
+            "skipPreflight": bool(skip_preflight),
+            "maxRetries": int(max_retries),
+        }
+
+        # JSON-RPC: sendTransaction([<base64_tx>, <opts>])
+        return await self.call("sendTransaction", [b64, opts])
+
+
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()

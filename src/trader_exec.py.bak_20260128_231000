@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+import os
+def _env_allowed_dexes(default: str = "raydium,meteora,orca"):
+    s = os.environ.get("ALLOWED_DEXES", default)
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+ALLOWED_DEXES_LIST = _env_allowed_dexes()
+
+
+DEX_LABELS_LOCAL = {
+    "raydium": "Raydium",
+    "meteora": "Meteora+DLMM",
+    "orca": "Orca",
+    "orca+v2": "Orca+V2",
+    "pump.fun": "Pump.fun",
+    "pumpfun": "Pump.fun",
+    "pump.fun amm": "Pump.fun Amm",
+    "pumpfun amm": "Pump.fun Amm",
+    "pump.fun+amm": "Pump.fun Amm",
+}
+def _to_labels(lst):
+    out=[]
+    for d in (lst or []):
+        d=(d or "").strip()
+        if not d: 
+            continue
+        out.append(DEX_LABELS_LOCAL.get(d.lower(), d))
+    return out
+
+import sys
+import json
+import asyncio
+from pathlib import Path
+
+# Make project root importable: allows `import core.*` when running `python src/trader_exec.py`
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from solders.keypair import Keypair
+
+from core.solana_rpc_async import SolanaRPCAsync
+import core.jupiter_exec as jx
+
+
+def _dex_show(x: str) -> str:
+    try:
+        from core.jupiter_exec import DEX_LABELS
+        return DEX_LABELS.get((x or "").strip().lower(), x)
+    except Exception:
+        return x
+
+# --- Config ---
+WSOL_MINT = os.getenv("WSOL_MINT", "So11111111111111111111111111111111111111112")
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def load_ready(path: str):
+    rows = []
+    p = Path(path)
+    if not p.exists():
+        return rows
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
+
+
+def score_used(o: dict) -> float:
+    # prefer score_v4 (0..1) then score2 then score
+    for k in ("score_v4", "score2", "score"):
+        v = o.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return 0.0
+
+
+def pick_best(rows):
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda x: score_used(x), reverse=True)
+    return rows[0]
+
+
+def build_allowed_dexes(best: dict):
+    dexes = best.get("dexes") or []
+    dexes = [str(d).lower() for d in dexes]
+    origin = (best.get("origin") or "").lower()
+
+    pref = ["meteora", "raydium", "orca"]
+    if origin == "pumpfun":
+        pref = ["raydium", "meteora", "orca"]
+    allowed = ALLOWED_DEXES_LIST or allowed
+    if not allowed:
+        allowed = pref
+    return allowed
+
+
+def dex_label(d: str) -> str:
+    d = (d or "").lower()
+    if d == "meteora":
+        return "Meteora+DLMM"
+    if d == "raydium":
+        return "Raydium"
+    if d == "orca":
+        return "Orca"
+    return d
+
+
+def _pick_jup_buy_func():
+    if hasattr(jx, "jup_buy_exact_in"):
+        return jx.jup_buy_exact_in, "jup_buy_exact_in"
+    raise RuntimeError("No Jupiter BUY function found in core/jupiter_exec.py")
+
+
+async def _buy_try(buy_func, rpc, wallet, out_mint: str, amount_in: int, dex_list, fallback_any: bool):
+    # Controls internal fallback in core/jupiter_exec.py (if you coded it)
+    os.environ["JUP_DEX_FALLBACK_ANY"] = "1" if fallback_any else "0"
+    try:
+        return await buy_func(
+            rpc=rpc,
+            wallet=wallet,
+            input_mint=WSOL_MINT,
+            output_mint=out_mint,
+            amount_in=amount_in,
+            allowed_dexes=dex_list,
+        )
+    finally:
+        # keep env for logs
+        pass
+
+
+async def buy_with_strict_routing(buy_func, rpc, wallet, out_mint: str, amount_in: int, allowed_dexes):
+    dexes = [str(d).lower() for d in (allowed_dexes or []) if d]
+
+    # 1) strict per-dex
+    for d in dexes:
+        print(f"🧭 routing_try strict dex_only={_dex_show(d)} (JUP_DEX_FALLBACK_ANY=0)", flush=True)
+        try:
+            return await _buy_try(buy_func, rpc, wallet, out_mint, amount_in, [d], fallback_any=False)
+        except Exception as e:
+            print(f"⚠️ routing_try failed dex_only={d} err={e}", flush=True)
+
+    # 2) strict with full list
+    if dexes:
+        print(f"🧭 routing_try strict dex_list={dexes} (JUP_DEX_FALLBACK_ANY=0)", flush=True)
+        try:
+            return await _buy_try(buy_func, rpc, wallet, out_mint, amount_in, dexes, fallback_any=False)
+        except Exception as e:
+            print(f"⚠️ routing_try failed dex_list={dexes} err={e}", flush=True)
+
+    # 3) fallback ANY
+    strict_only = os.getenv("STRICT_ONLY", "0").strip().lower() in ("1","true","yes","on")
+    if strict_only:
+        raise RuntimeError(f"STRICT_ONLY=1: no Jupiter route for allowed_dexes={dexes}")
+
+    print("🧭 routing_fallback ANY (JUP_DEX_FALLBACK_ANY=1)", flush=True)
+    return await _buy_try(buy_func, rpc, wallet, out_mint, amount_in, None, fallback_any=True)
+
+
+def _load_wallet():
+    kp_path = os.getenv("KEYPAIR_PATH", str(ROOT / "keypair.json"))
+    kb = Path(kp_path).read_text(encoding="utf-8", errors="ignore")
+    arr = json.loads(kb)
+    return Keypair.from_bytes(bytes(arr))
+
+
+async def main_async():
+    ready_file = os.getenv("READY_FILE", "ready_to_trade_ranked_v4_orca.jsonl")
+    dry_run = os.getenv("TRADER_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+    rpc_http = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")).strip()
+    buy_amount_sol = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))
+    amount_in = int(buy_amount_sol * 1_000_000_000)
+
+    print("🚀 trader_exec BUY", flush=True)
+    print("   ready_file=", ready_file, flush=True)
+    print("   rpc_http=", rpc_http, flush=True)
+    print("   dry_run=", dry_run, flush=True)
+
+    rows = load_ready(ready_file)
+    print("   ready_count=", len(rows), flush=True)
+    best = pick_best(rows)
+    if not best:
+        print("💤 no candidates", flush=True)
+        return 0
+
+    mint = best.get("mint")
+    origin = best.get("origin")
+    liq = best.get("liquidity_usd")
+    vol24 = best.get("vol_24h")
+    tx1h = best.get("txns_1h")
+    chg1h = best.get("chg_1h")
+
+    allowed = build_allowed_dexes(best)
+    labels = [dex_label(d) for d in allowed]
+    print(
+        f"[DECISION] PICK mint={mint} score_used={score_used(best):.4f} origin={origin} "
+        f"dexes={best.get('dexes')} liq={liq} vol24={vol24} tx1h={tx1h} chg1h={chg1h}",
+        flush=True,
+    )
+    # env override
+    if ALLOWED_DEXES_LIST:
+        allowed = ALLOWED_DEXES_LIST
+    labels = _to_labels(allowed)
+    print(f"🔀 route_policy allowed_dexes={allowed} labels={labels}", flush=True)

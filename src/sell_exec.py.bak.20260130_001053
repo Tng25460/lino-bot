@@ -1,0 +1,110 @@
+import os, sys, json, time, base64, argparse, requests
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+def rpc_call(rpc: str, method: str, params, timeout=25):
+    payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
+    r = requests.post(rpc, json=payload, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"RPC error: {j['error']}")
+    return j["result"]
+
+def get_decimals(rpc: str, mint: str) -> int:
+    res = rpc_call(rpc, "getTokenSupply", [mint, {"commitment":"processed"}])
+    return int(res["value"]["decimals"])
+
+def send_tx(rpc: str, tx_b64: str) -> str:
+    # tx_b64 already base64
+    res = rpc_call(rpc, "sendTransaction", [tx_b64, {"encoding":"base64","skipPreflight":False,"preflightCommitment":"processed"}])
+    return str(res)
+
+    try:
+        def confirm(rpc: str, sig: str, timeout_s=35):
+    except Exception as e:
+        print('WARN confirm:', e, flush=True)
+    return
+        time.sleep(1.2)
+    # not fatal; network can be slow
+    return
+
+def jup_quote(base: str, input_mint: str, output_mint: str, amount: int, slippage_bps: int):
+    url = f"{base.rstrip('/')}/swap/v1/quote"
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps),
+    }
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def jup_swap(base: str, quote: dict, user_pubkey: str):
+    url = f"{base.rstrip('/')}/swap/v1/swap"
+    body = {
+        "quoteResponse": quote,
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+    }
+    r = requests.post(url, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mint", required=True, help="token mint to SELL -> SOL")
+    ap.add_argument("--ui", required=True, type=float, help="amount in UI units to sell")
+    ap.add_argument("--reason", default="", help="tag for logs")
+    args = ap.parse_args()
+
+    rpc = os.getenv("SOLANA_RPC","https://api.mainnet-beta.solana.com")
+    base = os.getenv("JUP_BASE_URL", os.getenv("JUP_BASE","https://lite-api.jup.ag"))
+    slippage_bps = int(os.getenv("SELL_SLIPPAGE_BPS", os.getenv("SLIPPAGE_BPS","300")))
+    dry = os.getenv("SELL_DRY_RUN","0") == "1"
+
+    keypath = os.getenv("KEYPAIR_PATH","keypair.json")
+    secret = json.load(open(keypath))
+    kp = Keypair.from_bytes(bytes(secret))
+    owner = str(kp.pubkey())
+
+    mint = args.mint
+    ui_amt = float(args.ui)
+    if ui_amt <= 0:
+        raise SystemExit("ui amount must be > 0")
+
+    dec = get_decimals(rpc, mint)
+    amt = int(ui_amt * (10**dec))
+    if amt <= 0:
+        raise SystemExit("computed amount <= 0 (check decimals/ui)")
+
+    print(f"SELL_EXEC reason={args.reason} mint={mint} ui={ui_amt} dec={dec} amount={amt} slippage_bps={slippage_bps} base={base} rpc={rpc} dry={dry}", flush=True)
+
+    quote = jup_quote(base, mint, SOL_MINT, amt, slippage_bps)
+    swap = jup_swap(base, quote, owner)
+    tx_b64 = swap.get("swapTransaction")
+    if not tx_b64:
+        raise RuntimeError(f"no swapTransaction in response: keys={list(swap.keys())}")
+
+    if dry:
+        print("DRY_RUN swapTransaction_len=", len(tx_b64), flush=True)
+        print("txsig=DRY_RUN_NO_TX_SENT", flush=True)
+        return
+
+    raw = base64.b64decode(tx_b64)
+    vtx = VersionedTransaction.from_bytes(raw)
+    signed_vtx = VersionedTransaction(vtx.message, [kp])
+    signed_b64 = base64.b64encode(bytes(signed_vtx)).decode('utf-8')
+    txsig = send_tx(rpc, signed_b64)
+    print('txsig=' + txsig, flush=True)
+        confirm(rpc, txsig, timeout_s=int(os.getenv("SELL_CONFIRM_TIMEOUT_S","35")))
+    except Exception as e:
+        print("WARN confirm:", e, flush=True)
+return
+
+if __name__ == "__main__":
+    main()

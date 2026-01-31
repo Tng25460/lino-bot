@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List
+
+from config import settings
+
+
+class TradingEngine:
+    def __init__(self, wallet, logger, positions_file: str, mode: str):
+        self.wallet = wallet
+        self.logger = logger
+        self.positions_file = positions_file
+        self.mode = mode
+
+        self.last_buy_ts = 0.0
+
+        from core.real_executor import RealExecutor
+        from core.paper_executor import PaperExecutor
+
+        if mode == "REAL":
+            self.executor = RealExecutor(wallet, logger)
+        else:
+            self.executor = PaperExecutor(wallet, logger)
+
+        self.logger.info(
+            f"[TradingEngine] Initialisé (mode={mode}, SL + trailing activé)."
+        )
+
+    async def on_overviews(self, overviews: List[Dict[str, Any]], risk_checker) -> None:
+        self.logger.info(
+            "[DBG_ENTER] on_overviews called, n=%s", len(overviews) if overviews else 0
+        )
+
+        did_buy = False
+        now = time.time()
+
+        for ov in overviews or []:
+            if did_buy:
+                break
+
+            # Compat: scanner met souvent mint/token, d’autres mettent address
+            mint = ov.get("mint") or ov.get("token") or ov.get("address")
+
+            # Compat prix: price_usd (dexscreener) ou price
+            price = ov.get("price_usd") or ov.get("price")
+
+            if not mint or price is None:
+                continue
+
+            # cooldown global
+            if now - self.last_buy_ts < float(getattr(settings, "BUY_COOLDOWN_SECONDS", 0)):
+                continue
+
+            liq = ov.get("liquidity_usd")
+            mc = ov.get("marketcap_usd")
+
+            self.logger.info(
+                "[DBG_PRE_RISK] mint=%s liq=%s mc=%s price=%s",
+                mint, liq, mc, price
+            )
+
+            ok, reason = risk_checker.allow_buy(ov)
+            self.logger.info("[DBG_RISK] mint=%s ok=%s reason=%s", mint, ok, reason)
+
+            if not ok:
+                self.logger.info("[BUY] Skip %s (risk: %s)", mint, reason)
+                continue
+
+            sol_amount = float(getattr(settings, "BUY_AMOUNT_SOL", 0.02))
+
+            self.logger.info(
+                "[BUY] Signal %s price~%.8f size=%.4f SOL mode=%s",
+                mint, float(price), sol_amount, self.mode
+            )
+
+            try:
+                self.logger.info(
+                    "[DBG_BEFORE_BUY] mint=%s price=%s sol_amount=%s mode=%s",
+                    mint, price, sol_amount, self.mode
+                )
+
+                # Appel robuste: certains executors acceptent (token_address, sol_amount, ...)
+                # d'autres (mint, price, sol_amount) etc.
+                res = None
+                try:
+                    res = self.executor.buy(token_address=mint, sol_amount=sol_amount, price=float(price))
+                except TypeError:
+                    try:
+                        res = self.executor.buy(mint, sol_amount)
+                    except TypeError:
+                        res = self.executor.buy(mint, float(price), sol_amount)
+
+                # si async -> await
+                if hasattr(res, "__await__"):
+                    await res
+
+                self.last_buy_ts = now
+                did_buy = True
+                self.logger.info("[BUY OK] %s", mint)
+
+            except Exception as e:
+                self.logger.error("[BUY ERROR] %s: %s", mint, e)
+
+        self._print_portfolio()
+
+    def _print_portfolio(self) -> None:
+        self.logger.info(
+            "[PORTFOLIO] mode=%s cash=%.4f equity=%.4f open=%d closed=%d pnl=+%.4f",
+            self.mode,
+            1.0,
+            1.0,
+            0,
+            0,
+            0.0,
+        )

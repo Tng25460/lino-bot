@@ -1,0 +1,272 @@
+import os
+import json
+import base64
+import aiohttp
+from typing import Dict, Any, Optional, List
+
+
+def _dex_id(x: str) -> str:
+    s = (x or '').strip().lower()
+    s = s.replace('meteora+dlmm','meteora')
+    s = s.replace('pumpfun','pump.fun')
+    s = s.replace('pump.fun+amm','pump.fun amm')
+    s = s.replace('pumpfun amm','pump.fun amm')
+    return s
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+
+from core.solana_rpc_async import SolanaRPCAsync
+
+
+# --- builtins guard: ensure _dex_show always exists (avoid NameError across scopes) ---
+import builtins as _builtins
+if not hasattr(_builtins, '_dex_show'):
+    _builtins._dex_show = lambda x: x
+try:
+    _builtins._dex_show = globals().get('_dex_show', _builtins._dex_show)
+except Exception:
+    pass
+# --- end builtins guard ---
+
+# Base URL: prefer lite-api by default (no key required)
+JUP_BASE = os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag").rstrip("/")
+JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip()
+
+SLIPPAGE_BPS = int(os.getenv("JUP_SLIPPAGE_BPS", "250"))
+PRIORITY_FEE_MICROLAMPORTS = int(os.getenv("JUP_PRIORITY_FEE_MICROLAMPORTS", "0"))
+JUP_TIMEOUT_S = float(os.getenv("JUP_TIMEOUT_S", "15"))
+JUP_RETRIES = int(os.getenv("JUP_RETRIES", "3"))
+
+# If SELL_DRY_RUN not explicitly set, inherit TRADER_DRY_RUN
+if "SELL_DRY_RUN" in os.environ:
+    SELL_DRY_RUN = os.getenv("SELL_DRY_RUN", "1").strip().lower() not in ("0", "false", "no", "off")
+else:
+    SELL_DRY_RUN = os.getenv("TRADER_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Optional global excludes (comma-separated Jupiter dex names)
+JUP_EXCLUDE_DEXES = os.getenv("JUP_EXCLUDE_DEXES", "").strip()
+
+# Map internal dex ids -> Jupiter labels (best-effort)
+DEX_LABELS = {
+    "raydium": "Raydium",
+    "meteora": "Meteora+DLMM",
+    "orca": "Orca",
+    "orca+v2": "Orca+V2",
+    "orca v2": "Orca+V2",
+
+    "pump.fun": "Pump.fun",
+    "pumpfun": "Pump.fun",
+    "pump.fun amm": "Pump.fun Amm",
+    "pumpfun amm": "Pump.fun Amm",
+    "pump.fun+amm": "Pump.fun Amm",
+    "pump.fun_amm": "Pump.fun Amm",
+    "pumpswap": "Pump.fun Amm",
+}
+def _headers() -> Dict[str, str]:
+    # Only attach key when hitting api.jup.ag (Pro gating); lite-api typically doesn't need it.
+    h: Dict[str, str] = {}
+    if "api.jup.ag" in JUP_BASE and JUP_API_KEY:
+        h["x-api-key"] = JUP_API_KEY
+    return h
+
+async def _get_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    last_err = None
+    for _ in range(JUP_RETRIES):
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S),
+            ) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    raise RuntimeError(f"Jupiter quote HTTP {r.status}: {txt[:400]}")
+                return await r.json()
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Jupiter GET failed after {JUP_RETRIES} tries: {last_err}")
+
+async def _post_json(session: aiohttp.ClientSession, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    last_err = None
+    for _ in range(JUP_RETRIES):
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S),
+            ) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    raise RuntimeError(f"Jupiter swap HTTP {r.status}: {txt[:400]}")
+                return await r.json()
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Jupiter POST failed after {JUP_RETRIES} tries: {last_err}")
+
+def _to_labels(allowed_dexes: Optional[List[str]]) -> List[str]:
+    if not allowed_dexes:
+        return []
+    out = []
+    for d in allowed_dexes:
+        d0 = (d or "").strip().lower()
+        if not d0:
+            continue
+        out.append(DEX_LABELS.get(d0, d0))
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x in seen:
+            continue
+        uniq.append(x)
+        seen.add(x)
+    return uniq
+
+async def jup_build_swap_tx(
+    session: aiohttp.ClientSession,
+    user_pubkey: str,
+    input_mint: str,
+    output_mint: str,
+    amount_in: int,
+    allowed_dexes: Optional[List[str]] = None,
+) -> str:
+    qurl = f"{JUP_BASE}/swap/v1/quote"
+
+    params: Dict[str, Any] = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount_in),
+        "slippageBps": str(SLIPPAGE_BPS),
+    }
+
+    # Optional global excludes (comma-separated Jupiter dex names)
+    if JUP_EXCLUDE_DEXES:
+        params["excludeDexes"] = JUP_EXCLUDE_DEXES
+
+    # IMPORTANT:
+    # - Send dex ids in lowercase to Jupiter (NOT labels)
+    # - Labels are only for logs
+    dex_ids: List[str] = []
+    if allowed_dexes:
+        for d in allowed_dexes:
+            d0 = (d or "").strip().lower()
+            if d0:
+                dex_ids.append(d0)
+        # unique preserve order
+        seen = set()
+        dex_ids = [_dex_id(d) for d in (allowed_dexes or []) if str(d).strip()]
+
+    if dex_ids:
+        # ensure labels always defined (labels are Jupiter dex filter values)
+        labels = []
+        if allowed_dexes:
+            if isinstance(allowed_dexes, (list, tuple)):
+                raw = [str(x) for x in allowed_dexes]
+            else:
+                raw = [str(allowed_dexes)]
+            labels = [DEX_LABELS.get(x.strip().lower(), x.strip()) for x in raw if x and x.strip()]
+        # build Jupiter dex filter labels (EXACT labels, not lowercase)
+        labels = []
+        if allowed_dexes:
+            if isinstance(allowed_dexes, (list, tuple)):
+                raw = [str(x) for x in allowed_dexes]
+            else:
+                raw = str(allowed_dexes).split(",")
+            for x in raw:
+                x = (x or "").strip()
+                if not x:
+                    continue
+                labels.append(DEX_LABELS.get(x.lower(), x))
+        dex_ids = [_dex_id(d) for d in (allowed_dexes or []) if str(d).strip()]
+        params["dexes"] = ",".join(dex_ids)
+        labels = _to_labels(dex_ids)
+        print(f"🧩 jup_quote dex_ids={dex_ids} labels={labels}", flush=True)
+    # strict mode is evaluated per-call (env can change between attempts)
+    fallback_any = os.getenv("JUP_DEX_FALLBACK_ANY", "0").strip().lower() in ("1","true","yes","on")
+
+    try:
+        quote = await _get_json(session, qurl, params=params)
+    except Exception as e:
+        # If strict mode and dex restriction requested -> propagate
+        if dex_ids and not fallback_any:
+            raise
+        # Otherwise, fall back to ANY route
+        if dex_ids:
+            print(f"⚠️ jup_quote restricted failed -> fallback ANY. err={e}", flush=True)
+            params.pop("dexes", None)
+            quote = await _get_json(session, qurl, params=params)
+        else:
+            raise
+
+    surl = f"{JUP_BASE}/swap/v1/swap"
+    body: Dict[str, Any] = {
+        "quoteResponse": quote,
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+    }
+    if PRIORITY_FEE_MICROLAMPORTS > 0:
+        body["prioritizationFeeLamports"] = PRIORITY_FEE_MICROLAMPORTS
+
+    resp = await _post_json(session, surl, body)
+    tx_b64 = resp.get("swapTransaction")
+    if not tx_b64:
+        raise RuntimeError(f"Jupiter swap response missing swapTransaction keys={list(resp.keys())}")
+    return tx_b64
+
+async def jup_sign_and_send(
+    rpc: SolanaRPCAsync,
+    wallet: Keypair,
+    tx_b64: str,
+) -> str:
+    raw = base64.b64decode(tx_b64)
+    vtx = VersionedTransaction.from_bytes(raw)
+    sig_tx = VersionedTransaction(vtx.message, [wallet])
+
+    if SELL_DRY_RUN:
+        return "DRY_RUN_NO_TX_SENT"
+
+    txsig = await rpc.send_transaction(bytes(sig_tx), skip_preflight=False, max_retries=3)
+    return txsig
+
+async def jup_buy_exact_in(
+    rpc: SolanaRPCAsync,
+    wallet: Keypair,
+    input_mint: str,
+    output_mint: str,
+    amount_in: int,
+    allowed_dexes: List[str] | None = None,
+) -> str:
+    user_pubkey = str(wallet.pubkey())
+    async with aiohttp.ClientSession() as session:
+        tx_b64 = await jup_build_swap_tx(
+            session=session,
+            user_pubkey=user_pubkey,
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount_in=amount_in,
+            allowed_dexes=allowed_dexes,
+        )
+    return await jup_sign_and_send(rpc=rpc, wallet=wallet, tx_b64=tx_b64)
+
+async def jup_sell_exact_in(
+    rpc: SolanaRPCAsync,
+    wallet: Keypair,
+    input_mint: str,
+    output_mint: str,
+    amount_in: int,
+    allowed_dexes: List[str] | None = None,
+) -> str:
+    user_pubkey = str(wallet.pubkey())
+    async with aiohttp.ClientSession() as session:
+        tx_b64 = await jup_build_swap_tx(
+            session=session,
+            user_pubkey=user_pubkey,
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount_in=amount_in,
+            allowed_dexes=allowed_dexes,
+        )
+    return await jup_sign_and_send(rpc=rpc, wallet=wallet, tx_b64=tx_b64)

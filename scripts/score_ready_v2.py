@@ -1,130 +1,182 @@
 #!/usr/bin/env python3
-import os, json, time
-from pathlib import Path
-from collections import Counter
+import os, sys, json, math, argparse
+from typing import Any, Dict
 
-INP  = Path(os.getenv("READY_IN",  "ready_to_trade_enriched.jsonl"))
-OUT  = Path(os.getenv("READY_OUT", "ready_to_trade_scored.jsonl"))
-TOPN = int(os.getenv("READY_TOPN", "200"))
-
-DEX_ALLOW = set(x.strip() for x in os.getenv("DEX_ALLOW", "raydium").lower().split(",") if x.strip())
-
-# Thresholds (tune via env)
-MIN_LIQ_USD  = float(os.getenv("SCORE_MIN_LIQ",  "5000"))
-MIN_VOL5_USD = float(os.getenv("SCORE_MIN_VOL5", "100"))
-MIN_TX5      = float(os.getenv("SCORE_MIN_TX5",  "2"))
-MIN_CHG5     = float(os.getenv("SCORE_MIN_CHG5", "0.5"))
-MIN_CHG1H    = float(os.getenv("SCORE_MIN_CHG1H","3.0"))
-
-MAX_FDV      = float(os.getenv("SCORE_MAX_FDV",  "50000000"))
-MAX_MCAP     = float(os.getenv("SCORE_MAX_MCAP", "50000000"))
-
-SCORE_MIN    = float(os.getenv("SCORE_MIN",     "3.5"))
-
-READY_STATS  = os.getenv("READY_STATS", "0") == "1"
-
-def _f(x, d=0.0):
+def fnum(x, default=0.0) -> float:
     try:
         if x is None:
-            return d
+            return float(default)
         return float(x)
     except Exception:
-        return d
+        return float(default)
 
-def score_row(o: dict):
-    dex = (o.get("dex_id") or "").lower().strip()
-    if DEX_ALLOW and dex and dex not in DEX_ALLOW:
-        return None, "gate_dex", {}
+def pick(d: Dict[str, Any], *paths, default=None):
+    # paths can be strings (direct keys) or tuples for nested keys
+    for p in paths:
+        cur = d
+        ok = True
+        if isinstance(p, tuple):
+            for k in p:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok:
+                return cur
+        else:
+            if isinstance(cur, dict) and p in cur:
+                return cur[p]
+    return default
 
-    liq = _f(o.get("liquidity_usd"))
-    v5  = _f(o.get("vol_5m"))
-    tx5 = _f(o.get("txns_5m"))
-    ch5 = _f(o.get("chg_5m"))
-    ch1 = _f(o.get("chg_1h"))
-    fdv = _f(o.get("fdv"))
-    mcp = _f(o.get("market_cap"))
+def get_metrics(j: Dict[str, Any]) -> Dict[str, Any]:
+    # Many possible DexScreener shapes; be permissive.
+    mint = j.get("mint") or j.get("baseToken", {}).get("address") or ""
+    symbol = j.get("symbol") or j.get("baseToken", {}).get("symbol") or ""
 
-    if liq < MIN_LIQ_USD:  return None, "gate_liq",   {"liq": liq}
-    if v5  < MIN_VOL5_USD: return None, "gate_vol5",  {"vol5m": v5}
-    if tx5 < MIN_TX5:      return None, "gate_tx5",   {"tx5m": tx5}
-    if ch5 < MIN_CHG5:     return None, "gate_chg5",  {"chg5m": ch5}
-    if ch1 < MIN_CHG1H:    return None, "gate_chg1h", {"chg1h": ch1}
-    if fdv and fdv > MAX_FDV:   return None, "gate_fdv",  {"fdv": fdv}
-    if mcp and mcp > MAX_MCAP:  return None, "gate_mcap", {"mcap": mcp}
+    liq = pick(j, ("liquidity","usd"), "liquidityUsd", "liquidity_usd", "liq", "liq_usd", default=0.0)
+    vol24 = pick(j, ("volume","h24"), "volume24h", "vol24", "vol_24h", default=0.0)
 
-    # score (bounded / stable)
-    s_liq = min(2.0, max(0.0, liq / (MIN_LIQ_USD * 3.0)))       # 0..2
-    s_v5  = min(3.0, max(0.0, v5  / (MIN_VOL5_USD * 4.0)))      # 0..3
-    s_ch5 = min(3.0, max(0.0, ch5 / 30.0))                      # 0..3
-    s_tx  = min(2.0, max(0.0, tx5 / 30.0))                      # 0..2
+    # txns / change often nested
+    tx1h = pick(j, ("txns","h1","buys"), "txns_1h", default=None)
+    if tx1h is None:
+        tx1h = pick(j, "tx1h", "txns1h", "txns_1h", default=0.0)
+    else:
+        # if it's buys only, also add sells if present
+        sells = pick(j, ("txns","h1","sells"), default=0.0)
+        tx1h = fnum(tx1h,0.0) + fnum(sells,0.0)
 
-    score = float(s_liq + s_v5 + s_ch5 + s_tx)
+    chg1h = pick(j, ("priceChange","h1"), "change1h", "chg1h", "chg_1h", default=0.0)
 
-    dbg = {
-        "liq": liq, "vol5m": v5, "tx5m": tx5, "chg5m": ch5, "chg1h": ch1, "fdv": fdv, "mcap": mcp,
-        "s_liq": s_liq, "s_v5": s_v5, "s_ch5": s_ch5, "s_tx": s_tx,
-        "score_min": SCORE_MIN,
+    fdv = pick(j, "fdv", "fullyDilutedValuation", default=0.0)
+    mcap = pick(j, "marketCap", "market_cap", "mcap", default=0.0)
+
+    dex = pick(j, "dexId", "dex_id", "dex", "dex_id", default=None)
+    if dex is None:
+        # sometimes "dexes": [...]
+        dex = pick(j, "dexes", default=None)
+
+    return {
+        "mint": mint,
+        "symbol": symbol,
+        "liq": fnum(liq,0.0),
+        "vol24": fnum(vol24,0.0),
+        "tx1h": fnum(tx1h,0.0),
+        "chg1h": fnum(chg1h,0.0),
+        "fdv": fnum(fdv,0.0),
+        "mcap": fnum(mcap,0.0),
+        "dex": dex,
     }
 
-    if score < SCORE_MIN:
-        return None, "gate_scoremin", dbg
+def score(m: Dict[str, Any]) -> float:
+    # Simple, robust, monotonic score. Missing fields just contribute 0.
+    liq = max(m["liq"], 0.0)
+    vol24 = max(m["vol24"], 0.0)
+    tx1h = max(m["tx1h"], 0.0)
+    chg1h = m["chg1h"]
 
-    return score, "ok", dbg
+    s = 0.0
+    # log scale so early tokens don't get nuked
+    if liq > 0:
+        s += min(1.0, math.log10(1.0 + liq) / 6.0)         # ~ up to 1 at 1M
+    if vol24 > 0:
+        s += min(1.0, math.log10(1.0 + vol24) / 7.0)       # ~ up to 1 at 10M
+    if tx1h > 0:
+        s += min(1.0, math.log10(1.0 + tx1h) / 3.0)        # ~ up to 1 at 1000 tx
+    # reward positive momentum a bit, but don't kill negatives too hard
+    s += max(-0.3, min(0.7, chg1h / 100.0))                # -30%..+70% range
+
+    # tiny bonus if dex is known
+    if m.get("dex"):
+        s += 0.05
+
+    # normalize to 0..1.5 roughly
+    return max(0.0, s)
 
 def main():
-    if not INP.exists():
-        raise SystemExit(f"missing {INP}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="inp", default="ready_to_trade_enriched.jsonl")
+    ap.add_argument("--out", dest="out", default="ready_to_trade_scored.jsonl")
+    ap.add_argument("--limit", type=int, default=2000000)
+    args = ap.parse_args()
 
-    rows=[]
-    total=0
-    for line in INP.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if total >= TOPN:
-            break
-        line=line.strip()
-        if not line:
-            continue
-        try:
-            o=json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(o, dict):
-            continue
-        rows.append(o)
-        total += 1
+    # gates via env ONLY
+    score_min      = float(os.getenv("SCORE_MIN", "0.0"))
+    min_liq        = float(os.getenv("SCORE_MIN_LIQ", "0"))
+    min_vol24      = float(os.getenv("SCORE_MIN_VOL24", "0"))
+    min_tx1h       = float(os.getenv("SCORE_MIN_TX1H", "0"))
+    min_chg1h      = float(os.getenv("SCORE_MIN_CHG1H", "-999"))
+    max_fdv        = float(os.getenv("SCORE_MAX_FDV", "1e18"))
+    max_mcap       = float(os.getenv("SCORE_MAX_MCAP", "1e18"))
+    require_dex    = os.getenv("SCORE_REQUIRE_DEX", "0") == "1"
+    force_any      = os.getenv("SCORE_FORCE_ANY", "0") == "1"
 
-    if READY_STATS:
-        c=Counter()
-        kept=0
-        for o in rows:
-            sc, reason, _ = score_row(o)
-            if sc is None:
-                c[reason]+=1
-            else:
-                kept += 1
-                c["ok"] += 1
-        print("gate_stats:", dict(c))
-        print("kept_ok:", kept, "total:", len(rows))
-        return 0
+    kept = 0
+    total = 0
+    bad = 0
 
-    # write output
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text("", encoding="utf-8")
+    with open(args.inp, "r", encoding="utf-8") as f, open(args.out, "w", encoding="utf-8") as g:
+        for line in f:
+            if total >= args.limit:
+                break
+            t = line.strip()
+            if not t:
+                continue
+            total += 1
+            try:
+                j = json.loads(t)
+                if not isinstance(j, dict):
+                    bad += 1
+                    continue
+            except Exception:
+                bad += 1
+                continue
 
-    kept=0
-    for o in rows:
-        sc, reason, dbg = score_row(o)
-        if sc is None:
-            continue
-        o["score"] = float(sc)
-        o["score_reason"] = reason
-        o["score_dbg"] = dbg
-        o["scored_at"] = int(time.time())
-        OUT.open("a", encoding="utf-8").write(json.dumps(o, ensure_ascii=False) + "\n")
-        kept += 1
+            m = get_metrics(j)
+            mint = m["mint"]
+            if not mint:
+                continue
 
-    size = OUT.stat().st_size if OUT.exists() else 0
-    print(f"scored: {kept} of {len(rows)} -> {OUT} bytes= {size}")
-    return 0
+            if require_dex and not m.get("dex"):
+                continue
+
+            # gates (missing metrics == 0)
+            if m["liq"] < min_liq:
+                continue
+            if m["vol24"] < min_vol24:
+                continue
+            if m["tx1h"] < min_tx1h:
+                continue
+            if m["chg1h"] < min_chg1h:
+                continue
+            if m["fdv"] > max_fdv:
+                continue
+            if m["mcap"] > max_mcap:
+                continue
+
+            sc = score(m)
+
+            if sc < score_min and not force_any:
+                continue
+
+            out = dict(j)
+            out["mint"] = mint
+            if m["symbol"]:
+                out["symbol"] = m["symbol"]
+            out["score_used"] = float(sc)
+            out["liq"] = float(m["liq"])
+            out["vol24"] = float(m["vol24"])
+            out["tx1h"] = float(m["tx1h"])
+            out["chg1h"] = float(m["chg1h"])
+            out["fdv"] = float(m["fdv"])
+            out["mcap"] = float(m["mcap"])
+            out["dexes"] = m.get("dex")
+
+            g.write(json.dumps(out, ensure_ascii=False) + "\n")
+            kept += 1
+
+    print(f"READY_IN={args.inp} total={total} bad_json={bad}", flush=True)
+    print(f"scored: {kept} of {total} -> {args.out} bytes={os.path.getsize(args.out) if os.path.exists(args.out) else 0}", flush=True)
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

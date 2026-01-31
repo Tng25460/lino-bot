@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+import os
+def _env_allowed_dexes(default: str = "raydium,meteora,orca"):
+    s = os.environ.get("ALLOWED_DEXES", default)
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+ALLOWED_DEXES_LIST = _env_allowed_dexes()
+
+
+DEX_LABELS_LOCAL = {
+    "raydium": "Raydium",
+    "meteora": "Meteora+DLMM",
+    "orca": "Orca",
+    "orca+v2": "Orca+V2",
+    "pump.fun": "Pump.fun",
+    "pumpfun": "Pump.fun",
+    "pump.fun amm": "Pump.fun Amm",
+    "pumpfun amm": "Pump.fun Amm",
+    "pump.fun+amm": "Pump.fun Amm",
+}
+def _to_labels(lst):
+    out=[]
+    for d in (lst or []):
+        d=(d or "").strip()
+        if not d: 
+            continue
+        out.append(DEX_LABELS_LOCAL.get(d.lower(), d))
+    return out
+
+import sys
+import json
+import asyncio\nimport random
+from pathlib import Path
+
+# Make project root importable: allows `import core.*` when running `python src/trader_exec.py`
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from solders.keypair import Keypair
+
+from core.solana_rpc_async import SolanaRPCAsync
+import core.jupiter_exec as jx
+
+
+def _dex_show(x: str) -> str:
+    try:
+        from core.jupiter_exec import DEX_LABELS
+        return DEX_LABELS.get((x or "").strip().lower(), x)
+    except Exception:
+        return x
+
+
+def dex_id(x: str) -> str:
+    # Force Jupiter dex IDs (lowercase). Accepts labels too.
+    s = (x or "").strip().lower()
+    # normalize common label-ish inputs
+    s = s.replace("meteora+dlmm", "meteora")
+    s = s.replace("pumpfun", "pump.fun")
+    s = s.replace("pump.fun+amm", "pump.fun amm")
+    s = s.replace("pumpfun amm", "pump.fun amm")
+    return s
+
+# --- Config ---
+WSOL_MINT = os.getenv("WSOL_MINT", "So11111111111111111111111111111111111111112")
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def load_ready(path: str):
+    rows = []
+    p = Path(path)
+    if not p.exists():
+        return rows
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
+
+
+def score_used(o: dict) -> float:
+    # prefer score_v4 (0..1) then score2 then score
+    for k in ("score_v4", "score2", "score"):
+        v = o.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return 0.0
+
+
+def pick_best(rows, top_n: int = 10):
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda x: score_used(x), reverse=True)
+    n = min(max(int(top_n), 1), len(rows))
+    # choose randomly among top N to explore routes
+    return random.choice(rows[:n])
+
+
+def build_allowed_dexes(best: dict):
+    dexes = best.get("dexes") or []
+    dexes = [str(d).strip().lower() for d in dexes if str(d).strip()]
+    origin = (best.get("origin") or "").strip().lower()
+
+    # defaults
+    pref = ["meteora", "raydium", "orca"]
+    if origin == "pumpfun":
+        # pumpfun tokens routent le plus souvent via raydium/meteora/orca (selon ton setup)
+        pref = ["raydium", "meteora", "orca"]
+
+    # priorité: env ALLOWED_DEXES > dexes du candidat > defaults
+    if ALLOWED_DEXES_LIST:
+        return [str(d).strip().lower() for d in ALLOWED_DEXES_LIST if str(d).strip()]
+    if dexes:
+        return dexes
+    return pref
+
+def dex_label(d: str) -> str:
+    d = (d or "").lower()
+    if d == "meteora":
+        return "Meteora+DLMM"
+    if d == "raydium":
+        return "Raydium"
+    if d == "orca":
+        return "Orca"
+    return d
+
+
+def _pick_jup_buy_func():
+    if hasattr(jx, "jup_buy_exact_in"):
+        return jx.jup_buy_exact_in, "jup_buy_exact_in"
+    raise RuntimeError("No Jupiter BUY function found in core/jupiter_exec.py")
+
+
+async def _buy_try(buy_func, rpc, wallet, out_mint: str, amount_in: int, dex_list, fallback_any: bool):
+    # Controls internal fallback in core/jupiter_exec.py (if you coded it)
+    os.environ["JUP_DEX_FALLBACK_ANY"] = "1" if fallback_any else "0"
+    try:
+        return await buy_func(
+            rpc=rpc,
+            wallet=wallet,
+            input_mint=WSOL_MINT,
+            output_mint=out_mint,
+            amount_in=amount_in,
+            allowed_dexes=dex_list,
+        )
+    finally:
+        # keep env for logs
+        pass
+
+
+async def buy_with_strict_routing(buy_func, rpc, wallet, out_mint: str, amount_in: int, allowed_dexes):
+    # NOTE: Jupiter 'dexes' param disabled in core/jupiter_exec.py.
+    # We enforce DEX restriction via routePlan gating (STRICT_ONLY + ALLOWED_ROUTE_LABELS).
+    print('🧭 routing_try ANY (routePlan gating via STRICT_ONLY/ALLOWED_ROUTE_LABELS)', flush=True)
+    return await _buy_try(buy_func, rpc, wallet, out_mint, amount_in, None, fallback_any=True)
+def _load_wallet():
+    kp_path = os.getenv("KEYPAIR_PATH", str(ROOT / "keypair.json"))
+    kb = Path(kp_path).read_text(encoding="utf-8", errors="ignore")
+    arr = json.loads(kb)
+    return Keypair.from_bytes(bytes(arr))
+
+async def main_async():
+    ready_file = os.getenv("READY_FILE", "ready_to_trade_ranked_v4_orca.jsonl")
+    dry_run = os.getenv("TRADER_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+    rpc_http = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")).strip()
+    buy_amount_sol = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))
+    amount_in = int(buy_amount_sol * 1_000_000_000)
+
+    print("🚀 trader_exec BUY", flush=True)
+    print("   ready_file=", ready_file, flush=True)
+    print("   rpc_http=", rpc_http, flush=True)
+    print("   dry_run=", dry_run, flush=True)
+
+    rows = load_ready(ready_file)
+    print("   ready_count=", len(rows), flush=True)
+
+    best = pick_best(rows)
+    if not best:
+        print("💤 no candidates", flush=True)
+        return 0
+
+    mint = best.get("mint")
+    origin = best.get("origin")
+    liq = best.get("liquidity_usd")
+    vol24 = best.get("vol_24h")
+    tx1h = best.get("txns_1h")
+    chg1h = best.get("chg_1h")
+
+    allowed = build_allowed_dexes(best)
+
+    print(
+        f"[DECISION] PICK mint={mint} score_used={score_used(best):.4f} origin={origin} "
+        f"dexes={best.get('dexes')} liq={liq} vol24={vol24} tx1h={tx1h} chg1h={chg1h}",
+        flush=True,
+    )
+
+    # env override (déjà géré dans build_allowed_dexes, mais on garde la logique)
+    if ALLOWED_DEXES_LIST:
+        allowed = [str(d).strip().lower() for d in ALLOWED_DEXES_LIST if str(d).strip()]
+
+    labels = _to_labels(allowed)
+    print(f"🔀 route_policy allowed_dexes={allowed} labels={labels}", flush=True)
+
+    if not mint:
+        print("💤 best candidate missing mint", flush=True)
+        return 0
+
+    print("💸 BUY_AMOUNT_SOL=", buy_amount_sol, f"(lamports={amount_in})", flush=True)
+
+    buy_func, buy_func_name = _pick_jup_buy_func()
+    print("🧩 using jupiter func:", buy_func_name, flush=True)
+
+    wallet = _load_wallet()
+    rpc = SolanaRPCAsync(rpc_http)
+
+    try:
+        res = await buy_with_strict_routing(
+            buy_func=buy_func,
+            rpc=rpc,
+            wallet=wallet,
+            out_mint=str(mint),
+            amount_in=amount_in,
+            allowed_dexes=allowed,
+        )
+        print("✅ jupiter build result:", res, flush=True)
+        if dry_run:
+            print("🧪 TRADER_DRY_RUN=1 -> not sending tx", flush=True)
+        return 0
+    except Exception as e:
+        strict_only = os.getenv("STRICT_ONLY", "0").strip().lower() in ("1","true","yes","on")
+        if strict_only and "STRICT_ONLY=1" in str(e):
+            print(f"⛔ STRICT_ONLY skip: no route on allowed_dexes={allowed} err={e}", flush=True)
+            return 0
+        print(f"❌ BUY failed err={e}", flush=True)
+        return 1
+    finally:
+        try:
+            await rpc.aclose()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main_async()))

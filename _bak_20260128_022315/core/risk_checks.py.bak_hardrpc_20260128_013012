@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Tuple, Optional
+
+from config import settings
+
+from core.anti_rug import AntiRug
+from core.dev_profiler import DevProfiler
+
+# RPC async client: ton repo a core/solana_rpc_async.py (utilisé ailleurs)
+# On essaye d'importer un client compatible "get_account_info/get_token_supply/get_token_largest_accounts".
+try:
+    from core.solana_rpc_async import SolanaRPCAsync  # type: ignore
+except Exception:
+    SolanaRPCAsync = None  # type: ignore
+
+
+BLACKLIST_DEV_PATH = Path(os.getenv("BLACKLIST_DEV_PATH", "state/blacklist_dev.json"))
+BLACKLIST_MINT_PATH = Path(os.getenv("BLACKLIST_MINT_PATH", "state/blacklist_mint.json"))
+
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8") or "null") or default
+    except Exception:
+        pass
+    return default
+
+
+class RiskChecker:
+    """
+    Gate BUY (fail-closed en REAL):
+      - Filtres liq/mc
+      - Blacklists dev/mint (fichiers)
+      - DevProfiler (si creator présent)
+      - AntiRug on-chain (mint/freeze renounced + Token-2022 block + top holders)
+    """
+
+    def __init__(self, logger: Any = None, rpc_url: Optional[str] = None, mode: Optional[str] = None):
+        self.logger = logger
+        self.mode = (mode or getattr(settings, "MODE", "PAPER") or "PAPER").upper()
+        self.rpc_url = (rpc_url or getattr(settings, "RPC_URL", "") or "").strip()
+
+        self.dev_profiler = DevProfiler(path=os.getenv("DEV_DB_PATH", "dev_db.json"))
+
+        # cache anti-rug: mint -> (ts, ok, reason)
+        self._cache: Dict[str, Tuple[float, bool, str]] = {}
+
+        self.rpc = None
+        if SolanaRPCAsync and self.rpc_url:
+            try:
+                self.rpc = SolanaRPCAsync(self.rpc_url, logger=self.logger)  # type: ignore
+            except Exception:
+                self.rpc = None
+
+        self.anti = None
+        if self.rpc is not None:
+            self.anti = AntiRug(self.rpc, self.logger, block_token_2022=bool(getattr(settings, "RISK_BLOCK_TOKEN_2022", True)))
+
+    def _log(self, msg: str, *args):
+        if self.logger is not None and hasattr(self.logger, "info"):
+            try:
+                self.logger.info(msg, *args)
+                return
+            except Exception:
+                pass
+        # fallback
+        try:
+            print(msg % args if args else msg)
+        except Exception:
+            pass
+
+    def _creator_from_ov(self, ov: Dict[str, Any]) -> str:
+        data = ov.get("data") or {}
+        for k in ("creator", "dev", "deployer", "owner"):
+            v = ov.get(k) or data.get(k)
+            if v:
+                return str(v).strip()
+        return ""
+
+    def _mint_from_ov(self, ov: Dict[str, Any]) -> str:
+        return str(ov.get("mint") or ov.get("token") or ov.get("address") or "").strip()
+
+    def _is_mint_blacklisted(self, mint: str) -> Tuple[bool, str]:
+        bl = _load_json(BLACKLIST_MINT_PATH, {})
+        if isinstance(bl, dict) and mint in bl:
+            reason = bl.get(mint)
+            if isinstance(reason, dict):
+                return True, str(reason.get("reason") or "MINT_BLACKLISTED")
+            return True, str(reason or "MINT_BLACKLISTED")
+        return False, ""
+
+    def _is_dev_blacklisted(self, dev: str) -> Tuple[bool, str]:
+        bl = _load_json(BLACKLIST_DEV_PATH, {})
+        if isinstance(bl, dict) and dev in bl:
+            return True, str(bl.get(dev) or "DEV_BLACKLISTED")
+        return False, ""
+
+    async def allow_buy(self, ov: Dict[str, Any]) -> Tuple[bool, str]:
+        data = ov.get("data") or {}
+
+        # -------- 0) basic liq/mc --------
+        liq = ov.get("liquidity_usd")
+        mc = ov.get("marketcap_usd")
+        if liq is None:
+            liq = data.get("liquidity")
+        if mc is None:
+            mc = data.get("marketCap")
+
+        try:
+            liq_f = float(liq or 0.0)
+        except Exception:
+            liq_f = 0.0
+        try:
+            mc_f = float(mc or 0.0)
+        except Exception:
+            mc_f = 0.0
+
+        if liq_f < float(getattr(settings, "MIN_LIQUIDITY_USD", 0.0)):
+            return False, f"liquidity trop faible ({liq_f:.0f} < {float(settings.MIN_LIQUIDITY_USD):.0f})"
+
+        if mc_f > 0 and mc_f > float(getattr(settings, "MAX_MARKET_CAP_USD", 0.0)):
+            return False, f"marketcap trop élevé ({mc_f:.0f} > {float(settings.MAX_MARKET_CAP_USD):.0f})"
+
+        mint = self._mint_from_ov(ov)
+        if not mint:
+            return False, "missing mint"
+
+        creator = self._creator_from_ov(ov)
+
+        # -------- 1) blacklists --------
+        is_bl_m, why_m = self._is_mint_blacklisted(mint)
+        if is_bl_m:
+            return False, f"mint blacklisted: {why_m}"
+
+        if creator:
+            is_bl_d, why_d = self._is_dev_blacklisted(creator)
+            if is_bl_d:
+                return False, f"dev blacklisted: {why_d}"
+
+        # -------- 2) dev profiler gate --------
+        if creator and not self.dev_profiler.allow(creator):
+            return False, "dev_profiler deny"
+
+        # -------- 3) anti-rug on-chain --------
+        # If no rpc client, we fail-closed in REAL, but allow in PAPER.
+        if self.anti is None:
+            if self.mode == "REAL":
+                return False, "anti_rug unavailable (no rpc client)"
+            return True, "ok(paper_no_anti_rug)"
+
+        ttl = int(getattr(settings, "RISK_CACHE_TTL_SEC", 900))
+        now = time.time()
+        cached = self._cache.get(mint)
+        if cached and (now - cached[0] < ttl):
+            return (cached[1], cached[2])
+
+        try:
+            res = await self.anti.check(
+                mint,
+                max_top1=float(getattr(settings, "RISK_MAX_TOP1_PCT", 0.25)),
+                max_top10=float(getattr(settings, "RISK_MAX_TOP10_PCT", 0.60)),
+                require_renounced=bool(getattr(settings, "RISK_REQUIRE_RENOUNCED", True)),
+            )
+            ok, reason = bool(res.ok), str(res.reason or "")
+            self._cache[mint] = (now, ok, reason)
+            return ok, reason
+        except Exception as e:
+            # Fail closed en REAL
+            if self.mode == "REAL":
+                self._cache[mint] = (now, False, f"anti_rug_exc: {e}")
+                return False, f"anti_rug_exc: {e}"
+            return True, f"ok(paper_anti_rug_exc:{e})"
