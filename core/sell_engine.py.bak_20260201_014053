@@ -12,12 +12,6 @@ class SellEngine:
     """
 
     def __init__(self, db, price_feed, trader=None):
-        self._mint_cooldowns = {}  # mint -> unix_ts until when sells are paused
-        try:
-            import os
-            self.SELL_COOLDOWN_JUP_CUSTOM_SEC = int(os.getenv('SELL_COOLDOWN_JUP_CUSTOM_SEC','21600'))
-        except Exception:
-            self.SELL_COOLDOWN_JUP_CUSTOM_SEC = 21600
         self.db = db
         self.price_feed = price_feed
         self.trader = trader  # ignored (compat)
@@ -160,22 +154,6 @@ class SellEngine:
                 print(f"⚠️ JUP_INSUFFICIENT_FUNDS -> cooldown {block_sec}s (need SOL for fees/rent)", flush=True)
                 return ""
 
-            # COOLDOWN_ON_EXIT42
-
-            if proc.returncode == 42:
-
-                cd = int(getattr(self, 'SELL_COOLDOWN_JUP_CUSTOM_SEC', 21600))
-
-                if not hasattr(self, '_mint_cooldowns'):
-
-                    self._mint_cooldowns = {}
-
-                self._mint_cooldowns[mint] = int(now + cd)
-
-                print(f"⏸️ JUP_CUSTOM -> cooldown mint={mint} sec={cd}")
-
-                return ""
-
             raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
 
         return txsig or "NO_TXSIG"
@@ -224,13 +202,6 @@ class SellEngine:
                 print(traceback.format_exc(), flush=True)
 
     def _handle_one(self, pos, now: float):
-        # MINT_COOLDOWN_SKIP
-        mint = pos.get('mint') if isinstance(pos, dict) else getattr(pos, 'mint', None)
-        if mint and hasattr(self, '_mint_cooldowns'):
-            until = self._mint_cooldowns.get(mint, 0)
-            if until and now < until:
-                print(f"⏸️ SELL_COOLDOWN skip mint={mint} for {int(until-now)}s")
-                return
         mint = str(pos.get("mint") or "")
         entry = self._entry(pos)
         qty_total = self._ui_qty(pos)

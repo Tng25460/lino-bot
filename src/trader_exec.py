@@ -411,7 +411,7 @@ OUT_ERR = Path(os.getenv("OUT_ERR", "last_swap_error.json"))
 OUT_DBG = Path(os.getenv("OUT_DBG", "last_swap_debug.log"))
 OUT_SENT = Path(os.getenv("OUT_SENT", "last_swap_sent.json"))
 
-JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://api.jup.ag")).rstrip("/")
+JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag")).rstrip("/")
 RPC_HTTP = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com"))
 
 SOL_MINT = os.getenv("SOL_MINT", "So11111111111111111111111111111111111111112")

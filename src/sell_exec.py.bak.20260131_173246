@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
 import os
-
-# JUP_CUSTOM_ERROR_CODES: classify some Jupiter on-chain custom errors (avoid infinite retries)
-JUP_CUSTOM_ERROR_CODES = {6024, 6025}
-
-def _extract_custom_code(err_obj):
-    """
-    Try to extract Custom code from Solana RPC error dict:
-    err: {'InstructionError': [idx, {'Custom': 6024}]}
-    """
-    try:
-        if isinstance(err_obj, dict) and "InstructionError" in err_obj:
-            ie = err_obj["InstructionError"]
-            if isinstance(ie, list) and len(ie) == 2 and isinstance(ie[1], dict) and "Custom" in ie[1]:
-                return int(ie[1]["Custom"])
-    except Exception:
-        pass
-    return None
 import sys
 import json
 import time

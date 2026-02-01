@@ -12,12 +12,6 @@ class SellEngine:
     """
 
     def __init__(self, db, price_feed, trader=None):
-        self._mint_cooldowns = {}  # mint -> unix_ts until when sells are paused
-        try:
-            import os
-            self.SELL_COOLDOWN_JUP_CUSTOM_SEC = int(os.getenv('SELL_COOLDOWN_JUP_CUSTOM_SEC','21600'))
-        except Exception:
-            self.SELL_COOLDOWN_JUP_CUSTOM_SEC = 21600
         self.db = db
         self.price_feed = price_feed
         self.trader = trader  # ignored (compat)
@@ -36,7 +30,6 @@ class SellEngine:
         self.TIME_STOP_MIN_PNL = float(os.getenv("SELL_TIME_STOP_MIN_PNL", "0.05"))
 
         self._cfg_logged = False
-        self._blocked_until = {}  # mint -> ts until which we skip (e.g. no SOL)
 
     def _ui_qty(self, pos) -> float:
         try:
@@ -49,74 +42,8 @@ class SellEngine:
             return float(pos.get("entry_price") or pos.get("entry_price_usd") or 0.0)
         except Exception:
             return 0.0
-    def _onchain_ui_balance_simple(self, mint: str) -> float:
-        import os, json, requests
-        pub = os.getenv("WALLET_PUBKEY", "").strip()
-        if not pub:
-            # fallback: try to read pubkey from keypair
-            try:
-                from solders.keypair import Keypair
-                import json as _json
-                kp_path = os.getenv("KEYPAIR_PATH", os.getenv("KEYPATH", "/home/tng25/lino/keypair.json"))
-                kp = Keypair.from_bytes(bytes(_json.load(open(kp_path))))
-                pub = str(kp.pubkey())
-            except Exception:
-                return 0.0
-        rpc = os.getenv("SOLANA_RPC_URL", os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com"))
-        payload = {
-            "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-            "params":[pub, {"mint": mint}, {"encoding":"jsonParsed"}]
-        }
-        r = requests.post(rpc, json=payload, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        vals = (j.get("result",{}) or {}).get("value",[]) or []
-        tot = 0.0
-        for it in vals:
-            try:
-                ta = it["account"]["data"]["parsed"]["info"]["tokenAmount"]
-                tot += float(ta.get("uiAmount") or 0.0)
-            except Exception:
-                pass
-        return float(tot)
-
-    def _clamp_sell_ui(self, mint: str, ui_db: float) -> float:
-        """
-        Clamp sell ui to on-chain (prevents oversell -> Jupiter simulation 0x1788).
-        """
-        try:
-            ui_on = float(self._onchain_ui_balance_simple(mint) or 0.0)
-        except Exception:
-            ui_on = 0.0
-
-        if ui_on > 0:
-            ui = min(float(ui_db or 0.0), ui_on)
-            # safety epsilon (avoid exact dust/rounding)
-            ui = ui * 0.995
-            if ui < 0: ui = 0.0
-            if ui != float(ui_db or 0.0):
-                print(f"🧩 CLAMP_SELL_UI mint={mint} db={ui_db} onchain={ui_on} -> {ui}", flush=True)
-            return ui
-
-        return float(ui_db or 0.0)
-
 
     def _sell_exec(self, mint: str, ui_amount: float, reason: str) -> str:
-
-
-        # clamp qty to on-chain to prevent oversell -> Jupiter sim 0x1788
-
-
-        try:
-
-
-            qty = self._clamp_sell_ui(mint, float(ui_amount))
-
-
-        except Exception:
-
-
-            qty = float(ui_amount)
         ui_amount = float(ui_amount or 0.0)
         if ui_amount <= 0:
             print(f"🧹 SELL_SKIP mint={mint} reason={reason} ui_amount={ui_amount}", flush=True)
@@ -155,25 +82,7 @@ class SellEngine:
             # Jupiter error 0x1788 == 6024 == InsufficientFunds => skip (no crash loop)
             # (lack SOL for fees/rent etc)
             if "0x1788" in blob or "6024" in blob or "insufficientfunds" in blob or "insufficient funds" in blob:
-                block_sec = int(os.getenv("SELL_BLOCK_NO_SOL_SEC", "600"))
-                self._blocked_until[mint] = _time.time() + block_sec
-                print(f"⚠️ JUP_INSUFFICIENT_FUNDS -> cooldown {block_sec}s (need SOL for fees/rent)", flush=True)
-                return ""
-
-            # COOLDOWN_ON_EXIT42
-
-            if proc.returncode == 42:
-
-                cd = int(getattr(self, 'SELL_COOLDOWN_JUP_CUSTOM_SEC', 21600))
-
-                if not hasattr(self, '_mint_cooldowns'):
-
-                    self._mint_cooldowns = {}
-
-                self._mint_cooldowns[mint] = int(now + cd)
-
-                print(f"⏸️ JUP_CUSTOM -> cooldown mint={mint} sec={cd}")
-
+                print("⚠️ JUP_INSUFFICIENT_FUNDS -> skip sell (need more SOL for fees/rent)", flush=True)
                 return ""
 
             raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
@@ -212,11 +121,6 @@ class SellEngine:
                 continue
             if only_mint and mint != only_mint:
                 continue
-            # cooldown if last attempt failed due to missing SOL fees/rent
-            bu = float(self._blocked_until.get(mint, 0) or 0)
-            if bu and _time.time() < bu:
-                print(f"⏳ SKIP mint={mint} reason=insufficient_funds cooldown_left={int(bu-_time.time())}s", flush=True)
-                continue
             try:
                 self._handle_one(pos, now)
             except Exception as e:
@@ -224,13 +128,6 @@ class SellEngine:
                 print(traceback.format_exc(), flush=True)
 
     def _handle_one(self, pos, now: float):
-        # MINT_COOLDOWN_SKIP
-        mint = pos.get('mint') if isinstance(pos, dict) else getattr(pos, 'mint', None)
-        if mint and hasattr(self, '_mint_cooldowns'):
-            until = self._mint_cooldowns.get(mint, 0)
-            if until and now < until:
-                print(f"⏸️ SELL_COOLDOWN skip mint={mint} for {int(until-now)}s")
-                return
         mint = str(pos.get("mint") or "")
         entry = self._entry(pos)
         qty_total = self._ui_qty(pos)
@@ -293,10 +190,6 @@ class SellEngine:
                 print("🧪 SELL_DRY_RUN=1 -> skip TIME_STOP sell", flush=True)
                 return
             sell_qty = qty_total
-            # TIME_STOP_GUARD: only sell if pnl >= min pnl
-            if pnl < self.TIME_STOP_MIN_PNL:
-                print(f"⏱️ TIME_STOP skip: pnl {pnl:.2%} < min {self.TIME_STOP_MIN_PNL:.2%}")
-                return
             txsig = self._sell_exec(mint, sell_qty, "time_stop")
             if not txsig:
                 return

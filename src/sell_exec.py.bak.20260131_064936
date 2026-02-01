@@ -1,48 +1,10 @@
 #!/usr/bin/env python3
 import os
-
-# JUP_CUSTOM_ERROR_CODES: classify some Jupiter on-chain custom errors (avoid infinite retries)
-JUP_CUSTOM_ERROR_CODES = {6024, 6025}
-
-def _extract_custom_code(err_obj):
-    """
-    Try to extract Custom code from Solana RPC error dict:
-    err: {'InstructionError': [idx, {'Custom': 6024}]}
-    """
-    try:
-        if isinstance(err_obj, dict) and "InstructionError" in err_obj:
-            ie = err_obj["InstructionError"]
-            if isinstance(ie, list) and len(ie) == 2 and isinstance(ie[1], dict) and "Custom" in ie[1]:
-                return int(ie[1]["Custom"])
-    except Exception:
-        pass
-    return None
 import sys
 import json
 import time
 import base64
 import argparse
-
-def _rpc_get_balance_lamports(rpc_url: str, pubkey: str) -> int:
-    import requests
-    payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[pubkey, {"commitment":"processed"}]}
-    r = requests.post(rpc_url, json=payload, timeout=15)
-    r.raise_for_status()
-    j = r.json()
-    return int((j.get("result") or {}).get("value") or 0)
-
-def _precheck_min_sol_fees(rpc_url: str, pubkey: str) -> bool:
-    # default: 0.02 SOL
-    import os
-    min_sol = float(os.getenv("SELL_MIN_SOL_FEES", "0.02"))
-    lamports = _rpc_get_balance_lamports(rpc_url, pubkey)
-    sol = lamports / 1_000_000_000
-    if sol < min_sol:
-        print(f"⚠️ LOW_SOL_FEES sol={sol:.6f} < min={min_sol} -> SKIP sell", flush=True)
-        return False
-    return True
-
-
 
 
 def _with_401_fallback(do_request, base_url: str):

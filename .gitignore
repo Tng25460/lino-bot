@@ -5,3 +5,5 @@ state/
 keypair.json
 __pycache__/
 .venv/
+.env.real
+.env.*
