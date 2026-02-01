@@ -192,6 +192,20 @@ def main():
         st = confirm_sig(rpc, txsig, timeout_s=int(os.getenv("SELL_CONFIRM_TIMEOUT_S", "35")))
         print("confirm=" + str(st), flush=True)
     except Exception as e:
+    # EXIT42_ON_CUSTOM
+    try:
+        err_obj = None
+        if isinstance(e, dict) and 'data' in e and isinstance(e['data'], dict) and 'err' in e['data']:
+            err_obj = e['data']['err']
+        code = _extract_custom_code(err_obj)
+        if code in JUP_CUSTOM_ERROR_CODES:
+            print(f"⚠️ JUP_CUSTOM_CODE {code} -> exit 42 (cooldown)")
+            import sys
+            sys.exit(42)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
         print("WARN confirm:", e, flush=True)
 
 if __name__ == "__main__":
