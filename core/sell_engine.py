@@ -2,6 +2,8 @@ import os
 import time as _time
 import subprocess
 import traceback
+import time
+import re
 
 class SellEngine:
     """
@@ -125,7 +127,14 @@ class SellEngine:
         cmd = ["python", "-u", "src/sell_exec.py", "--mint", mint, "--ui", str(ui_amount), "--reason", reason]
         print("🧾 SELL cmd=" + " ".join(cmd), flush=True)
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run( cmd, capture_output=True, text=True, timeout=SELL_SUBPROCESS_TIMEOUT_S)
+
+        out_all = ((getattr(proc, "stdout", "") or "") + "\n" + (getattr(proc, "stderr", "") or "")).strip()
+
+        if _is_insufficient_funds_blob(out_all):
+
+            _sell_cooldown_set("insufficient_funds")
+            return ""
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
 
@@ -133,6 +142,14 @@ class SellEngine:
             print("📤 sell_exec stdout:\n" + out, flush=True)
         if err:
             print("📥 sell_exec stderr:\n" + err, flush=True)
+
+
+        if _sell_cooldown_active():
+            try:
+                print("[SELL] cooldown triggered mid-tick -> stop run_once", flush=True)
+            except Exception:
+                pass
+            return
 
         # extract txsig
         txsig = ""
@@ -277,6 +294,13 @@ class SellEngine:
                 return
             sell_qty = qty_total
             txsig = self._sell_exec(mint, sell_qty, "hard_sl")
+            if _sell_cooldown_active():
+                try:
+                    print("[SELL] cooldown active after sell attempt -> stop run_once", flush=True)
+                except Exception:
+                    pass
+                return
+
             if not txsig:
                 return
             print(f"✅ SOLD HARD_SL txsig={txsig}", flush=True)
@@ -365,3 +389,45 @@ class SellEngine:
             except Exception:
                 pass
             return
+
+
+# ---- Robust SELL exec controls (added by patch_sell_engine_safe.py)
+SELL_SUBPROCESS_TIMEOUT_S = float(os.getenv("SELL_SUBPROCESS_TIMEOUT_S", "25"))
+SELL_GLOBAL_COOLDOWN_S = float(os.getenv("SELL_GLOBAL_COOLDOWN_S", "180"))
+
+# Global cooldown timestamp (unix seconds) to avoid hammering sells when SOL is low
+_sell_cooldown_until = 0.0
+
+def _now():
+    return time.time()
+
+def _sell_cooldown_active() -> bool:
+    global _sell_cooldown_until
+    return _now() < _sell_cooldown_until
+
+def _sell_cooldown_set(reason: str):
+    global _sell_cooldown_until
+    _sell_cooldown_until = _now() + SELL_GLOBAL_COOLDOWN_S
+    try:
+        print(f"[SELL] global cooldown {SELL_GLOBAL_COOLDOWN_S:.0f}s reason={reason}")
+    except Exception:
+        pass
+
+def _is_insufficient_funds_blob(blob: str) -> bool:
+    if not blob:
+            return ""
+    b = blob.lower()
+    # common markers: your own tag + typical simulation / custom program errors
+    # 0x1788 observed in your logs -> treat as "insufficient SOL for fees/rent/ATA"
+    hits = [
+        "jup_insufficient_funds",
+        "insufficient funds",
+        "insufficient lamports",
+        "insufficient balance",
+        "custom program error: 0x1788",
+        "0x1788",
+        "insufficient funds for rent",
+        "accountnotfound",
+        "could not find account",
+    ]
+    return any(h in b for h in hits)
