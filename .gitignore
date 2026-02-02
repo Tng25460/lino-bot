@@ -8,3 +8,11 @@ __pycache__/
 .env.real
 .env.*
 *.bak*
+
+# secrets / local
+.env
+.env.*
+state/*.log
+state/*.pid
+state/*.sqlite
+state/*.sqlite*
