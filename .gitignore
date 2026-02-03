@@ -16,3 +16,36 @@ state/*.log
 state/*.pid
 state/*.sqlite
 state/*.sqlite*
+config/local_secrets.py
+
+# ---- local secrets ----
+config/local_secrets.py
+
+# ---- runtime outputs / artifacts ----
+last_swap_*.json
+last_swap_*.b64
+last_swap_*.txt
+last_swap_error.json
+last_swap_meta.json
+last_swap_sent.json
+last_swap_tx.b64
+
+# ---- generated ready files (keep in state/ instead) ----
+ready_to_trade_*.jsonl
+ready_*.jsonl
+
+# ---- logs / dumps ----
+*.log
+*.pid
+
+# ---- local db/state (if you have these folders) ----
+state/
+*.sqlite
+*.db
+
+# ---- python cache ----
+__pycache__/
+*.pyc
+
+# ---- venv ----
+.venv/

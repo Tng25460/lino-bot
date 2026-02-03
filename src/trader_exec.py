@@ -194,21 +194,28 @@ def _postbuy_resync_db(mint: str, symbol: str, price_usd: float, route: str, txs
 
 def _append_skip_mint(mint: str):
     from pathlib import Path
-    fp = Path(os.getenv('SKIP_MINTS_FILE','state/skip_mints_runtime.txt'))
+    m = (mint or '').strip()
+    if not m:
+        return
+    fp = Path(SKIP_MINTS_FILE)
     try:
         fp.parent.mkdir(parents=True, exist_ok=True)
         with fp.open('a', encoding='utf-8') as f:
-            f.write(mint.strip() + '\n')
+            f.write(m + '\n')
     except Exception as e:
         print(f"⚠️ autoskip write failed: {e}")
-
 def _autoskip_mint(mint: str):
     from pathlib import Path
-    fp = Path(os.getenv('SKIP_MINTS_FILE','state/skip_mints_runtime.txt'))
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    with fp.open('a', encoding='utf-8') as f:
-        f.write(mint.strip() + '\n')
-
+    m = (mint or '').strip()
+    if not m:
+        return
+    fp = Path(SKIP_MINTS_FILE)
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with fp.open('a', encoding='utf-8') as f:
+            f.write(m + '\n')
+    except Exception as e:
+        print(f"⚠️ autoskip write failed: {e}")
 USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
 SKIP_MINTS_FILE = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
 SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
@@ -256,6 +263,55 @@ def _load_skip_mints() -> set[str]:
         return s
     except Exception:
         return set()
+
+# ANTI_REBUY_LAST_BUY_V1
+LAST_BUY_FILE = os.getenv('LAST_BUY_FILE', 'state/last_buy.json')
+LAST_BUY_COOLDOWN_S = int(os.getenv('LAST_BUY_COOLDOWN_S', '900'))  # 15min default
+
+def _last_buy_get():
+    try:
+        from pathlib import Path
+        import json, time
+        fp = Path(LAST_BUY_FILE)
+        if not fp.exists():
+            return None
+        j = json.loads(fp.read_text(encoding='utf-8'))
+        mint = str(j.get('mint') or '').strip()
+        ts = int(j.get('ts') or 0)
+        if not mint or ts <= 0:
+            return None
+        return {'mint': mint, 'ts': ts}
+    except Exception:
+        return None
+
+def _last_buy_set(mint: str):
+    try:
+        from pathlib import Path
+        import json, time
+        m = (mint or '').strip()
+        if not m:
+            return
+        fp = Path(LAST_BUY_FILE)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps({'mint': m, 'ts': int(time.time())}, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+
+def _is_last_buy_blocked(mint: str) -> bool:
+    try:
+        import time
+        m = (mint or '').strip()
+        if not m:
+            return False
+        j = _last_buy_get()
+        if not j:
+            return False
+        if j['mint'] != m:
+            return False
+        age = int(time.time()) - int(j['ts'])
+        return age < LAST_BUY_COOLDOWN_S
+    except Exception:
+        return False
 
 def _get_token_ui_balance(owner_pubkey: str, mint: str) -> float:
     # jsonParsed token accounts by owner+mint
@@ -593,6 +649,19 @@ def main() -> int:
         cand = ready[0]
 
     output_mint = (cand.get("outputMint") or cand.get("mint") or cand.get("address") or "").strip()
+# ANTI_REBUY_PICK_LOOP_V1
+    # Re-pick if mint is skipped or last-buy cooldown blocks it
+    skip_set = _load_skip_mints()
+    if output_mint and (output_mint in skip_set or _is_last_buy_blocked(output_mint)):
+        why = 'skip_file' if output_mint in skip_set else 'last_buy_cooldown'
+        print(f"⚠️ re-pick: blocked by {why} mint={output_mint}")
+        # remove blocked mints and pick again
+        ready2 = [r for r in ready if (r.get('outputMint') or r.get('mint') or r.get('address') or '').strip() not in skip_set]
+        cand2 = _pick_best_scored_ready(ready2) if USE_SCORED_IF_PRESENT else (ready2[0] if ready2 else None)
+        if cand2:
+            cand = cand2
+            output_mint = (cand.get('outputMint') or cand.get('mint') or cand.get('address') or '').strip()
+            print(f"   repick -> {output_mint}")
     FORCE_OUTPUT_MINT = os.getenv("FORCE_OUTPUT_MINT")
     if FORCE_OUTPUT_MINT:
         output_mint = FORCE_OUTPUT_MINT.strip()
@@ -614,8 +683,12 @@ def main() -> int:
 
         if ui > BAG_MIN_UI:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
+            try:
+                _append_skip_mint(str(output_mint))
+                print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
+            except Exception as _e:
+                print("autoskip already-holding failed:", _e)
             return 0
-
 
     if not output_mint:
 
@@ -681,6 +754,44 @@ def main() -> int:
         if qr.status_code != 200:
             _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
             print("❌ quote failed http=", qr.status_code)
+            # AUTO_SKIP_QUOTE_HTTP_FAIL_V2
+            try:
+                _body = (qr.text or '')
+                _head = _body[:500]
+                # logs utiles
+                print('   quote_body_head=', _head)
+                _u = str(output_mint)
+                _b = _body.lower()
+                # TOKEN_NOT_TRADABLE / no route => autoskip
+                if ('token_not_tradable' in _b) or ('not tradable' in _b) or ('could not find any route' in _b) or ('no route' in _b):
+                    try:
+                        _append_skip_mint(_u)
+                        print(f'⛔ AUTO_SKIP_QUOTE_FAIL mint={_u} -> {SKIP_MINTS_FILE}')
+                    except Exception as _e:
+                        print('autoskip quote-fail failed:', _e)
+            except Exception as _e:
+                print('quote-fail inspect error:', _e)
+
+            # AUTO_SKIP_QUOTE_HTTP_400_V1
+            try:
+                _body = (qr.text or '')
+                print('   quote_body_head=', _body[:600])
+                _low = _body.lower()
+                if ('token_not_tradable' in _low) or ('not tradable' in _low):
+                    try:
+                        _append_skip_mint(str(output_mint))
+                        print(f"⛔ AUTO_SKIP TOKEN_NOT_TRADABLE mint={output_mint} -> {SKIP_MINTS_FILE}")
+                    except Exception as _e:
+                        print('autoskip TOKEN_NOT_TRADABLE failed:', _e)
+                if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
+                    try:
+                        _append_skip_mint(str(output_mint))
+                        print(f"⛔ AUTO_SKIP NO_ROUTE mint={output_mint} -> {SKIP_MINTS_FILE}")
+                    except Exception as _e:
+                        print('autoskip NO_ROUTE failed:', _e)
+            except Exception as _e:
+                print('quote error parse failed:', _e)
+
             # --- AUTO_SKIP_NO_ROUTE: avoid looping on mints with no Jupiter route ---
             try:
                 _sk = os.getenv('SKIP_MINTS_FILE','state/skip_mints.txt')
@@ -738,6 +849,11 @@ def main() -> int:
             txsig = _send_signed_b64(txb64, RPC_HTTP)
             OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
             print("✅ sent txsig=", txsig)
+            # ANTI_REBUY_AFTER_SEND_V1
+            try:
+                _last_buy_set(output_mint)
+            except Exception:
+                pass
             # --- DB HOOK: record BUY into SQLite (best-effort) ---
             try:
                 import time, sqlite3

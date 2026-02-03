@@ -1,7 +1,7 @@
 import requests
 from typing import Optional
-
-DEX_TIMEOUT = float(__import__("os").getenv("DEX_TIMEOUT_S", "10"))
+import os
+DEX_TIMEOUT = float(os.getenv("DEX_TIMEOUT", "4"))
 
 class DexScreenerPriceFeed:
     """

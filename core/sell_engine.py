@@ -5,6 +5,25 @@ import traceback
 import time
 import re
 
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 class SellEngine:
     """
     Sell engine autonome (compatible DB actuelle):
@@ -30,7 +49,7 @@ class SellEngine:
         self.TP2_PCT = float(os.getenv("SELL_TP2_PCT", "0.80"))
         self.TP2_SIZE = float(os.getenv("SELL_TP2_SIZE", "0.35"))
 
-        self.HARD_SL_PCT = -abs(float(os.getenv("SELL_HARD_SL_PCT", "0.25")))
+        self.HARD_SL_PCT = -abs(_env_float('HARD_SL_PCT', _env_float('SELL_HARD_SL_PCT', 0.25)))
         self.TRAIL_TIGHT = float(os.getenv("SELL_TRAIL_TIGHT", "0.10"))
         self.TRAIL_WIDE  = float(os.getenv("SELL_TRAIL_WIDE",  "0.20"))
 
@@ -193,7 +212,14 @@ class SellEngine:
 
                 return ""
 
-            raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
+                    # --- DUST guard: Jupiter can return 400 Bad Request for tiny amount=1
+        def _to_str(x):
+            return x.decode(errors='ignore') if isinstance(x, (bytes, bytearray)) else (x or '')
+        out_all = (_to_str(getattr(proc, 'stdout', '')) + "\\n" + _to_str(getattr(proc, 'stderr', ''))).strip()
+        if ('400 Client Error' in out_all and 'Bad Request' in out_all and 'amount=1' in out_all):
+            print(f"🧹 DUST_UNTRADEABLE mint={mint} (amount=1) -> close locally")
+            return '__DUST__'
+        raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
 
         return txsig or "NO_TXSIG"
 
@@ -294,6 +320,13 @@ class SellEngine:
                 return
             sell_qty = qty_total
             txsig = self._sell_exec(mint, sell_qty, "hard_sl")
+            if txsig == '__DUST__':
+                # mark closed in DB and continue
+                try:
+                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
+                except Exception as e:
+                    print(f"❌ close dust failed mint={mint} err={e}")
+                return
             if _sell_cooldown_active():
                 try:
                     print("[SELL] cooldown active after sell attempt -> stop run_once", flush=True)
@@ -322,6 +355,13 @@ class SellEngine:
                 print(f"⏱️ TIME_STOP skip: pnl {pnl:.2%} < min {self.TIME_STOP_MIN_PNL:.2%}")
                 return
             txsig = self._sell_exec(mint, sell_qty, "time_stop")
+            if txsig == '__DUST__':
+                # mark closed in DB and continue
+                try:
+                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
+                except Exception as e:
+                    print(f"❌ close dust failed mint={mint} err={e}")
+                return
             if not txsig:
                 return
             print(f"✅ SOLD TIME_STOP txsig={txsig}", flush=True)
@@ -342,6 +382,13 @@ class SellEngine:
                 print("🧪 SELL_DRY_RUN=1 -> skip TP1 sell", flush=True)
                 return
             txsig = self._sell_exec(mint, sell_qty, "tp1")
+            if txsig == '__DUST__':
+                # mark closed in DB and continue
+                try:
+                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
+                except Exception as e:
+                    print(f"❌ close dust failed mint={mint} err={e}")
+                return
             if not txsig:
                 return
             print(f"✅ SOLD TP1 txsig={txsig}", flush=True)
@@ -362,6 +409,13 @@ class SellEngine:
                 print("🧪 SELL_DRY_RUN=1 -> skip TP2 sell", flush=True)
                 return
             txsig = self._sell_exec(mint, sell_qty, "tp2")
+            if txsig == '__DUST__':
+                # mark closed in DB and continue
+                try:
+                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
+                except Exception as e:
+                    print(f"❌ close dust failed mint={mint} err={e}")
+                return
             if not txsig:
                 return
             print(f"✅ SOLD TP2 txsig={txsig}", flush=True)
@@ -381,6 +435,13 @@ class SellEngine:
                 return
             sell_qty = qty_total
             txsig = self._sell_exec(mint, sell_qty, "trailing_stop")
+            if txsig == '__DUST__':
+                # mark closed in DB and continue
+                try:
+                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
+                except Exception as e:
+                    print(f"❌ close dust failed mint={mint} err={e}")
+                return
             if not txsig:
                 return
             print(f"✅ SOLD TRAIL txsig={txsig}", flush=True)

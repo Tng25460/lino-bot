@@ -3,8 +3,22 @@ import os
 from typing import List, Dict, Any
 
 from flask import Flask, render_template_string
-from config.settings import POSITIONS_FILE, TRAILING_SL_PCT
 
+# SAFE_SETTINGS_BLOCK
+# dashboard must NEVER crash if config.settings is missing / broken
+try:
+    from config.settings import POSITIONS_FILE as _POSITIONS_FILE
+except Exception:
+    _POSITIONS_FILE = "state/positions.json"
+
+try:
+    from config.settings import TRAILING_SL_PCT as _TRAILING_SL_PCT
+except Exception:
+    _TRAILING_SL_PCT = 0.10
+
+# allow override via env
+POSITIONS_FILE = os.getenv("DASH_POSITIONS_FILE", _POSITIONS_FILE)
+TRAILING_SL_PCT = float(os.getenv("DASH_TRAILING_SL_PCT", str(_TRAILING_SL_PCT)))
 app = Flask(__name__)
 
 HTML_TEMPLATE = """
@@ -206,4 +220,7 @@ def dashboard():
 
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    host = os.getenv("DASH_HOST", "0.0.0.0")
+    port = int(os.getenv("DASH_PORT", "5050"))
+    print(f"[Dashboard] starting on http://{host}:{port}  positions_file={POSITIONS_FILE}")
+    app.run(host=host, port=port, debug=False)

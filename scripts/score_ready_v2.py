@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 import os, sys, json, math, argparse
 from typing import Any, Dict
+import os
+
+# --- IO from env (so we can write into state/)
+READY_IN = os.getenv('READY_IN', 'state/ready_to_trade_enriched.jsonl')
+READY_OUT = os.getenv('READY_OUT', 'state/ready_to_trade_scored.jsonl')
+
 
 def fnum(x, default=0.0) -> float:
     try:

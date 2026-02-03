@@ -1,4 +1,16 @@
 import os
+DEBUG_QUOTE = int(os.getenv("DEBUG_QUOTE","0"))
+
+def _dbg_http_fail(tag: str, url: str, status: int, body: str):
+    if not DEBUG_QUOTE:
+        return
+    try:
+        print(f"🧨 {tag} HTTP {status} url={url}", flush=True)
+        if body:
+            b = body.strip()
+            print("🧨 body:", (b[:1600] + ("..." if len(b) > 1600 else "")), flush=True)
+    except Exception:
+        pass
 import json
 import base64
 import aiohttp
@@ -80,6 +92,16 @@ async def _get_json(session: aiohttp.ClientSession, url: str, params: Dict[str, 
                 headers=_headers(),
                 timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S),
             ) as r:
+                if DEBUG_QUOTE:
+                    try:
+                        _st = getattr(r, 'status', None)
+                        if _st and int(_st) != 200:
+                            _tx = await r.text()
+                            print(f"🧪 JUP_QUOTE_HTTP status={{_st}} body={{(_tx or '')[:900]}}")
+                        else:
+                            print(f"🧪 JUP_QUOTE_HTTP status={{_st}} (ok)")
+                    except Exception as _e:
+                        print('🧪 JUP_QUOTE_HTTP read failed:', _e)
                 txt = await r.text()
                 if r.status >= 400:
                     raise RuntimeError(f"Jupiter quote HTTP {r.status}: {txt[:400]}")

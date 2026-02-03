@@ -1,3 +1,4 @@
+import os
 import sys
 import asyncio
 import os
@@ -24,6 +25,16 @@ async def _maybe_await(x):
 
 async def main():
     print("🚀 run_live: starting sell_engine + trader_loop", flush=True)
+
+    # Optional: reclaim SOL rent by closing empty token accounts
+    if os.getenv("RECLAIM_RENT_ON_START", "0") == "1":
+        try:
+            import subprocess, time as _time
+            print("🧹 RECLAIM_RENT_ON_START=1 -> closing empty token accounts (rent reclaim)", flush=True)
+            subprocess.run(["python","-u","scripts/reclaim_rent.py"], check=False)
+            _time.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ reclaim_rent failed: {e}", flush=True)
 
     db_path = os.getenv("DB_PATH", "state/trades.sqlite")
     db = PositionsDBAdapter(db_path)

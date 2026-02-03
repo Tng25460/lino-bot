@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import os
 
+# patched: default error holder
+e = None
+
+
 # JUP_CUSTOM_ERROR_CODES: classify some Jupiter on-chain custom errors (avoid infinite retries)
 JUP_CUSTOM_ERROR_CODES = {6024, 6025}
 
@@ -136,6 +140,8 @@ def jup_swap(base: str, quote: dict, user_pubkey: str):
     return r.json()
 
 def main():
+    # patched: prevent UnboundLocalError for 'e'
+    e = None
     ap = argparse.ArgumentParser()
     ap.add_argument("--mint", required=True)
     ap.add_argument("--ui", required=True, help="UI amount to sell (token units)")
@@ -191,7 +197,17 @@ def main():
     try:
         st = confirm_sig(rpc, txsig, timeout_s=int(os.getenv("SELL_CONFIRM_TIMEOUT_S", "35")))
         print("confirm=" + str(st), flush=True)
+        # patched: hard exit after confirm (uncatchable)
+        os._exit(0)
+        sys.exit(0)
+        # ---- patched: stop after any successful confirm (processed/confirmed/finalized)
+        if str(locals().get('confirm','')) in ('processed','confirmed','finalized'):
+            sys.exit(0)
+        # ---- patched: stop after confirmed tx (avoid unbound local 'e')
+        if str(locals().get('confirm','')) == 'confirmed' or str(locals().get('status','')) == 'confirmed':
+            sys.exit(0)
     except Exception as e:
+        pass
     # EXIT42_ON_CUSTOM
     try:
         err_obj = None
