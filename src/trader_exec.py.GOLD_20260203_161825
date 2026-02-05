@@ -1,174 +1,5 @@
 from __future__ import annotations
 import os
-# === RL_SKIP_HELPERS_V2 ===
-import json as _json
-import time as _time
-from pathlib import Path as _Path
-RL_SKIP_FILE = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
-RL_SKIP_SEC = int(os.getenv('RL_SKIP_SEC', '180'))
-QUOTE_429_SLEEP_S = float(os.getenv('QUOTE_429_SLEEP_S', '1.5'))
-
-def _rl_skip_load():
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        if not fp.exists():
-            return {}
-        d = _json.loads(fp.read_text(encoding='utf-8', errors='ignore') or '{}')
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-def _rl_skip_save(d: dict):
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(_json.dumps(d, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    except Exception as e:
-        print('⚠️ RL_SKIP save failed:', e, flush=True)
-
-def _rl_skip_add(mint: str, *, sec: int | None = None):
-    m = (mint or '').strip()
-    if not m:
-        return
-    d = _rl_skip_load()
-    now = int(_time.time())
-    ttl = int(sec or RL_SKIP_SEC)
-    d[m] = max(int(d.get(m, 0) or 0), now + ttl)
-    _rl_skip_save(d)
-
-def _rl_skip_is(mint: str) -> bool:
-    m = (mint or '').strip()
-    if not m:
-        return False
-    d = _rl_skip_load()
-    now = int(_time.time())
-    until = int(d.get(m, 0) or 0)
-    if until <= now:
-        # lazy cleanup
-        if until != 0 and m in d:
-            try:
-                del d[m]
-                _rl_skip_save(d)
-            except Exception:
-                pass
-        return False
-    return True
-
-
-# === RL_SKIP_HELPERS ===
-import json as _json
-from pathlib import Path as _Path
-RL_SKIP_FILE = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
-RL_SKIP_SEC = int(os.getenv('RL_SKIP_SEC', '180'))
-QUOTE_429_SLEEP_S = float(os.getenv('QUOTE_429_SLEEP_S', '1.5'))
-
-def _rl_skip_load():
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        if not fp.exists():
-            return {}
-        return _json.loads(fp.read_text(encoding='utf-8', errors='ignore') or '{}')
-    except Exception:
-        return {}
-
-def _rl_skip_is(mint: str) -> bool:
-    m = (mint or '').strip()
-    if not m:
-        return False
-    d = _rl_skip_load()
-    until = float(d.get(m, 0) or 0)
-    return until > time.time()
-
-def _rl_skip_add(mint: str, reason: str = '429'):
-    m = (mint or '').strip()
-    if not m:
-        return
-    fp = _Path(RL_SKIP_FILE)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    d = _rl_skip_load()
-    until = time.time() + float(RL_SKIP_SEC)
-    d[m] = until
-    fp.write_text(_json.dumps(d, sort_keys=True), encoding='utf-8')
-    print(f'🧊 RL_SKIP add mint={m} sec={RL_SKIP_SEC} reason={reason}', flush=True)
-
-# === END RL_SKIP_HELPERS ===
-
-# --- RL skip (429): temporarily skip a mint without polluting SKIP_MINTS_FILE ---
-import json as _json
-from pathlib import Path as _Path
-
-RL_SKIP_FILE = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
-RL_SKIP_SEC = int(os.getenv("RL_SKIP_SEC", "180"))  # 3 min default
-
-def _rl_skip_load() -> dict:
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        if not fp.exists():
-            return {}
-        return _json.loads(fp.read_text(encoding="utf-8", errors="ignore") or "{}")
-    except Exception:
-        return {}
-
-def _rl_skip_save(d: dict) -> None:
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(_json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    except Exception as _e:
-        print("⚠️ rl_skip save failed:", _e)
-
-def _rl_skip_add(mint: str, sec: int = None) -> None:
-    m = (mint or "").strip()
-    if not m:
-        return
-    d = _rl_skip_load()
-    sec = int(sec or RL_SKIP_SEC)
-    d[m] = int(time.time()) + sec
-    _rl_skip_save(d)
-
-def _rl_skip_has(mint: str) -> bool:
-    m = (mint or "").strip()
-    if not m:
-        return False
-    now = int(time.time())
-    d = _rl_skip_load()
-    exp = int(d.get(m, 0) or 0)
-    if exp <= now:
-        if m in d:
-            d.pop(m, None)
-            _rl_skip_save(d)
-        return False
-    return True
-# --- END RL skip ---
-
-
-def _jup_quote_with_retry(jup, *, input_mint, output_mint, amount_lamports, slippage_bps, max_price_impact_pct, dexes=None, retries=6):
-    import time as _time
-    delay = 0.6
-    last_err = None
-    for i in range(retries):
-        try:
-            return _jup_quote_with_retry(jup, 
-                input_mint=input_mint,
-                output_mint=output_mint,
-                amount_lamports=amount_lamports,
-                slippage_bps=slippage_bps,
-                max_price_impact_pct=max_price_impact_pct,
-                dexes=dexes,
-            )
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            # many codepaths raise Exception("quote failed http= 429 ...")
-            if (" 429" in msg) or ("Rate limit" in msg) or ("http= 429" in msg) or ("Too Many" in msg) or ("503" in msg) or ("504" in msg):
-                _time.sleep(delay)
-                delay = min(8.0, delay * 1.7)
-                continue
-            raise
-    raise last_err
-
-# skip_mints split (trader vs brain)
-TRADER_SKIP_MINTS_FILE = os.getenv('TRADER_SKIP_MINTS_FILE') or os.getenv('SKIP_MINTS_FILE') or 'state/skip_mints_trader.txt'
 
 # === POSTBUY_RESYNC_DB (autofill trades.qty_token + create/update positions) ===
 def _db_cols(con, table: str):
@@ -386,7 +217,7 @@ def _autoskip_mint(mint: str):
     except Exception as e:
         print(f"⚠️ autoskip write failed: {e}")
 USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
-SKIP_MINTS_FILE = os.getenv("TRADER_SKIP_MINTS_FILE", "state/skip_mints_trader.txt")
+SKIP_MINTS_FILE = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
 SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
 BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
 
@@ -394,15 +225,6 @@ BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
 def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
     if not rows:
         return None
-        # RL_SKIP filter
-        try:
-            _before = len(rows)
-            rows = [r for r in rows if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or ''))]
-            _after = len(rows)
-            if _after != _before:
-                print(f"🧊 RL_SKIP filtered {_before-_after} rows", flush=True)
-        except Exception as _e:
-            print('⚠️ RL_SKIP filter failed:', _e, flush=True)
     rows2 = sorted(rows, key=lambda r: float(r.get("score") or -1e9), reverse=True)
     k = max(1, int(SCORED_TOPK))
     top = rows2[:k]
@@ -913,24 +735,6 @@ def main() -> int:
     amount = int(amount_lamports)
 
 
-    try:
-        _before = None
-        if 'ready' in locals() and isinstance(ready, list):
-            _before = len(ready)
-            ready = [r for r in ready if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or r.get('address') or ''))]
-            if _before != len(ready):
-                print(f"🧊 RL_SKIP filtered ready: {_before}->{len(ready)}", flush=True)
-    except Exception as _e:
-        print('⚠️ RL_SKIP filter failed:', _e, flush=True)
-    try:
-        _before = None
-        if 'ready' in locals() and isinstance(ready, list):
-            _before = len(ready)
-            ready = [r for r in ready if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or r.get('address') or ''))]
-            if _before != len(ready):
-                print(f"🧊 RL_SKIP filtered ready: {_before}->{len(ready)}", flush=True)
-    except Exception as _e:
-        print('⚠️ RL_SKIP filter failed:', _e, flush=True)
     print("   pick=", output_mint, "amount_lamports=", amount)
 
         
@@ -950,35 +754,12 @@ def main() -> int:
         if qr.status_code != 200:
             _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
             print("❌ quote failed http=", qr.status_code)
-            # --- RL_SKIP_ON_429 ---
-            try:
-                _h = int(http)
-            except Exception:
-                _h = -1
-            if _h == 429:
-                try:
-                    _rl_skip_add(str(output_mint), reason='quote_429')
-                except Exception as _e:
-                    print('rl_skip_add failed:', _e, flush=True)
-                import time as _time
-                _time.sleep(QUOTE_429_SLEEP_S)
-                return 0
-            try:
-                _http = int(http)
-            except Exception:
-                _http = -1
-            if _http == 429:
-                _rl_skip_add(str(output_mint))
-                print(f'⏳ quote 429 -> RL_SKIP {output_mint} for {RL_SKIP_SEC}s (no autoskip)', flush=True)
-                time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','1.5')))
-                return 0
             # AUTO_SKIP_QUOTE_HTTP_FAIL_V2
             try:
                 _body = (qr.text or '')
                 _head = _body[:500]
                 # logs utiles
                 print('   quote_body_head=', _head)
-   # 429/rate-limit is not a token issue -> do not autoskip
                 _u = str(output_mint)
                 _b = _body.lower()
                 # TOKEN_NOT_TRADABLE / no route => autoskip
@@ -1013,29 +794,13 @@ def main() -> int:
 
             # --- AUTO_SKIP_NO_ROUTE: avoid looping on mints with no Jupiter route ---
             try:
-                try:
-                    _http = int(http)
-                except Exception:
-                    _http = -1
-            
-                # NEVER autoskip on rate limit
-                if _http == 429:
-                    print('⏳ quote 429 rate-limit -> NOT autoskipping mint', flush=True)
-                else:
-                    _body = (qr.text or '')
-                    _low = _body.lower()
-            
-                    # Only autoskip if we are confident it's really no route (not transient)
-                    if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
-                        _sk = os.getenv('TRADER_SKIP_MINTS_FILE','state/skip_mints_trader.txt')
-                        Path(_sk).parent.mkdir(parents=True, exist_ok=True)
-                        with open(_sk, 'a', encoding='utf-8') as f:
-                            f.write(str(output_mint).strip() + '\n')
-                        print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={output_mint} to SKIP_MINTS_FILE={_sk}", flush=True)
-                    else:
-                        print('ℹ️ quote failed but not NO_ROUTE -> no autoskip', flush=True)
+                _sk = os.getenv('SKIP_MINTS_FILE','state/skip_mints.txt')
+                Path(_sk).parent.mkdir(parents=True, exist_ok=True)
+                with open(_sk, 'a', encoding='utf-8') as f:
+                    f.write(str(output_mint).strip() + "\n")
+                print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={{output_mint}} to SKIP_MINTS_FILE={{_sk}}", flush=True)
             except Exception as _e:
-                print(f"⚠️ AUTO_SKIP_NO_ROUTE handler error mint={output_mint} err={repr(_e)}", flush=True)
+                print(f"⚠️ AUTO_SKIP_NO_ROUTE failed mint={{output_mint}} err={{repr(_e)}}", flush=True)
             return 0
         quote = qr.json()
     except Exception as e:

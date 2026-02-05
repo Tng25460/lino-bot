@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS wallet_events (
   ts INTEGER,
   signature TEXT,
   action TEXT,
-  token_address TEXT,
+  mint TEXT,
   decimals INTEGER,
   amount_raw REAL,
   flow TEXT,
@@ -64,4 +64,4 @@ CREATE TABLE IF NOT EXISTS wallet_events (
   source TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_wallet_events_token_ts ON wallet_events(token_address, ts);
+CREATE INDEX IF NOT EXISTS idx_wallet_events_token_ts ON wallet_events(mint, ts);

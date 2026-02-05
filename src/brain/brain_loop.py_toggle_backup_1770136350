@@ -1,10 +1,6 @@
 import os, json, time, sqlite3, statistics
 from typing import Dict, Any, List, Tuple, Optional
 import os
-
-# skip_mints split (trader vs brain)
-BRAIN_SKIP_MINTS_FILE = os.getenv('BRAIN_SKIP_MINTS_FILE') or os.getenv('SKIP_MINTS_FILE') or 'state/skip_mints_brain.txt'
-
 import urllib.request
 import urllib.error
 import sqlite3
@@ -42,7 +38,7 @@ DUST_UI = float(os.getenv("HOLDING_DUST_UI", "0.001"))
 
 
 def _brain_load_skip_mints():
-    path = os.getenv("BRAIN_SKIP_MINTS_FILE", "state/skip_mints_brain.txt")
+    path = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
     out = set()
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -482,7 +478,9 @@ def _brain_is_stable_like(o: dict) -> bool:
     except Exception:
         return False
     return False
-def run_once(note: str = "brain_loop"):
+
+
+ef run_once(note: str = "brain_loop"):
     _ensure_brain_db()
     brain=_connect(BRAIN_DB)
 

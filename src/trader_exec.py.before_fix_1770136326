@@ -1,0 +1,16 @@
+from __future__ import annotations
+import os
+
+# === MINT COOLDOWN (anti re-eval spam) ======================
+MINT_COOLDOWN_S = int(os.getenv('MINT_COOLDOWN_S', '600'))
+_MINT_LAST_SEEN = {}  # mint -> last_ts
+
+def _mint_on_cooldown(mint: str, now_ts: int) -> bool:
+    last = _MINT_LAST_SEEN.get(mint)
+    return last is not None and (now_ts - last) < MINT_COOLDOWN_S
+
+def _mark_mint_seen(mint: str, now_ts: int):
+    if mint:
+        _MINT_LAST_SEEN[mint] = now_ts
+
+

@@ -219,7 +219,9 @@ class SellEngine:
         if ('400 Client Error' in out_all and 'Bad Request' in out_all and 'amount=1' in out_all):
             print(f"🧹 DUST_UNTRADEABLE mint={mint} (amount=1) -> close locally")
             return '__DUST__'
-        raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
+        if (getattr(proc, "returncode", 1) != 0) or (not txsig):
+
+            raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
 
         return txsig or "NO_TXSIG"
 

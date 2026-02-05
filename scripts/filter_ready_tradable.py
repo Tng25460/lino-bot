@@ -1,56 +1,136 @@
-#!/usr/bin/env python3
-import json, os, time
+import os, json, time
+from pathlib import Path
+
 import requests
 
-INP = os.getenv("READY_IN", "state/ready_scored.jsonl")
-OUT = os.getenv("READY_OUT", "state/ready_tradable.jsonl")
-JUP = os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag")
-AMOUNT = str(int(float(os.getenv("BUY_AMOUNT_SOL","0.003")) * 1e9))
-SLIPPAGE = os.getenv("SLIPPAGE_BPS", "120")
+INP = os.getenv("READY_TRADABLE_IN", "state/ready_pump_early.jsonl")
+OUT = os.getenv("READY_TRADABLE_OUT", "state/ready_tradable.jsonl")
+JUP = os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag").rstrip("/")
 
-def ok_quote(mint: str) -> tuple[bool,str]:
-    params = {
-        "inputMint":"So11111111111111111111111111111111111111112",
-        "outputMint": mint,
-        "amount": AMOUNT,
-        "slippageBps": SLIPPAGE,
-    }
-    try:
-        r = requests.get(f"{JUP}/swap/v1/quote", params=params, timeout=12)
-        if r.status_code == 200:
-            return True, ""
-        txt = (r.text or "")[:200]
-        return False, f"http={r.status_code} body={txt}"
-    except Exception as e:
-        return False, f"exc={e}"
+INPUT_MINT = os.getenv("FILTER_INPUT_MINT", "So11111111111111111111111111111111111111112")
+AMOUNT_LAMPORTS = int(os.getenv("FILTER_AMOUNT_LAMPORTS", "3000000"))
+SLIPPAGE_BPS = int(os.getenv("FILTER_SLIPPAGE_BPS", "120"))
 
-rows = []
-with open(INP,"r",encoding="utf-8") as f:
-    for ln in f:
-        ln = ln.strip()
-        if not ln: 
+MAX_N = int(os.getenv("FILTER_MAX_N", "0"))  # 0 = no limit
+TIMEOUT_S = float(os.getenv("FILTER_TIMEOUT_S", "10.0"))
+
+RETRIES = int(os.getenv("FILTER_QUOTE_RETRIES", "6"))
+DELAY_S = float(os.getenv("FILTER_QUOTE_DELAY_S", "0.6"))
+MAX_DELAY_S = float(os.getenv("FILTER_QUOTE_MAX_DELAY_S", "6.0"))
+
+# If 429, we either KEEP (default) or SOFT-SKIP without marking bad
+ON_429_KEEP = os.getenv("FILTER_ON_429_KEEP", "1") == "1"
+
+def _read_jsonl(path: str):
+    p = Path(path)
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
             continue
         try:
-            rows.append(json.loads(ln))
+            out.append(json.loads(line))
         except Exception:
-            pass
-
-kept = 0
-bad = 0
-with open(OUT,"w",encoding="utf-8") as w:
-    for i, o in enumerate(rows, 1):
-        mint = (o.get("mint") or o.get("outputMint") or o.get("address") or "").strip()
-        if not mint:
-            bad += 1
             continue
-        ok, why = ok_quote(mint)
-        if ok:
-            w.write(json.dumps(o, ensure_ascii=False) + "\n")
-            kept += 1
-        else:
-            bad += 1
-        if i % 10 == 0:
-            print(f"[{i}/{len(rows)}] kept={kept} bad={bad}")
-        time.sleep(0.12)
+    return out
 
-print("DONE kept=", kept, "bad=", bad, "OUT=", OUT)
+def _quote(output_mint: str):
+    url = f"{JUP}/swap/v1/quote"
+    params = {
+        "inputMint": INPUT_MINT,
+        "outputMint": output_mint,
+        "amount": str(int(AMOUNT_LAMPORTS)),
+        "slippageBps": str(int(SLIPPAGE_BPS)),
+    }
+
+    delay = DELAY_S
+    last = None
+
+    for i in range(RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, timeout=TIMEOUT_S)
+            sc = r.status_code
+            txt = (r.text or "")[:200]
+
+            if sc == 200:
+                return True, sc, None
+
+            # --- 429 handling (do not mark bad)
+            if sc == 429:
+                last = ("429", txt)
+                if ON_429_KEEP:
+                    return True, sc, "rate_limit_keep"
+                # soft-skip (ne compte pas bad)
+                time.sleep(min(delay, MAX_DELAY_S))
+                delay = min(delay * 1.6, MAX_DELAY_S)
+                continue
+
+            # Common "not tradable / no route"
+            if sc in (400, 404):
+                if "Could not find any route" in txt or "TOKEN_NOT_TRADABLE" in txt or "No route found" in txt:
+                    return False, sc, txt
+
+            # other transient HTTPs: retry a bit
+            last = (str(sc), txt)
+            time.sleep(min(delay, MAX_DELAY_S))
+            delay = min(delay * 1.6, MAX_DELAY_S)
+            continue
+
+        except Exception as e:
+            last = ("exc", str(e)[:200])
+            time.sleep(min(delay, MAX_DELAY_S))
+            delay = min(delay * 1.6, MAX_DELAY_S)
+            continue
+
+    # If we exhausted retries:
+    # - if last was 429 and ON_429_KEEP=1, we would have returned already
+    return False, 0, f"quote_failed:{last}"
+
+def main():
+    items = _read_jsonl(INP)
+    if MAX_N > 0:
+        items = items[:MAX_N]
+
+    Path(OUT).parent.mkdir(parents=True, exist_ok=True)
+
+    kept = 0
+    bad = 0
+    soft429 = 0
+
+    print(f"[filter_ready_tradable] INP={INP} OUT={OUT}")
+    print(f"[filter_ready_tradable] JUP={JUP} amount={AMOUNT_LAMPORTS} slip_bps={SLIPPAGE_BPS} retries={RETRIES} on429_keep={int(ON_429_KEEP)}")
+
+    with open(OUT, "w", encoding="utf-8") as fo:
+        total = max(1, len(items))
+        for n, obj in enumerate(items, 1):
+            mint = str(obj.get("mint") or "").strip()
+            if not mint:
+                bad += 1
+                continue
+
+            ok, sc, err = _quote(mint)
+
+            obj2 = dict(obj)
+            obj2["tradable_checked_at"] = int(time.time())
+            obj2["tradable_ok"] = bool(ok)
+            obj2["tradable_http"] = int(sc) if sc else None
+            if err:
+                obj2["tradable_err"] = err
+
+            if ok:
+                kept += 1
+                if err == "rate_limit_keep" and sc == 429:
+                    soft429 += 1
+                fo.write(json.dumps(obj2, separators=(",", ":"), ensure_ascii=False) + "\n")
+            else:
+                bad += 1
+
+            if n % 10 == 0 or n == total:
+                print(f"[{n}/{total}] kept={kept} bad={bad} soft429={soft429}")
+
+    print("DONE kept=", kept, "bad=", bad, "soft429=", soft429, "OUT=", OUT)
+
+if __name__ == "__main__":
+    main()

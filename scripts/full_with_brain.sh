@@ -1,61 +1,31 @@
 #!/usr/bin/env bash
-set -u  # PAS de -e : on ne veut jamais quitter en live
-cd "$(dirname "$0")/.." || exit 0
-
-# venv
+set -euo pipefail
+cd "$(dirname "$0")/.." || exit 1
 source .venv/bin/activate
-export PATH="$(pwd)/.venv/bin:$PATH"
 
+PY="$(which python3)"
+echo "[LAUNCH] PYTHON=$PY"
+$PY -V
+
+TS="$(date +%s)"
+MODE="${MODE:-FULL}"
+LOG_BRAIN="state/brain_${TS}.log"
+LOG_LIVE="state/run_live_${MODE}_${TS}.log"
 mkdir -p state
-RUN_LOG="state/run_live_FULL_$(date +%s).log"
-BRAIN_LOG="state/brain_loop_$(date +%s).log"
 
-# wallet pubkey (robuste)
-export WALLET_PUBKEY="$(
-  python3 - <<'PY'
-import json
-from solders.keypair import Keypair
-kp = Keypair.from_bytes(bytes(json.load(open("keypair.json"))))
-print(str(kp.pubkey()))
-PY
-)"
-export TRADER_USER_PUBLIC_KEY="$WALLET_PUBKEY"
+echo "[LAUNCH] WALLET_PUBKEY=${WALLET_PUBKEY:-}"
+echo "[LAUNCH] MODE=$MODE TRADER_DRY_RUN=${TRADER_DRY_RUN:-} READY_FILE=${READY_FILE:-}"
+echo "[LAUNCH] brain -> src/brain/brain_loop.py (every 20s) -> $LOG_BRAIN"
+echo "[LAUNCH] run_live -> $LOG_LIVE"
 
-# config (tu peux override avant de lancer)
-export MODE="${MODE:-FULL}"
-export TRADER_DRY_RUN="${TRADER_DRY_RUN:-0}"
-export READY_FILE="${READY_FILE:-state/ready_scored.jsonl}"
-export BRAIN_EVERY_SEC="${BRAIN_EVERY_SEC:-20}"
+( while true; do
+    $PY -u src/brain/brain_loop.py >> "$LOG_BRAIN" 2>&1 || true
+    sleep 20
+  done ) &
 
-echo "[LAUNCH] PYTHON=$(which python3)" | tee -a "$RUN_LOG"
-python3 -V | tee -a "$RUN_LOG"
-echo "[LAUNCH] WALLET_PUBKEY=$WALLET_PUBKEY" | tee -a "$RUN_LOG"
-echo "[LAUNCH] MODE=$MODE TRADER_DRY_RUN=$TRADER_DRY_RUN READY_FILE=$READY_FILE" | tee -a "$RUN_LOG"
-echo "[LAUNCH] brain every ${BRAIN_EVERY_SEC}s -> $BRAIN_LOG" | tee -a "$RUN_LOG"
-echo "[LAUNCH] run_live -> $RUN_LOG" | tee -a "$RUN_LOG"
-
-cleanup() {
-  echo "[LAUNCH] stopping..." | tee -a "$RUN_LOG"
-  [[ -n "${BRAIN_PID:-}" ]] && kill "$BRAIN_PID" 2>/dev/null || true
-  pkill -f "python3 -u src/run_live.py" 2>/dev/null || true
-}
-trap cleanup INT TERM EXIT
-
-# cerveau loop (ignore errors, never quit)
-(
-  while true; do
-    echo "[BRAIN] tick $(date -Is)" | tee -a "$BRAIN_LOG"
-    python3 -u src/brain/brain_loop.py >>"$BRAIN_LOG" 2>&1 || echo "[BRAIN] error ignored $(date -Is)" >>"$BRAIN_LOG"
-    sleep "$BRAIN_EVERY_SEC"
-  done
-) &
-BRAIN_PID=$!
-
-# run_live loop (restart on crash)
+echo "[RUN] starting run_live $(date -Iseconds)" | tee -a "$LOG_LIVE"
 while true; do
-  echo "[RUN] starting run_live $(date -Is)" | tee -a "$RUN_LOG"
-  python3 -u src/run_live.py >>"$RUN_LOG" 2>&1
-  EC=$?
-  echo "[RUN] run_live exited code=$EC at $(date -Is) (restart in 3s)" | tee -a "$RUN_LOG"
+  $PY -u src/run_live.py >> "$LOG_LIVE" 2>&1 || true
+  echo "[RUN] run_live exited code=$? $(date -Iseconds) (restart in 3s)" | tee -a "$LOG_LIVE"
   sleep 3
 done
