@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 import argparse, os, sqlite3, time
 
+
+def _pnl_pct_from_prices(entry_usd, close_usd):
+    # Returns float pnl_pct, or None if cannot compute safely.
+    try:
+        if entry_usd is None or close_usd is None:
+            return None
+        e=float(entry_usd)
+        c=float(close_usd)
+        if e <= 0:
+            return None
+        return ((c - e) / e) * 100.0
+    except Exception:
+        return None
+
 def _tables(con):
     cur=con.cursor()
     cur.execute("select name from sqlite_master where type='table'")
