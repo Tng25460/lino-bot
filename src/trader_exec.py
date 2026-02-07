@@ -72,26 +72,52 @@ def _rl_skip_save(d: dict):
     except Exception as e:
         print('⚠️ RL_SKIP save failed:', e, flush=True)
 
-def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
-    # RL_SKIP: accept optional kw 'reason' without breaking signature
+def _rl_skip_add(mint: str, sec: int | None = None, reason: str = ''):
+    """Add mint to RL skip map until now+sec.
+    Backward compatible with old signature _rl_skip_add(mint).
+    """
+    import os, json, time as _time
+    from pathlib import Path
 
-    reason = None
-
+    # RL_SKIP_FILE can be Path or str; normalize
+    rl_file = None
     try:
-
-        reason = _kw.pop("reason", None)
-
+        rl_file = RL_SKIP_FILE  # may exist elsewhere
     except Exception:
+        rl_file = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
+    if isinstance(rl_file, str):
+        rl_file = Path(rl_file)
 
-        reason = None
-    m = (mint or '').strip()
-    if not m:
-        return
-    d = _rl_skip_load()
+    if sec is None:
+        sec = int(os.getenv('RL_SKIP_SEC', '600'))
+    else:
+        try:
+            sec = int(sec)
+        except Exception:
+            sec = int(os.getenv('RL_SKIP_SEC', '600'))
+
     now = int(_time.time())
-    ttl = int(sec or RL_SKIP_SEC)
-    d[m] = max(int(d.get(m, 0) or 0), now + ttl)
-    _rl_skip_save(d)
+    until = now + int(sec)
+
+    data = {}
+    try:
+        if rl_file.exists():
+            data = json.loads(rl_file.read_text(errors='ignore') or '{}')
+    except Exception:
+        data = {}
+
+    data[str(mint)] = int(until)
+    try:
+        rl_file.parent.mkdir(parents=True, exist_ok=True)
+        rl_file.write_text(json.dumps(data, separators=(',',':')))
+    except Exception as e:
+        print(f"⚠️ RL_SKIP write failed file={rl_file} err={e}")
+        return
+
+    if reason:
+        print(f"🧊 RL_SKIP add mint={mint} sec={sec} until={until} reason={reason}")
+    else:
+        print(f"🧊 RL_SKIP add mint={mint} sec={sec} until={until}")
 
 def _rl_skip_is(mint: str) -> bool:
     m = (mint or '').strip()
@@ -147,27 +173,6 @@ def _rl_skip_is(mint: str) -> bool:
     until = float(d.get(m, 0) or 0)
     return until > time.time()
 
-def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
-    m = (mint or '').strip()
-    if not m:
-        return
-    fp = _Path(RL_SKIP_FILE)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    d = _rl_skip_load()
-    until = time.time() + float(RL_SKIP_SEC)
-    d[m] = until
-    fp.write_text(_json.dumps(d, sort_keys=True), encoding='utf-8')
-    print(f'🧊 RL_SKIP add mint={m} sec={RL_SKIP_SEC} reason={reason}', flush=True)
-
-# === END RL_SKIP_HELPERS ===
-
-# --- RL skip (429): temporarily skip a mint without polluting SKIP_MINTS_FILE ---
-import json as _json
-from pathlib import Path as _Path
-
-RL_SKIP_FILE = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
-RL_SKIP_SEC = int(os.getenv("RL_SKIP_SEC", "180"))  # 3 min default
-
 def _rl_skip_load() -> dict:
     try:
         fp = _Path(RL_SKIP_FILE)
@@ -184,15 +189,6 @@ def _rl_skip_save(d: dict) -> None:
         fp.write_text(_json.dumps(d, ensure_ascii=False), encoding="utf-8")
     except Exception as _e:
         print("⚠️ rl_skip save failed:", _e)
-
-def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
-    m = (mint or "").strip()
-    if not m:
-        return
-    d = _rl_skip_load()
-    sec = int(sec or RL_SKIP_SEC)
-    d[m] = int(time.time()) + sec
-    _rl_skip_save(d)
 
 def _rl_skip_has(mint: str) -> bool:
     m = (mint or "").strip()
@@ -773,7 +769,7 @@ SLIPPAGE_BPS = int(float(os.getenv("SLIPPAGE_BPS", os.getenv("TRADER_SLIPPAGE_BP
 MAX_PRICE_IMPACT_PCT = float(os.getenv("MAX_PRICE_IMPACT_PCT", os.getenv("TRADER_MAX_PRICE_IMPACT_PCT", "1.5")))
 DEFAULT_SOL_AMOUNT = float(os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")))
 
-ONE_SHOT = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1", "true", "yes", "on")
+ONE_SHOT = os.getenv("ONE_SHOT", os.getenv("TRADER_ONE_SHOT","0")).strip().lower() in ("1", "true", "yes", "on")
 DRY_RUN = os.getenv("TRADER_DRY_RUN", os.getenv("DRY_RUN", "1")).strip().lower() in ("1", "true", "yes", "on")
 SKIP_PREFLIGHT = os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -1028,6 +1024,7 @@ def main() -> int:
 
         if ui > 0.0:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
+            _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC','900')), reason='already_holding')
             if ui >= BAG_MIN_UI:
                 try:
                     _append_skip_mint(str(output_mint))

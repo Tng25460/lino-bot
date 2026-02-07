@@ -16,7 +16,7 @@ async def trader_loop():
     max_trades_per_hour = int(os.getenv("LOOP_MAX_TRADES_PER_HOUR", "6"))
     cooldown_s = int(os.getenv("LOOP_COOLDOWN_MINT_S", "1800"))
 
-    one_shot = os.getenv("TRADER_ONE_SHOT", "0").strip().lower() in ("1","true","yes","on")
+    one_shot = os.getenv("ONE_SHOT", os.getenv("TRADER_ONE_SHOT","0")).strip().lower() in ("1","true","yes","on")
 
     print("🧠 trader_loop (universe_builder -> exec -> sign -> send)", flush=True)
     print("   sleep_s=", sleep_s, "max_trades/h=", max_trades_per_hour, "cooldown_s=", cooldown_s, flush=True)
@@ -42,6 +42,10 @@ async def trader_loop():
 
         await asyncio.sleep(sleep_s)
 def main():
+    # propagate ONE_SHOT -> TRADER_ONE_SHOT for consistency across scripts
+    if os.getenv("ONE_SHOT","").strip().lower() in ("1","true","yes","on") and not os.getenv("TRADER_ONE_SHOT"):
+        os.environ["TRADER_ONE_SHOT"] = "1"
+
     args = _parse_cli()
     if args.sell_json:
         req = json.loads(args.sell_json)
@@ -49,16 +53,20 @@ def main():
             return globals()["run_sell"](req)
         if "handle_sell" in globals():
             return globals()["handle_sell"](req)
-        print("[trader_loop] SELL request:", req)
+        print("[trader_loop] SELL request:", req, flush=True)
         return 0
+
     if args.buy_json:
         req = json.loads(args.buy_json)
         if "run_buy" in globals():
             return globals()["run_buy"](req)
         if "handle_buy" in globals():
             return globals()["handle_buy"](req)
-        print("[trader_loop] BUY request:", req)
+        print("[trader_loop] BUY request:", req, flush=True)
         return 0
+
+    # default: run the loop
+    asyncio.run(trader_loop())
     return 0
 
 if __name__ == "__main__":
