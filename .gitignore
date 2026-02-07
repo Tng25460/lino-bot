@@ -15,3 +15,10 @@ keypair.json
 *.bak_*
 *.bak
 *~
+
+# --- Bot Lino runtime artifacts ---
+state/
+last_swap_*.b64
+last_swap_*.json
+last_swap_*.log
+*.BROKEN_*
