@@ -149,8 +149,16 @@ def main():
         pnl_sol=_as_float(r[col_pnl_sol]) if col_pnl_sol else None
 
         # Prefer USD prices when available (GOLD schema)
-        entry_usd = _as_float(r.get("entry_price_usd")) if isinstance(r, dict) else None
-        close_usd = _as_float(r.get("close_price_usd")) if isinstance(r, dict) else None
+        # Supports sqlite3.Row (mapping) and dict; falls back safely.
+        entry_usd = None
+        close_usd = None
+        try:
+            if hasattr(r, "keys") and ("entry_price_usd" in r.keys()) and ("close_price_usd" in r.keys()):
+                entry_usd = _as_float(r["entry_price_usd"])
+                close_usd = _as_float(r["close_price_usd"])
+        except Exception:
+            entry_usd = None
+            close_usd = None
         if entry_usd is not None and close_usd is not None:
             entry, exitp = entry_usd, close_usd
         pnl_pct=_as_float(r[col_pnl_pct]) if col_pnl_pct else None
