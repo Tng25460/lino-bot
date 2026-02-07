@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+import os, json, time, math
+from typing import Dict, Any, List
+
+READY_IN  = os.getenv("BRAIN_READY_IN",  "state/ready_to_trade_scored.jsonl")
+READY_OUT = os.getenv("BRAIN_READY_OUT", "state/ready_scored.jsonl")
+SKIP_FILE = os.getenv("SKIP_MINTS_FILE", "state/skip_mints.txt")
+
+TOP_N     = int(os.getenv("BRAIN_TOP_N", "100"))
+MIN_SCORE = float(os.getenv("BRAIN_MIN_SCORE", "-1e9"))
+
+# Si un token est "déjà dans le wallet" mais ultra dust, on l'ignore (et donc ça ne bloque pas les buys)
+IGNORE_HOLDING_BELOW = float(os.getenv("IGNORE_HOLDING_BELOW", "0.0"))  # ex: 0.001
+# Pour ton cas: Bonk dust ui=1e-05 => mets IGNORE_HOLDING_BELOW=0.001
+
+def _load_jsonl(path: str) -> List[Dict[str, Any]]:
+    items = []
+    # BRAIN_SKIP_FILTER_V1
+    skip = _load_skip_mints(SKIP_FILE)
+    if skip:
+        before = len(items)
+        items = [x for x in items if (str(x.get('mint') or x.get('outputMint') or x.get('address') or '')).strip() not in skip]
+        print(f"🧠 brain_v2: filtered skip_mints={before-len(items)} remaining={len(items)}")
+    out=[]
+    if not os.path.exists(path):
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+def _write_jsonl(path: str, items) -> None:
+    """
+    Atomic JSONL write (tmp + os.replace).
+    Prevents partial files if interrupted.
+    """
+    import os, json
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as w:
+        for o in items:
+            w.write(json.dumps(o, ensure_ascii=False) + '\n')
+    os.replace(tmp, path)
+def _load_skip_mints(path: str | None = None) -> set:
+    if path is None:
+        path = SKIP_FILE
+    s=set()
+    if not os.path.exists(path):
+        return s
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line or line.startswith("#"):
+                continue
+            s.add(line)
+    return s
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def score_market(o: Dict[str, Any]) -> float:
+    # Idée: scorer sans exploser (log + clamp)
+    liq = _safe_float(o.get("liquidity_usd"), 0.0)
+    v1h = _safe_float(o.get("vol_1h"), 0.0)
+    t1h = _safe_float(o.get("txns_1h"), 0.0)
+    c1h = _safe_float(o.get("chg_1h"), 0.0)
+    mc  = _safe_float(o.get("market_cap") or o.get("fdv"), 0.0)
+
+    # logs sûrs
+    liq_s = math.log10(max(1.0, liq))
+    v1h_s = math.log10(max(1.0, v1h))
+    t1h_s = math.log10(max(1.0, t1h))
+    mc_s  = math.log10(max(1.0, mc))
+
+    # momentum clamp
+    c1h_s = _clamp(c1h, -80.0, 300.0) / 10.0
+
+    # pondérations simples (stables)
+    score = 0.0
+    score += 3.0 * liq_s
+    score += 2.0 * v1h_s
+    score += 2.0 * t1h_s
+    score += 1.0 * c1h_s
+    score += -0.8 * mc_s  # pénalise les gros caps (option moonshot)
+
+    return score
+
+def score_flow(o: Dict[str, Any], skip_mints: set) -> float:
+    # Pour l’instant: si mint dans skip => énorme malus (évite loops)
+    m = str(o.get("mint") or "")
+    if m in skip_mints:
+        return -999.0
+    return 0.0
+
+def score_history(o: Dict[str, Any]) -> float:
+    # Placeholder: quand on branchera brain.sqlite + wallet CSV, on mettra du vrai
+    return 0.0
+
+def run_once() -> int:
+    items = _load_jsonl(READY_IN)
+    skip_mints = _load_skip_mints(SKIP_FILE)
+
+    # filtre skip
+    if skip_mints:
+        before=len(items)
+        items = [x for x in items if str(x.get("mint") or "") not in skip_mints]
+        if len(items) != before:
+            print(f"🧠 brain_v2: filtered skip_mints={before-len(items)} remaining={len(items)}")
+
+    scored=[]
+    now=int(time.time())
+    for o in items:
+        m = str(o.get("mint") or "")
+        if not m:
+            continue
+
+        s_market  = score_market(o)
+        s_flow    = score_flow(o, skip_mints)
+        s_hist    = score_history(o)
+        s_total   = s_market + s_flow + s_hist
+
+        o2 = dict(o)
+        o2["brain_score"] = round(s_total, 4)
+        o2["brain_score_market"] = round(s_market, 4)
+        o2["brain_score_flow"] = round(s_flow, 4)
+        o2["brain_score_history"] = round(s_hist, 4)
+        o2["brain_scored_at"] = now
+
+        scored.append(o2)
+
+    scored.sort(key=lambda x: float(x.get("brain_score") or 0.0), reverse=True)
+    out=[]
+    for x in scored:
+        if float(x.get("brain_score") or 0.0) < MIN_SCORE:
+            continue
+        out.append(x)
+        if len(out) >= TOP_N:
+            break
+
+    # FILTER_TOKEN_NOT_TRADABLE
+    # Retire les tokens que Jupiter refuse (TOKEN_NOT_TRADABLE) si brain a déjà cette info
+    try:
+        out2=[]
+        dropped=0
+        for x in out:
+            # si le brain met un flag/raison dans x
+            rc=str(x.get('errorCode') or x.get('jup_errorCode') or x.get('jup_error') or x.get('reason') or '')
+            if 'TOKEN_NOT_TRADABLE' in rc:
+                dropped += 1
+                continue
+            out2.append(x)
+        if dropped:
+            print(f"🧠 brain_v2: dropped TOKEN_NOT_TRADABLE={dropped}")
+        out = out2
+    except Exception as _e:
+        print('brain_v2 filter not_tradable failed:', _e)
+
+    _write_jsonl(READY_OUT, out)
+
+    print(f"🧠 brain_v2: in={len(items)} -> out={len(out)} file={READY_OUT}")
+    if out:
+        top=out[0]
+        print("🧠 top1:", top.get("mint"), "score=", top.get("brain_score"))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(run_once())

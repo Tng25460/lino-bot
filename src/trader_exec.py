@@ -1,13 +1,59 @@
 from __future__ import annotations
 import os
-# === RL_SKIP_HELPERS_V2 ===
-import json as _json
-import time as _time
-from pathlib import Path as _Path
-RL_SKIP_FILE = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
-RL_SKIP_SEC = int(os.getenv('RL_SKIP_SEC', '180'))
-QUOTE_429_SLEEP_S = float(os.getenv('QUOTE_429_SLEEP_S', '1.5'))
 
+# --- RL_SKIP (top-level) ---
+_rl_skip = {}
+# LOAD_RL_SKIP_FILE (step2)
+try:
+    import os as _os
+    _rl_path = _os.getenv("RL_SKIP_FILE","state/rl_skip_mints.json")
+    if _os.path.exists(_rl_path):
+        with open(_rl_path, "r", encoding="utf-8", errors="ignore") as _f:
+            _raw = (_f.read() or "").strip()
+        if _raw:
+            _rl_skip.update(__import__("json").loads(_raw))
+except Exception as _e:
+    print("rl_skip load failed:", _e, flush=True)
+# /LOAD_RL_SKIP_FILE
+# --- /RL_SKIP ---
+
+
+def _rl_skip_filter_ready(ready):
+    """
+    Filters a ready(list[dict|str]) using state/rl_skip_mints.json.
+    Robust mint extraction: supports keys: address | token | mint, or raw string lines.
+    """
+    try:
+        rl = _rl_skip_load()
+    except Exception:
+        rl = {}
+
+    if not rl:
+        return ready
+
+    now = int(_time.time())
+    out = []
+
+    def _get_mint(x):
+        if isinstance(x, str):
+            return x.strip()
+        if isinstance(x, dict):
+            v = x.get("address") or x.get("token") or x.get("mint")
+            if isinstance(v, str):
+                return v.strip()
+        return None
+
+    for x in (ready or []):
+        mint = _get_mint(x)
+        if not mint:
+            out.append(x)
+            continue
+        until = rl.get(mint)
+        if until and int(until) > now:
+            continue
+        out.append(x)
+
+    return out
 def _rl_skip_load():
     try:
         fp = _Path(RL_SKIP_FILE)
@@ -26,7 +72,18 @@ def _rl_skip_save(d: dict):
     except Exception as e:
         print('⚠️ RL_SKIP save failed:', e, flush=True)
 
-def _rl_skip_add(mint: str, *, sec: int | None = None):
+def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
+    # RL_SKIP: accept optional kw 'reason' without breaking signature
+
+    reason = None
+
+    try:
+
+        reason = _kw.pop("reason", None)
+
+    except Exception:
+
+        reason = None
     m = (mint or '').strip()
     if not m:
         return
@@ -52,6 +109,13 @@ def _rl_skip_is(mint: str) -> bool:
             except Exception:
                 pass
         return False
+    # FORCE_PERSIST_RL_SKIP (auto)
+    try:
+        # persist RL_SKIP map so next trader_exec process can repick
+        _path = os.getenv('RL_SKIP_FILE','state/rl_skip_mints.json')
+        Path(_path).write_text(json.dumps(_rl_skip, sort_keys=True))
+    except Exception as _e:
+        print('rl_skip persist failed:', _e, flush=True)
     return True
 
 
@@ -60,6 +124,10 @@ import json as _json
 from pathlib import Path as _Path
 RL_SKIP_FILE = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
 RL_SKIP_SEC = int(os.getenv('RL_SKIP_SEC', '180'))
+
+
+
+
 QUOTE_429_SLEEP_S = float(os.getenv('QUOTE_429_SLEEP_S', '1.5'))
 
 def _rl_skip_load():
@@ -79,7 +147,7 @@ def _rl_skip_is(mint: str) -> bool:
     until = float(d.get(m, 0) or 0)
     return until > time.time()
 
-def _rl_skip_add(mint: str, reason: str = '429'):
+def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
     m = (mint or '').strip()
     if not m:
         return
@@ -117,7 +185,7 @@ def _rl_skip_save(d: dict) -> None:
     except Exception as _e:
         print("⚠️ rl_skip save failed:", _e)
 
-def _rl_skip_add(mint: str, sec: int = None) -> None:
+def _rl_skip_add(mint: str, *, sec: int | None = None, reason: str | None = None, **_kw):
     m = (mint or "").strip()
     if not m:
         return
@@ -389,6 +457,57 @@ USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
 SKIP_MINTS_FILE = os.getenv("TRADER_SKIP_MINTS_FILE", "state/skip_mints_trader.txt")
 SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
 BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
+HOLDING_CACHE_FILE = os.getenv("HOLDING_CACHE_FILE", "state/holding_cache.json")
+HOLDING_CACHE_TTL_S = int(float(os.getenv("HOLDING_CACHE_TTL_S", "7200")))  # 2h
+
+def _holding_cache_load() -> dict:
+    try:
+        from pathlib import Path as _P
+        f = _P(HOLDING_CACHE_FILE)
+        if not f.exists():
+            return {}
+        return json.loads(f.read_text(errors="ignore") or "{}") if 'json' in globals() else {}
+    except Exception:
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            f = _P(HOLDING_CACHE_FILE)
+            if not f.exists():
+                return {}
+            return _json.loads(f.read_text(errors="ignore") or "{}")
+        except Exception:
+            return {}
+
+def _holding_cache_save(d: dict) -> None:
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        _P(HOLDING_CACHE_FILE).write_text(_json.dumps(d, ensure_ascii=False))
+    except Exception:
+        pass
+
+def _holding_cache_update(mint: str, ui: float) -> None:
+    try:
+        import time as _time
+        d = _holding_cache_load()
+        d[mint] = {"ui": float(ui), "ts": int(_time.time())}
+        _holding_cache_save(d)
+    except Exception:
+        pass
+
+def _holding_cache_get_recent_ui(mint: str) -> float:
+    try:
+        import time as _time
+        d = _holding_cache_load()
+        v = d.get(mint) or {}
+        ui = float(v.get("ui") or 0.0)
+        ts = int(v.get("ts") or 0)
+        if ui > 0.0 and ts > 0 and (int(_time.time()) - ts) <= HOLDING_CACHE_TTL_S:
+            return ui
+        return 0.0
+    except Exception:
+        return 0.0
+
 
 
 def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
@@ -645,7 +764,7 @@ OUT_ERR = Path(os.getenv("OUT_ERR", "last_swap_error.json"))
 OUT_DBG = Path(os.getenv("OUT_DBG", "last_swap_debug.log"))
 OUT_SENT = Path(os.getenv("OUT_SENT", "last_swap_sent.json"))
 
-JUP_BASE = os.getenv("JUP_BASE", os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag")).rstrip("/")
+JUP_BASE = (os.getenv("JUP_BASE_URL") or os.getenv("JUP_BASE") or os.getenv("JUPITER_BASE_URL") or "https://lite-api.jup.ag").rstrip("/")
 RPC_HTTP = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com"))
 
 SOL_MINT = os.getenv("SOL_MINT", "So11111111111111111111111111111111111111112")
@@ -789,7 +908,31 @@ def main() -> int:
     print("   one_shot=", ONE_SHOT, "dry_run=", DRY_RUN)
 
 
+
     ready = _load_ready()
+    # APPLY_RL_SKIP_INLINE (safe)
+    try:
+        import time as __t
+        _now = int(__t.time())
+        _before = len(ready) if isinstance(ready, list) else 0
+        _out = []
+        for _x in (ready or []):
+            _mint = None
+            if isinstance(_x, str):
+                _mint = _x.strip()
+            elif isinstance(_x, dict):
+                _mint = (_x.get('mint') or _x.get('address') or _x.get('token'))
+                if isinstance(_mint, str):
+                    _mint = _mint.strip()
+            if _mint and int((_rl_skip.get(_mint, 0) or 0)) > _now:
+                continue
+            _out.append(_x)
+        ready = _out
+        if _before and len(ready) != _before:
+            print('🧊 RL_SKIP filtered ready:', _before, '->', len(ready), flush=True)
+    except Exception as _e:
+        print('rl_skip inline filter failed:', _e, flush=True)
+    # /APPLY_RL_SKIP_INLINE
 
     print("   ready_count=", len(ready))
 
@@ -853,21 +996,47 @@ def main() -> int:
     except Exception:
         pass
     if SKIP_IF_BAG:
-        ui = _get_token_ui_balance(WALLET_PUBKEY, output_mint) or 0.0
+        try:
+            ui = float(_onchain_ui_balance_stable(str(output_mint), tries=3, sleep_s=0.4, timeout_s=3.5) or 0.0)
+        except Exception as _e:
+            ui = 0.0
+            print(f"⚠️ holding ui fetch failed -> ui=0.0 err={_e}", flush=True)
+
+        # if ui==0, recheck harder (avoid transient empty RPC)
+        if ui <= 0.0:
+            try:
+                ui2 = float(_onchain_ui_balance_stable(str(output_mint), tries=6, sleep_s=0.5, timeout_s=6.0) or 0.0)
+                if ui2 > 0.0:
+                    ui = ui2
+            except Exception as _e2:
+                pass
+
+        # update cache when we see ui>0
+        if ui > 0.0:
+            _holding_cache_update(str(output_mint), float(ui))
+        else:
+            # ui==0 : fallback to recent cache (safe: prevent accidental rebuy)
+            _cached = _holding_cache_get_recent_ui(str(output_mint))
+            if _cached > 0.0:
+                print(f"🧠 holding cache used mint={output_mint} cached_ui={_cached}", flush=True)
+                ui = float(_cached)
+
         IGNORE_DUST = float(os.getenv("IGNORE_HOLDING_BELOW", "0"))
 
         if ui < IGNORE_DUST:
             ui = 0.0
 
-        if ui > BAG_MIN_UI:
+        if ui > 0.0:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
-            try:
-                _append_skip_mint(str(output_mint))
-                print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
-            except Exception as _e:
-                print("autoskip already-holding failed:", _e)
+            if ui >= BAG_MIN_UI:
+                try:
+                    _append_skip_mint(str(output_mint))
+                    print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
+                except Exception as _e:
+                    print("autoskip already-holding failed:", _e)
+            else:
+                print(f"   no autoskip: ui={ui} < BAG_MIN_UI={BAG_MIN_UI}", flush=True)
             return 0
-
     if not output_mint:
 
         _write_err("bad_candidate_no_mint", {"candidate": cand})
@@ -893,53 +1062,66 @@ def main() -> int:
 
 
 
-    amount_lamports = _lamports_from_any(cand.get("amount"))
+    amount_lamports = _lamports_from_any(cand.get("amount_lamports"))
     BUY_LAMPORTS_OVERRIDE = os.getenv("BUY_LAMPORTS")
     if BUY_LAMPORTS_OVERRIDE:
+        # --- RL_SKIP REPICK BEFORE PRINT (auto) ---
         try:
-            amount_lamports = int(BUY_LAMPORTS_OVERRIDE)
-            print(f"   [CFG] BUY_LAMPORTS override -> {amount_lamports}")
-        except Exception:
-            pass
-
+            _rl = _rl_skip_load() or {}
+            _now = int(_t.time())
+            _until = int(_rl.get(output_mint, 0) or 0)
+            if output_mint and _until > _now:
+                _old = output_mint
+                _cands = list(ready) if isinstance(ready, (list, tuple)) else []
+                try:
+                    _cands.sort(key=lambda d: (d.get('score') if isinstance(d, dict) else -1), reverse=True)
+                except Exception:
+                    pass
+                _new = None
+                for _c in _cands:
+                    if not isinstance(_c, dict):
+                        continue
+                    _m = _c.get('mint') or _c.get('address') or _c.get('token')
+                    if not isinstance(_m, str) or not _m.strip():
+                        continue
+                    _m = _m.strip()
+                    try:
+                        _u = int(_rl.get(_m, 0) or 0)
+                    except Exception:
+                        _u = 0
+                    if _u <= _now:
+                        _new = _c
+                        break
+                if _new is not None:
+                    output_mint = (_new.get('mint') or _new.get('address') or _new.get('token') or output_mint)
+                    if isinstance(output_mint, str):
+                        output_mint = output_mint.strip() or _old
+                    print(f"🧊 RL_SKIP repick(before print): {_old} -> {output_mint}", flush=True)
+        except Exception as _e:
+            print(f"rl_skip repick(before print) failed: {_e}", flush=True)
+    # --- amount_lamports guard (v2) ---
     if amount_lamports is None:
-
-        amount_lamports = int(DEFAULT_SOL_AMOUNT * 1_000_000_000)
-
-
-    input_mint = SOL_MINT
-
-
-    amount = int(amount_lamports)
-
-
-    try:
-        _before = None
-        if 'ready' in locals() and isinstance(ready, list):
-            _before = len(ready)
-            ready = [r for r in ready if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or r.get('address') or ''))]
-            if _before != len(ready):
-                print(f"🧊 RL_SKIP filtered ready: {_before}->{len(ready)}", flush=True)
-    except Exception as _e:
-        print('⚠️ RL_SKIP filter failed:', _e, flush=True)
-    try:
-        _before = None
-        if 'ready' in locals() and isinstance(ready, list):
-            _before = len(ready)
-            ready = [r for r in ready if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or r.get('address') or ''))]
-            if _before != len(ready):
-                print(f"🧊 RL_SKIP filtered ready: {_before}->{len(ready)}", flush=True)
-    except Exception as _e:
-        print('⚠️ RL_SKIP filter failed:', _e, flush=True)
-    print("   pick=", output_mint, "amount_lamports=", amount)
-
-        
+        _buy_sol = os.environ.get("BUY_AMOUNT_SOL", "").strip()
+        _buy_lam = os.environ.get("BUY_AMOUNT_LAMPORTS", "").strip() or os.environ.get("AMOUNT_LAMPORTS", "").strip()
+        try:
+            if _buy_sol:
+                amount_lamports = int(float(_buy_sol) * 1_000_000_000)
+            elif _buy_lam:
+                amount_lamports = int(_buy_lam)
+        except Exception:
+            amount_lamports = None
+    
+    if not amount_lamports or int(amount_lamports) <= 0:
+        print(f"⛔ amount_lamports invalid: {amount_lamports} (set BUY_AMOUNT_SOL or BUY_AMOUNT_LAMPORTS)")
+        return 2
+    # --- /amount_lamports guard (v2) ---
+    print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
         "inputMint": SOL_MINT,
         "outputMint": output_mint,
-        "amount": str(amount),
+        "amount": str(int(amount_lamports)),
         "slippageBps": str(SLIPPAGE_BPS),
     }
     try:
@@ -952,16 +1134,21 @@ def main() -> int:
             print("❌ quote failed http=", qr.status_code)
             # --- RL_SKIP_ON_429 ---
             try:
-                _h = int(http)
+                _h = int(qr.status_code)
             except Exception:
                 _h = -1
             if _h == 429:
+                # PERF: rate-limit => RL_SKIP + repick next tick
                 try:
                     _rl_skip_add(str(output_mint), reason='quote_429')
                 except Exception as _e:
                     print('rl_skip_add failed:', _e, flush=True)
+                try:
+                    print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {RL_SKIP_SEC}s (repick next)", flush=True)
+                except Exception:
+                    pass
                 import time as _time
-                _time.sleep(QUOTE_429_SLEEP_S)
+                _time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','0.3')))
                 return 0
             try:
                 _http = int(http)
@@ -1069,12 +1256,25 @@ def main() -> int:
             "mode": "BUY",
             "inputMint": SOL_MINT,
             "outputMint": output_mint,
-            "amount": amount,
+            "amount_lamports": amount_lamports,
             "slippageBps": SLIPPAGE_BPS,
             "userPublicKey": WALLET_PUBKEY,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
         print("✅ built tx -> last_swap_tx.b64")
+
+        # AUTO_SKIP_AFTER_BUILD_TX (perf)
+
+        try:
+
+            # even in DRY_RUN, rotate candidates to avoid rebuilding same mint forever
+
+            _rl_skip_add(str(output_mint), reason="dryrun_built_tx")
+
+        except Exception:
+
+            pass
+
 
         if DRY_RUN:
             print("🧪 DRY_RUN=1 -> not sending")

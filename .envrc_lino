@@ -1,0 +1,5 @@
+# usage: source .envrc_lino
+if [ -f ".venv/bin/activate" ]; then
+  source .venv/bin/activate
+  hash -r
+fi

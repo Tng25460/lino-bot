@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+
+: "${PIPELINE_SLEEP_S:=8}"
+set -euo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+source .venv/bin/activate
+
+# ---- Jupiter base (force lite-api)
+export JUP_BASE_URL="${JUP_BASE_URL:-https://lite-api.jup.ag}"
+
+# ---- choose profile pack: pump|multi (default: pump)
+PROFILE="${1:-pump}"
+if [[ "$PROFILE" == "pump" ]]; then
+  set -a; source configs/profile_pump.env; set +a
+else
+  set -a; source configs/profile_multi.env; set +a
+fi
+
+# ---- split skip files (hard)
+export TRADER_SKIP_MINTS_FILE="${TRADER_SKIP_MINTS_FILE:-state/skip_mints_trader.txt}"
+export BRAIN_SKIP_MINTS_FILE="${BRAIN_SKIP_MINTS_FILE:-state/skip_mints_brain.txt}"
+
+# ---- pipeline files
+export READY_TRADABLE="${READY_TRADABLE:-state/ready_tradable.jsonl}"
+export READY_FILE="${READY_FILE:-state/ready_scored.jsonl}"
+
+# ---- filter input defaults by profile
+if [[ -z "${READY_TRADABLE_IN:-}" ]]; then
+  if [[ "$PROFILE" == "pump" ]]; then
+    export READY_TRADABLE_IN="state/ready_pump_early.jsonl"
+  else
+    export READY_TRADABLE_IN="state/ready_ranked.jsonl"
+  fi
+fi
+export READY_TRADABLE_OUT="${READY_TRADABLE_OUT:-$READY_TRADABLE}"
+
+# ---- brain export I/O
+export BRAIN_DB="${BRAIN_DB:-state/brain.sqlite}"
+export BRAIN_READY_IN="${BRAIN_READY_IN:-$READY_TRADABLE}"
+export BRAIN_READY_OUT="${BRAIN_READY_OUT:-state/ready_scored.jsonl}"
+
+# ---- wallet pubkey export (needed by trader_loop)
+export KEYPAIR_PATH="${KEYPAIR_PATH:-/home/tng25/lino/keypair.json}"
+if [[ ! -f "$KEYPAIR_PATH" ]]; then
+  export KEYPAIR_PATH="$(pwd)/keypair.json"
+fi
+
+if [[ -f "$KEYPAIR_PATH" ]]; then
+  WALLET_PUBKEY="$(python - <<PY
+import json
+from solders.keypair import Keypair
+arr=json.load(open("$KEYPAIR_PATH","r"))
+kp=Keypair.from_bytes(bytes(arr))
+print(str(kp.pubkey()))
+PY
+)"
+  export WALLET_PUBKEY="$WALLET_PUBKEY"
+  export TRADER_USER_PUBLIC_KEY="$WALLET_PUBKEY"
+else
+  echo "⚠️ KEYPAIR_PATH not found: $KEYPAIR_PATH"
+fi
+
+# ---- propagate common trader controls (compat)
+export ONE_SHOT="${ONE_SHOT:-0}"
+export TRADER_ONE_SHOT="${TRADER_ONE_SHOT:-$ONE_SHOT}"
+export SLEEP_S="${SLEEP_S:-10}"
+export TRADER_SLEEP_S="${TRADER_SLEEP_S:-$SLEEP_S}"
+export TRADER_LOOP_SLEEP_S="${TRADER_LOOP_SLEEP_S:-$SLEEP_S}"
+export LOOP_SLEEP_S="${LOOP_SLEEP_S:-$SLEEP_S}"
+export TRADER_LOOP_S="${TRADER_LOOP_S:-$SLEEP_S}"
+
+export TRADER_LOOP_MAX_TRADES_PER_HOUR="${TRADER_LOOP_MAX_TRADES_PER_HOUR:-$MAX_TRADES_PER_HOUR}"
+export TRADER_MAX_TRADES_H="${TRADER_MAX_TRADES_H:-$MAX_TRADES_PER_HOUR}"
+export MAX_TRADES_H="${MAX_TRADES_H:-$MAX_TRADES_PER_HOUR}"
+
+export COOLDOWN_S="${COOLDOWN_S:-1800}"
+export TRADER_COOLDOWN_S="${TRADER_COOLDOWN_S:-$COOLDOWN_S}"
+export TRADER_LOOP_COOLDOWN_S="${TRADER_LOOP_COOLDOWN_S:-$COOLDOWN_S}"
+export MAX_TRADES_PER_HOUR="${MAX_TRADES_PER_HOUR:-6}"
+export TRADER_MAX_TRADES_PER_HOUR="${TRADER_MAX_TRADES_PER_HOUR:-$MAX_TRADES_PER_HOUR}"
+
+echo "=== CFG ==="
+echo "PROFILE=$PROFILE"
+echo "WALLET_PUBKEY=${WALLET_PUBKEY:-}"
+echo "TRADER_USER_PUBLIC_KEY=${TRADER_USER_PUBLIC_KEY:-}"
+echo "TRADER_SKIP_MINTS_FILE=$TRADER_SKIP_MINTS_FILE"
+echo "BRAIN_SKIP_MINTS_FILE=$BRAIN_SKIP_MINTS_FILE"
+echo "BRAIN_DB=$BRAIN_DB"
+echo "READY_TRADABLE_IN=$READY_TRADABLE_IN"
+echo "READY_TRADABLE_OUT=$READY_TRADABLE_OUT"
+echo "BRAIN_READY_IN=$BRAIN_READY_IN"
+echo "READY_FILE=$READY_FILE"
+echo "ONE_SHOT=$ONE_SHOT TRADER_ONE_SHOT=$TRADER_ONE_SHOT"
+echo "SLEEP_S=$SLEEP_S MAX_TRADES_PER_HOUR=$MAX_TRADES_PER_HOUR"
+echo "TRADER_LOOP_SLEEP_S=$TRADER_LOOP_SLEEP_S TRADER_LOOP_MAX_TRADES_PER_HOUR=$TRADER_LOOP_MAX_TRADES_PER_HOUR"
+echo "COOLDOWN_S=$COOLDOWN_S TRADER_LOOP_COOLDOWN_S=$TRADER_LOOP_COOLDOWN_S"
+echo "============"
+
+echo "[1/3] filter_ready_tradable.py"
+
+sleep "${PIPELINE_SLEEP_S:-8}"
+
+echo "[RELAX_FILTER] JUP_BASE_URL=$JUP_BASE_URL"
+env STRICT_ONLY=0 ROUTE_GATE_MODE=any ALLOWED_ROUTE_LABELS="" DENY_ROUTE_LABELS="" JUP_BASE_URL="$JUP_BASE_URL" python -u scripts/filter_ready_tradable.py || true
+
+echo "[2/3] brain_export_v4"
+
+sleep "${PIPELINE_SLEEP_S:-8}"
+
+python -u src/brain/brain_export_v4.py || true
+
+echo "[3/3] run_live"
+python -u src/run_live.py

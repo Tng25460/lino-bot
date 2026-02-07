@@ -1,0 +1,7 @@
+{
+  "ts": 1770344645,
+  "kind": "quote_http",
+  "status": 429,
+  "text": "Rate limit exceeded, please try again later.",
+  "url": "https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=61Wj56QgGyyB966T7YsMzEAKRLcMvJpDbPzjkrCZc4Bi&amount=3000000&slippageBps=120"
+}
