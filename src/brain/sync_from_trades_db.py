@@ -155,7 +155,7 @@ def main():
         tp2=_as_int(r[col_tp2]) if col_tp2 else None
 
         # simple derivations if missing
-        if pnl_pct is None and entry and exitp and entry != 0:
+        if pnl_pct is None and entry is not None and exitp is not None and entry != 0:
             pnl_pct=(exitp-entry)/entry
         if pnl_sol is None:
             pnl_sol=None
