@@ -1,9 +1,0 @@
-{
-  "ts": 1770429239,
-  "mode": "BUY",
-  "inputMint": "So11111111111111111111111111111111111111112",
-  "outputMint": "Av3cLhrHypqqh5VNqgmASeCGKbPGB8L2teNRuhH3bonk",
-  "amount_lamports": 3000000,
-  "slippageBps": 120,
-  "userPublicKey": "9U69xxU9eWRebdQ99FSo2FBwfafQZYjL4DT6ZFLqwmga"
-}
