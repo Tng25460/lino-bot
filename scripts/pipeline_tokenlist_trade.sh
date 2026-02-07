@@ -119,22 +119,22 @@ echo "[OK] brain counts:"
 wc -l state/ready_final.capped.jsonl state/ready_brain.jsonl 2>/dev/null || true
 
 # choose READY_FILE: brain if non-empty, else capped, else nobase
-READY_FILE="state/ready_brain.jsonl"
+READY_FILE="${READY_FILE:-state/ready_brain.jsonl}"
 if [ ! -s "$READY_FILE" ]; then
   echo "[WARN] brain empty -> fallback to state/ready_final.capped.jsonl"
-  READY_FILE="state/ready_final.capped.jsonl"
+  READY_FILE="${READY_FILE:-state/ready_final.capped.jsonl}"
 fi
 if [ ! -s "$READY_FILE" ]; then
   echo "[WARN] capped empty -> fallback to state/ready_final.nobase.jsonl"
-  READY_FILE="state/ready_final.nobase.jsonl"
+  READY_FILE="${READY_FILE:-state/ready_final.nobase.jsonl}"
 fi
 
 
 # choose READY_FILE: capped if non-empty, else nobase
-READY_FILE="state/ready_final.capped.jsonl"
+READY_FILE="${READY_FILE:-state/ready_final.capped.jsonl}"
 if [ ! -s "$READY_FILE" ]; then
   echo "[WARN] capped empty -> fallback to state/ready_final.nobase.jsonl"
-  READY_FILE="state/ready_final.nobase.jsonl"
+  READY_FILE="${READY_FILE:-state/ready_final.nobase.jsonl}"
 fi
 
 echo "[STEP] trader_exec (uses $READY_FILE)"

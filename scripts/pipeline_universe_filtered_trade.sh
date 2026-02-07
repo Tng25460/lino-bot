@@ -27,7 +27,7 @@ echo "[CFG] WALLET=$WALLET_PUBKEY"
 
 # 1) universe from tokenlist
 UNIVERSE_TOKENLIST_MAX="${UNIVERSE_TOKENLIST_MAX:-2500}" \
-READY_FILE="state/ready_to_trade.jsonl" \
+READY_FILE="${READY_FILE:-state/ready_to_trade.jsonl}" \
 python scripts/universe_from_tokenlist.py
 
 # 2) enrich + score (DexScreener)
@@ -65,4 +65,4 @@ wc -l "$READY_IN" state/ready_universe.filtered.jsonl || true
 head -n 5 state/ready_universe.filtered.jsonl || true
 
 # 6) run trader_exec (uses READY_FILE)
-READY_FILE="state/ready_universe.filtered.jsonl" scripts/run_trader_wallet_ready.sh
+READY_FILE="${READY_FILE:-state/ready_universe.filtered.jsonl}" scripts/run_trader_wallet_ready.sh

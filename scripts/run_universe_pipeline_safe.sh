@@ -71,7 +71,7 @@ echo "" >> "$LOG"
 
 # Step 6: trader_exec (uses filtered)
 echo "[STEP] trader_exec" >> "$LOG"
-READY_FILE="state/ready_scored.filtered.jsonl" \
+READY_FILE="${READY_FILE:-state/ready_scored.filtered.jsonl}" \
 WALLET_PUBKEY="$WALLET_PUBKEY" TRADER_USER_PUBLIC_KEY="$WALLET_PUBKEY" SELL_OWNER_PUBKEY="$WALLET_PUBKEY" \
 JUP_BASE_URL="$JUP_BASE_URL" RPC_HTTP="$RPC_HTTP" \
 TRADER_DRY_RUN="$TRADER_DRY_RUN" ONE_SHOT="$ONE_SHOT" \
