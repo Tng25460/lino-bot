@@ -147,6 +147,12 @@ def main():
         exitp=_as_float(r[col_exit]) if col_exit else None
         qty=_as_float(r[col_qty]) if col_qty else None
         pnl_sol=_as_float(r[col_pnl_sol]) if col_pnl_sol else None
+
+        # Prefer USD prices when available (GOLD schema)
+        entry_usd = _as_float(r.get("entry_price_usd")) if isinstance(r, dict) else None
+        close_usd = _as_float(r.get("close_price_usd")) if isinstance(r, dict) else None
+        if entry_usd is not None and close_usd is not None:
+            entry, exitp = entry_usd, close_usd
         pnl_pct=_as_float(r[col_pnl_pct]) if col_pnl_pct else None
         opened=_as_int(r[col_opened]) if col_opened else None
         closed=_as_int(r[col_closed]) if col_closed else None
