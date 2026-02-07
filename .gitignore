@@ -10,3 +10,8 @@ state/*.b64
 state/jup.env
 keypair.json
 /tmp/
+
+# local/auto backups
+*.bak_*
+*.bak
+*~
