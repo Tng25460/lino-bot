@@ -1,4 +1,5 @@
 import os
+import sys
 import time as _time
 import subprocess
 import traceback
@@ -28,7 +29,7 @@ class SellEngine:
     """
     Sell engine autonome (compatible DB actuelle):
     - lit qty_token (fallback qty)
-    - exécute src/sell_exec.py (Jupiter)
+    - exécute src/sell_exec_wrap.py (Jupiter)
     - TP1 / TP2 partiels + hard SL + time stop + trailing
     """
 
@@ -56,6 +57,12 @@ class SellEngine:
         self.TIME_STOP_SEC = int(os.getenv("SELL_TIME_STOP_SEC", "900"))
         self.TIME_STOP_MIN_PNL = float(os.getenv("SELL_TIME_STOP_MIN_PNL", "0.05"))
 
+        # 429 rate-limit handling (Jupiter lite-api)
+        self.SELL_429_COOLDOWN_SEC = int(os.getenv("SELL_429_COOLDOWN_SEC", "90"))
+        self.SELL_ROUTE_FAIL_COOLDOWN_SEC = int(os.getenv("SELL_ROUTE_FAIL_COOLDOWN_SEC", "2700"))  # 45min
+        self._mint_sell_cooldown_until = {}
+        self.SELL_429_MAX_RETRY = int(os.getenv("SELL_429_MAX_RETRY", "2"))
+        self.SELL_429_BACKOFF_SEC = int(os.getenv("SELL_429_BACKOFF_SEC", "20"))
         self._cfg_logged = False
         self._blocked_until = {}  # mint -> ts until which we skip (e.g. no SOL)
 
@@ -123,108 +130,62 @@ class SellEngine:
 
 
     def _sell_exec(self, mint: str, ui_amount: float, reason: str) -> str:
+        """Run src/sell_exec_wrap.py and return a marker or txsig."""
 
-
-        # clamp qty to on-chain to prevent oversell -> Jupiter sim 0x1788
-
-
+        # throttle swaps (best-effort)
         try:
-
-
-            qty = self._clamp_sell_ui(mint, float(ui_amount))
-
-
+            now = time.time()
+            last = float(getattr(self, "_last_swap_ts", 0.0) or 0.0)
+            min_iv = float(getattr(self, "SELL_SWAP_MIN_INTERVAL_SEC", 0) or 0)
+            if min_iv > 0 and now - last < min_iv:
+                time.sleep(max(0.0, min_iv - (now - last)))
+            self._last_swap_ts = time.time()
         except Exception:
+            pass
 
+        cmd = [sys.executable, "-u", "src/sell_exec_wrap.py",
+               "--mint", mint,
+               "--ui", str(ui_amount),
+               "--reason", reason]
+        print(f"🧾 SELL cmd={' '.join(cmd)}", flush=True)
 
-            qty = float(ui_amount)
-        ui_amount = float(ui_amount or 0.0)
-        if ui_amount <= 0:
-            print(f"🧹 SELL_SKIP mint={mint} reason={reason} ui_amount={ui_amount}", flush=True)
-            return ""
+        timeout_s = int(getattr(self, "SELL_EXEC_TIMEOUT_SEC", 180) or 180)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return "__FAIL__"
+        except Exception:
+            return "__FAIL__"
 
-        cmd = ["python", "-u", "src/sell_exec.py", "--mint", mint, "--ui", str(ui_amount), "--reason", reason]
-        print("🧾 SELL cmd=" + " ".join(cmd), flush=True)
+        out = (proc.stdout or "")
+        err = (proc.stderr or "")
+        out_all = (out + "\n" + err).strip()
+        lo = out_all.lower()
+        rc = int(getattr(proc, "returncode", 0) or 0)
 
-        proc = subprocess.run( cmd, capture_output=True, text=True, timeout=SELL_SUBPROCESS_TIMEOUT_S)
+        # rc priority from sell_exec_wrap.py
+        if rc in (42, 43, 44):
+            return "__ROUTE_FAIL__"
 
-        out_all = ((getattr(proc, "stdout", "") or "") + "\n" + (getattr(proc, "stderr", "") or "")).strip()
-
-        if _is_insufficient_funds_blob(out_all):
-
-            _sell_cooldown_set("insufficient_funds")
-            return ""
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-
-        if out:
-            print("📤 sell_exec stdout:\n" + out, flush=True)
-        if err:
-            print("📥 sell_exec stderr:\n" + err, flush=True)
-
-
-        if _sell_cooldown_active():
-            try:
-                print("[SELL] cooldown triggered mid-tick -> stop run_once", flush=True)
-            except Exception:
-                pass
-            return
+        # marker priority
+        if "route_fail_0x1788" in lo or "route_fail" in lo:
+            return "__ROUTE_FAIL__"
+        if "http=429" in lo or " 429 " in lo or "too many requests" in lo:
+            return "__429__"
+        if "jup_insufficient_funds" in lo or "insufficient_funds" in lo or "insufficient funds" in lo:
+            return "__INSUF__"
+        if "__dust__" in lo or "dust_untradeable" in lo or ("bad request" in lo and "amount=1" in lo):
+            return "__DUST__"
 
         # extract txsig
-        txsig = ""
-        for line in (proc.stdout or "").splitlines():
-            if line.startswith("txsig="):
-                txsig = line.split("=", 1)[1].strip()
+        mm = re.search(r'\btxsig=([1-9A-HJ-NP-Za-km-z]{40,})\b', out_all)
+        if mm:
+            return mm.group(1)
+        mm = re.search(r'\b(?:signature|sig)=([1-9A-HJ-NP-Za-km-z]{40,})\b', out_all)
+        if mm:
+            return mm.group(1)
 
-        if proc.returncode != 0:
-            blob = (out + "\n" + err).lower()
-
-            # anti-dust: computed amount <= 0 => close as dust (best effort)
-            if "computed amount <= 0" in blob:
-                print("⚠️ SELL_SKIP_DUST mint=", mint, "ui=", ui_amount, "reason=", reason, "-> CLOSE", flush=True)
-                try:
-                    self.db.close_position(mint, close_reason="dust", close_ts=int(_time.time()))
-                except Exception:
-                    pass
-                return ""
-
-            # Jupiter error 0x1788 == 6024 == InsufficientFunds => skip (no crash loop)
-            # (lack SOL for fees/rent etc)
-            if "0x1788" in blob or "6024" in blob or "insufficientfunds" in blob or "insufficient funds" in blob:
-                block_sec = int(os.getenv("SELL_BLOCK_NO_SOL_SEC", "600"))
-                self._blocked_until[mint] = _time.time() + block_sec
-                print(f"⚠️ JUP_INSUFFICIENT_FUNDS -> cooldown {block_sec}s (need SOL for fees/rent)", flush=True)
-                return ""
-
-            # COOLDOWN_ON_EXIT42
-
-            if proc.returncode == 42:
-
-                cd = int(getattr(self, 'SELL_COOLDOWN_JUP_CUSTOM_SEC', 21600))
-
-                if not hasattr(self, '_mint_cooldowns'):
-
-                    self._mint_cooldowns = {}
-
-                self._mint_cooldowns[mint] = int(now + cd)
-
-                print(f"⏸️ JUP_CUSTOM -> cooldown mint={mint} sec={cd}")
-
-                return ""
-
-                    # --- DUST guard: Jupiter can return 400 Bad Request for tiny amount=1
-        def _to_str(x):
-            return x.decode(errors='ignore') if isinstance(x, (bytes, bytearray)) else (x or '')
-        out_all = (_to_str(getattr(proc, 'stdout', '')) + "\\n" + _to_str(getattr(proc, 'stderr', ''))).strip()
-        if ('400 Client Error' in out_all and 'Bad Request' in out_all and 'amount=1' in out_all):
-            print(f"🧹 DUST_UNTRADEABLE mint={mint} (amount=1) -> close locally")
-            return '__DUST__'
-        if (getattr(proc, "returncode", 1) != 0) or (not txsig):
-
-            raise RuntimeError(f"sell_exec failed rc={proc.returncode} txsig={txsig}")
-
-        return txsig or "NO_TXSIG"
-
+        return "__FAIL__"
     def run_once(self):
         only_mint = (os.getenv("SELL_ONLY_MINT", "") or "").strip()
         if only_mint:
@@ -271,6 +232,16 @@ class SellEngine:
     def _handle_one(self, pos, now: float):
         # MINT_COOLDOWN_SKIP
         mint = pos.get('mint') if isinstance(pos, dict) else getattr(pos, 'mint', None)
+        # SELL_COOLDOWN_GUARD
+        try:
+            now = float(__import__("time").time())
+            until = float(getattr(self, "_mint_sell_cooldown_until", {}).get(mint, 0.0) or 0.0)
+            if until and now < until:
+                left = int(until - now)
+                print(f"⏳ SELL mint cooldown active left={left}s mint={mint}", flush=True)
+                return
+        except Exception:
+            pass
         if mint and hasattr(self, '_mint_cooldowns'):
             until = self._mint_cooldowns.get(mint, 0)
             if until and now < until:
@@ -322,6 +293,41 @@ class SellEngine:
                 return
             sell_qty = qty_total
             txsig = self._sell_exec(mint, sell_qty, "hard_sl")
+            # markers from _sell_exec / sell_exec_wrap.py
+            if txsig == "__429__":
+                print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=429", flush=True)
+                try:
+                    self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                except Exception:
+                    pass
+                return
+            if txsig == "__INSUF__":
+                print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=insufficient_funds", flush=True)
+                try:
+                    self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                except Exception:
+                    pass
+                return
+            if txsig == "__ROUTE_FAIL__":
+                print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={mint}", flush=True)
+                try:
+                    if hasattr(self, "_rl_skip_add"):
+                        self._rl_skip_add(mint, int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC), reason="sell_route_fail")
+                    elif hasattr(self, "_mint_sell_cooldown_until"):
+                        self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)
+                except Exception:
+                    pass
+                return
+            if txsig == "__DUST__":
+                print(f"[SELL] dust_untradeable -> close in DB mint={mint}", flush=True)
+                try:
+                    self.db.close_position(mint, close_reason="dust_untradeable")
+                except Exception:
+                    try:
+                        self.db.close_position(mint, reason="dust_untradeable")
+                    except Exception:
+                        pass
+                return
             if txsig == '__DUST__':
                 # mark closed in DB and continue
                 try:
@@ -384,6 +390,10 @@ class SellEngine:
                 print("🧪 SELL_DRY_RUN=1 -> skip TP1 sell", flush=True)
                 return
             txsig = self._sell_exec(mint, sell_qty, "tp1")
+            if txsig == "__COOLDOWN__":
+                return
+            if txsig == "__COOLDOWN__":
+                return
             if txsig == '__DUST__':
                 # mark closed in DB and continue
                 try:
@@ -411,6 +421,10 @@ class SellEngine:
                 print("🧪 SELL_DRY_RUN=1 -> skip TP2 sell", flush=True)
                 return
             txsig = self._sell_exec(mint, sell_qty, "tp2")
+            if txsig == "__COOLDOWN__":
+                return
+            if txsig == "__COOLDOWN__":
+                return
             if txsig == '__DUST__':
                 # mark closed in DB and continue
                 try:
