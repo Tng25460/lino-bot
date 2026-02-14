@@ -143,6 +143,21 @@ class SellEngine:
         except Exception:
             pass
 
+        # --- SELL_SWAP_MIN_INTERVAL throttle ---
+        try:
+            _min_iv = float(getattr(self, "SELL_SWAP_MIN_INTERVAL_SEC", 0.0) or 0.0)
+            if _min_iv > 0:
+                import time as _t
+                _now = float(_t.time())
+                _last = float(getattr(self, "_last_sell_swap_ts", 0.0) or 0.0)
+                _wait = (_last + _min_iv) - _now
+                if _wait > 0:
+                    print(f"[SELL] throttle sleep_s={_wait:.2f} reason=min_interval", flush=True)
+                    _t.sleep(_wait)
+                self._last_sell_swap_ts = float(_t.time())
+        except Exception:
+            pass
+
         cmd = [sys.executable, "-u", "src/sell_exec_wrap.py",
                "--mint", mint,
                "--ui", str(ui_amount),
