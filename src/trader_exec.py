@@ -1,6 +1,48 @@
 from __future__ import annotations
 import os
 
+
+
+# --- FAKE_SWAP429_N_V1 ---
+def _fake_swap429_should_exit():
+    try:
+        n = int(float(os.getenv("FAKE_SWAP429_N", "0")))
+    except Exception:
+        n = 0
+    if n <= 0:
+        return False
+    path = os.getenv("FAKE_SWAP429_ONCE_PATH", "/tmp/lino_fake_swap429_n.flag")
+    try:
+        import json, time
+        if os.path.exists(path):
+            d = json.loads(open(path, "r", encoding="utf-8").read() or "{}")
+        else:
+            d = {"n": n}
+        left = int(d.get("n", n))
+        if left > 0:
+            d["n"] = left - 1
+            d["ts"] = time.time()
+            open(path, "w", encoding="utf-8").write(json.dumps(d))
+            return True
+    except Exception:
+        return True
+    return False
+# --- /FAKE_SWAP429_N_V1 ---
+
+
+def _exit_rc42_on_429_v1(msg: str) -> None:
+    try:
+        if not msg:
+            return
+        if 'http= 429' in msg or 'http=429' in msg:
+            print('🧊 BUY_429_DETECTED -> exit(42)', flush=True)
+            raise SystemExit(42)
+    except SystemExit:
+        raise
+    except Exception:
+        return
+
+TRADER_QUOTE_ONLY = int(os.getenv("TRADER_QUOTE_ONLY", "0"))
 # --- RL_SKIP (top-level) ---
 _rl_skip = {}
 # LOAD_RL_SKIP_FILE (step2)
@@ -297,6 +339,87 @@ def _postbuy_resync_db(mint: str, symbol: str, price_usd: float, route: str, txs
     Returns qty_token (float) or 0.0
     """
     import os, time, json, sqlite3
+
+def _db_cols(cur, table: str):
+    return [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+
+def _db_insert(cur, table: str, data: dict):
+    cols=_db_cols(cur, table)
+    if not cols:
+        return False
+    use={k:v for k,v in data.items() if k in cols}
+    if not use:
+        return False
+    keys=list(use.keys())
+    q=f"INSERT INTO {table} ({','.join(keys)}) VALUES ({','.join(['?']*len(keys))})"
+    cur.execute(q, [use[k] for k in keys])
+    return True
+
+def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str="", qty_token: float=0.0, price: float=0.0, qty_sol: float=0.0):
+    """
+    Schema-safe DB write for BUY:
+      - trades(ts, side, mint, symbol, qty_token, price, txsig, qty)
+      - positions(mint, symbol, qty_token, entry_price, entry_ts, max_price, stop_price, status)
+    Avoids pnl_usd mismatch completely.
+    """
+    import sqlite3, time
+    if not db_path:
+        db_path="state/trades.sqlite"
+
+    con=sqlite3.connect(db_path, timeout=30)
+    cur=con.cursor()
+
+    # if already open position for this mint, do not duplicate
+    try:
+        cur.execute("SELECT COUNT(*) FROM positions WHERE mint=? AND (status LIKE 'OPEN%')", (mint,))
+        if cur.fetchone()[0] > 0:
+            # still record trade
+            _db_insert(cur, "trades", {
+                "ts": int(time.time()),
+                "side": "BUY",
+                "mint": mint,
+                "symbol": symbol,
+                "qty_token": float(qty_token or 0.0),
+                "price": float(price or 0.0),
+                "txsig": txsig,
+                "qty": float(qty_sol or 0.0),
+            })
+            con.commit()
+            con.close()
+            return True
+    except Exception:
+        pass
+
+    now=int(time.time())
+
+    _db_insert(cur, "trades", {
+        "ts": now,
+        "side": "BUY",
+        "mint": mint,
+        "symbol": symbol,
+        "qty_token": float(qty_token or 0.0),
+        "price": float(price or 0.0),
+        "txsig": txsig,
+        "qty": float(qty_sol or 0.0),
+    })
+
+    _db_insert(cur, "positions", {
+        "mint": mint,
+        "symbol": symbol,
+        "qty_token": float(qty_token or 0.0),
+        "entry_price": float(price or 0.0),
+        "entry_ts": now,
+        "max_price": float(price or 0.0),
+        "stop_price": 0.0,
+        "status": "OPEN",
+        "tp1_done": 0,
+        "tp2_done": 0,
+    })
+
+    con.commit()
+    con.close()
+    return True
+
     import requests
     from solders.keypair import Keypair
 
@@ -891,6 +1014,48 @@ def main() -> int:
 
     print("🚀 trader_exec BUY")
 
+    # --- FAKE_SWAP429_N_V1 (test helper) ---
+    try:
+        if '_fake_swap429_should_exit' in globals() and _fake_swap429_should_exit():
+            print("🧪 FAKE_SWAP429_N -> exit(42)", flush=True)
+            raise SystemExit(42)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # --- /FAKE_SWAP429_N_V1 ---
+    # --- FAKE_SWAP429_ONCE_V2 (sentinel file, real once across subprocesses) ---
+    try:
+        _fake = str(os.getenv("FAKE_SWAP429_ONCE","0")).strip().lower() in ("1","true","yes","on")
+        if _fake:
+            _flag = os.getenv("FAKE_SWAP429_ONCE_PATH", "/tmp/lino_fake_swap429_once.flag")
+            if not os.path.exists(_flag):
+                try:
+                    with open(_flag, "w", encoding="utf-8") as f:
+                        f.write("1\n")
+                except Exception:
+                    pass
+                print("❌ swap build failed http= 429", flush=True)
+                print("🧊 BUY_429_DETECTED swap_build -> exit(42)", flush=True)
+                raise SystemExit(42)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # --- /FAKE_SWAP429_ONCE_V2 ---
+
+
+    # --- FORCE_RC42_V1 ---
+    try:
+        if str(os.getenv("FORCE_RC42","0")).strip().lower() in ("1","true","yes","on"):
+            print("🧪 FORCE_RC42_V1 -> exit(42)", flush=True)
+            raise SystemExit(42)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # --- /FORCE_RC42_V1 ---
+
     print("   ready_file=", READY_FILE)
 
     print("   jup_base=", JUP_BASE)
@@ -1053,6 +1218,19 @@ def main() -> int:
                 wait = BUY_COOLDOWN_S - age
                 print(f"   [COOLDOWN] selected mint={output_mint}")
                 print(f"⚠️ skip BUY: rebuy cooldown mint={output_mint} age_s={age} wait_s={wait}")
+                # rebuy_cooldown_rl_skip
+                try:
+                    # 'wait' is computed just above: wait = BUY_COOLDOWN_S - age
+                    _wait_s = int(wait) if 'wait' in locals() else int(os.getenv('COOLDOWN_S','1800'))
+                except Exception:
+                    _wait_s = int(os.getenv('COOLDOWN_S','1800'))
+                # clamp (avoid nonsense)
+                _wait_s = max(30, min(_wait_s, 6*3600))
+                try:
+                    _rl_skip_add(str(output_mint), sec=_wait_s, reason='rebuy_cooldown')
+                    print(f"🧊 RL_SKIP rebuy_cooldown -> {output_mint} for {_wait_s}s (repick next)", flush=True)
+                except Exception as _e:
+                    print('rl_skip_add rebuy_cooldown failed:', _e, flush=True)
                 return 0
     except Exception:
         pass
@@ -1113,6 +1291,108 @@ def main() -> int:
         return 2
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
+    # --- LOW_SOL_GUARD_V5 ---
+    import os as _os
+
+    _wallet = _os.getenv("WALLET_PUBKEY") or _os.getenv("TRADER_USER_PUBLIC_KEY") or None
+    _rpc = _os.getenv("RPC_HTTP", "https://api.mainnet-beta.solana.com")
+
+    def _fenv(name, default):
+        try:
+            v = _os.getenv(name, "")
+            return float(v) if str(v).strip() != "" else float(default)
+        except Exception:
+            return float(default)
+
+    # always read from env (do not trust in-code constants)
+    _buf = _fenv("MIN_SOL_BUFFER_SOL", 0.0)
+    _amt = _fenv("BUY_AMOUNT_SOL", (float(amount_lamports)/1_000_000_000 if amount_lamports else 0.0))
+    _extra = _fenv("BUY_EXTRA_SOL_CUSHION", 0.003)
+    _need = _buf + _amt + _extra
+
+    # resolve SOL balance: locals -> RPC getBalance(wallet)
+    _sol = None
+    try:
+        _loc = locals()
+        if "sol_balance_sol" in _loc and _loc["sol_balance_sol"] is not None:
+            _sol = float(_loc["sol_balance_sol"])
+        elif "sol_balance_lamports" in _loc and _loc["sol_balance_lamports"] is not None:
+            _sol = float(_loc["sol_balance_lamports"]) / 1_000_000_000
+        elif "sol_lamports" in _loc and _loc["sol_lamports"] is not None:
+            _sol = float(_loc["sol_lamports"]) / 1_000_000_000
+        elif "sol_balance" in _loc and _loc["sol_balance"] is not None:
+            _sol = float(_loc["sol_balance"])
+    except Exception:
+        _sol = None
+
+    if _sol is None and _wallet:
+        try:
+            import requests as _rq
+            _r = _rq.post(_rpc, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(_wallet)]}, timeout=10)
+            if _r.status_code == 200:
+                _j = _r.json()
+                _lam = (((_j or {}).get("result") or {}).get("value"))
+                if _lam is not None:
+                    _sol = float(_lam) / 1_000_000_000
+        except Exception:
+            pass
+
+    print(f"LOW_SOL_GUARD status sol={_sol} need={_need:.6f} (buf={_buf:.6f} amt={_amt:.6f} extra={_extra:.6f}) wallet={_wallet} rpc={_rpc}", flush=True)
+
+    if _sol is not None and _sol < _need:
+        print(f"LOW_SOL_GUARD SKIP sol={_sol:.6f} need>={_need:.6f}", flush=True)
+        try:
+            _rl_skip_add(output_mint, 600, reason="low_sol_guard")
+        except Exception:
+            pass
+        import sys
+        sys.exit(0)
+# --- /LOW_SOL_GUARD_V5 ---
+
+    if TRADER_QUOTE_ONLY:
+        # quote-only: perform 1 Jupiter quote (exercise RL + cache), then stop
+
+        import asyncio as _asyncio
+
+        import aiohttp as _aiohttp
+
+        from core.jupiter_exec import _get_json as _jup_get_json
+
+        _jup_base = os.getenv('JUP_BASE_URL', 'https://lite-api.jup.ag').rstrip('/')
+
+        _qurl = f"{_jup_base}/swap/v1/quote"
+
+        _qparams = {
+
+          'inputMint': SOL_MINT,
+
+          'outputMint': output_mint,
+
+          'amount': str(amount_lamports),
+
+          'slippageBps': str(SLIPPAGE_BPS),
+
+        }
+
+        async def _qo():
+
+          async with _aiohttp.ClientSession() as _s:
+
+            return await _jup_get_json(_s, _qurl, _qparams)
+
+        try:
+
+          _q = _asyncio.run(_qo())
+
+          _rp = _q.get('routePlan') or []
+
+          print(f"🧪 quote_only quote OK outAmount={_q.get('outAmount')} routes={len(_rp)}", flush=True)
+
+        except Exception as _e:
+
+          print(f"🧪 quote_only quote ERR {type(_e).__name__} {str(_e)[:140]}", flush=True)
+
+        return 0
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
@@ -1142,6 +1422,10 @@ def main() -> int:
                     print('rl_skip_add failed:', _e, flush=True)
                 try:
                     print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {RL_SKIP_SEC}s (repick next)", flush=True)
+                    import time as _t
+                    _b = int(os.getenv('QUOTE_429_BACKOFF_S','25'))
+                    print(f'⏳ 429 backoff sleep={_b}s', flush=True)
+                    _t.sleep(max(1, _b))
                 except Exception:
                     pass
                 import time as _time
@@ -1218,6 +1502,9 @@ def main() -> int:
                         print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={output_mint} to SKIP_MINTS_FILE={_sk}", flush=True)
                     else:
                         print('ℹ️ quote failed but not NO_ROUTE -> no autoskip', flush=True)
+                        # --- QUOTE_429_RAISE_V1 ---
+                        raise Exception("quote failed http= 429")
+                        # --- /QUOTE_429_RAISE_V1 ---
             except Exception as _e:
                 print(f"⚠️ AUTO_SKIP_NO_ROUTE handler error mint={output_mint} err={repr(_e)}", flush=True)
             return 0
@@ -1238,6 +1525,16 @@ def main() -> int:
         if sr.status_code != 200:
             _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
             print("❌ swap build failed http=", sr.status_code)
+            try:
+                _raw = sr
+                _code = getattr(_raw, 'status_code', _raw)
+                if str(_code).strip() == '429':
+                    print('🧊 BUY_429_DETECTED swap_build -> exit(42)', flush=True)
+                    raise SystemExit(42)
+            except SystemExit:
+                raise
+            except Exception:
+                pass
             return 0
 
         swap = sr.json()
@@ -1258,21 +1555,47 @@ def main() -> int:
             "userPublicKey": WALLET_PUBKEY,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        if TRADER_QUOTE_ONLY:
+
+            print("🧪 quote_only -> skip built tx", flush=True)
+
+            return 0
+
         print("✅ built tx -> last_swap_tx.b64")
-
-        # AUTO_SKIP_AFTER_BUILD_TX (perf)
-
+        # STOP_AFTER_BUILD_ALWAYS_V1: if STOP_AFTER_BUILD_TX=1, EXIT after build (NO SEND), even in LIVE
+        if os.getenv('STOP_AFTER_BUILD_TX','0').strip().lower() in ('1','true','yes','on'):
+            print('🛑 STOP_AFTER_BUILD_TX=1 -> EXIT after build (NO SEND)', flush=True)
+            # RC3_AFTER_BUILD_V1: signal parent loop that we built a tx (DRY-ish)
+            raise SystemExit(3)
+        # STOP_AFTER_BUILD_TX (avoid spamming quotes/swaps in DRY)
         try:
-
-            # even in DRY_RUN, rotate candidates to avoid rebuilding same mint forever
-
-            _rl_skip_add(str(output_mint), reason="dryrun_built_tx")
-
+            _is_dry = os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on')
         except Exception:
-
-            pass
-
-
+            _is_dry = False
+        # AUTO_SKIP_AFTER_BUILD_TX (perf)
+        # --- DRYRUN_BUILDTX_RL_SKIP_HOOK_V3 ---
+        # In DRY_RUN, optionally add short RL_SKIP to rotate candidates after building a tx.
+        try:
+            _is_dry = (os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on'))
+        except Exception:
+            _is_dry = False
+        if _is_dry:
+            try:
+                _sec = int(float(os.getenv('DRYRUN_BUILDTX_RL_SKIP_SEC','0')))
+            except Exception:
+                _sec = 0
+            if _sec > 0:
+                try:
+                    _rl_skip_add(str(output_mint), sec=_sec, reason='dryrun_built_tx')
+                except Exception as _e:
+                    print(f"rl_skip_add(dryrun_built_tx) failed: {_e}", flush=True)
+        else:
+            # LIVE: keep existing behavior (mark built_tx) but don't crash if rl_skip isn't available
+            try:
+                _rl_skip_add(str(output_mint), reason='built_tx')
+            except Exception:
+                pass
+        # --- /DRYRUN_BUILDTX_RL_SKIP_HOOK_V3 ---
         if DRY_RUN:
             print("🧪 DRY_RUN=1 -> not sending")
             return 0
@@ -1281,67 +1604,29 @@ def main() -> int:
             txsig = _send_signed_b64(txb64, RPC_HTTP)
             OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
             print("✅ sent txsig=", txsig)
+            # --- DB record BUY (schema-safe) ---
+            # DB_GUARD_DRY_V1: avoid polluting DB in DRY_RUN / STOP_AFTER_BUILD_TX
+            if os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on') or os.getenv('STOP_AFTER_BUILD_TX','0').strip().lower() in ('1','true','yes','on'):
+                print('🧪 DB_GUARD_DRY_V1 -> skip DB record (dry/stop_after_build)', flush=True)
+            else:
+                try:
+                    _dbp = os.getenv('TRADES_DB_PATH', os.getenv('DB_PATH', 'state/trades.sqlite'))
+                    _sym = locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or ''
+                    _qty_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
+                    _price = float(locals().get('exec_price') or locals().get('price') or 0.0)
+                    _db_record_buy_schema_safe(_dbp, output_mint, txsig, symbol=_sym, qty_token=0.0, price=_price, qty_sol=_qty_sol)
+                    print(f"✅ DB: recorded BUY mint={output_mint} txsig={txsig[:8]}… db={_dbp}", flush=True)
+                except Exception as _e:
+                    print(f"⚠️ DB record BUY failed: {_e}", flush=True)
             # ANTI_REBUY_AFTER_SEND_V1
             try:
                 _last_buy_set(output_mint)
             except Exception:
                 pass
-            # --- DB HOOK: record BUY into SQLite (best-effort) ---
-            try:
-                import time, sqlite3
-                dbp = os.getenv("TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite"))
-                now = int(time.time())
-                wallet = str(WALLET_PUBKEY)
-                mint = output_mint
-                sym = str(cand.get("symbol") or cand.get("symbolBase") or "")
-                txsig = str(txsig)
-                meta = {"ready_file": str(READY_FILE), "candidate": cand, "amount_lamports": int(amount_lamports)}
-                con = sqlite3.connect(dbp, timeout=30)
-                cur = con.cursor()
-                cur.execute(
-                    """INSERT INTO trades
-                    (ts, side, mint, symbol, qty, price, txsig, pnl_usd, meta_json, wallet, qty_token, price_usd, notional_usd, tx_sig, route, err, created_ts, updated_ts)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (now, "BUY", mint, sym, 0.0, 0.0, txsig, 0.0, json.dumps(meta, ensure_ascii=False, default=str), wallet, 0.0, 0.0, 0.0, txsig, "", "", now, now),
-                )
-                cur.execute(
-                    """INSERT OR REPLACE INTO positions
-                    (mint, symbol, dex, entry_ts, entry_price, qty, cost_usd, status, high_water, trailing_stop, tp1_done, tp2_done, meta_json, wallet, qty_token, entry_price_usd, entry_cost_usd, close_price_usd, close_ts, close_reason)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (mint, sym, "", now, 0.0, 0.0, 0.0, "OPEN", 0.0, 0.0, 0, 0, json.dumps(meta, ensure_ascii=False, default=str), wallet, 0.0, 0.0, 0.0, 0.0, None, ""),
-                )
-                con.commit()
-
-                # --- POSTBUY_RESYNC_DB_RETRY_V1: always log + retry on-chain balance ---
-                try:
-                    import time as _t
-                    _m = output_mint
-                    _sym = str((cand or {}).get("symbol") or (cand or {}).get("symbolBase") or "")
-                    _px = float((cand or {}).get("price_usd") or 0.0)
-                    _rt = str((cand or {}).get("route") or "")
-                    _ts = int(now)
-                    _sig = str(txsig)
-
-                    print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 start mint={_m} sym={_sym} px={_px} rt={_rt} sig={_sig[:10]} ts={_ts}", flush=True)
-
-                    q = 0.0
-                    if _m and _sig:
-                        # balance can appear a bit later after swap -> retry
-                        for _attempt in range(1, 8):
-                            q = float(_postbuy_resync_db(str(_m), _sym, _px, _rt, _sig, _ts) or 0.0)
-                            print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 attempt={_attempt} qty_token={q}", flush=True)
-                            if q > 0:
-                                break
-                            _t.sleep(1.5)  # small wait
-
-                    print(f"🧾 POSTBUY_RESYNC_DB_RETRY_V1 done mint={_m} qty_token={q}", flush=True)
-
-                except Exception as _e:
-                    print(f"⚠️ POSTBUY_RESYNC_DB_RETRY_V1 failed err={_e}", flush=True)
-                con.close()
-                print(f"✅ DB: BUY recorded db={dbp} mint={mint} sig={txsig}", flush=True)
-            except Exception as _e:
-                print(f"⚠️ DB record failed: {_e}", flush=True)
+            if 0:
+                pass  # disabled legacy DB hook (schema mismatch)
+                        # --- DB HOOK (legacy) DISABLED: old schema mismatch (wallet/meta_json/price_usd/etc.) ---
+            pass
             # --- end DB HOOK ---
 
 
@@ -1351,6 +1636,8 @@ def main() -> int:
                     _autoskip_mint(output_mint)
             except Exception as e:
                 print('⚠️ autoskip failed:', e)
+            # EXIT2_AFTER_SEND_V1: signal parent loop that a swap was sent
+            raise SystemExit(2)
             # record_last_buy
             try:
                 import time as _time
@@ -1359,6 +1646,7 @@ def main() -> int:
                 _save_last_buys(last)
             except Exception:
                 pass
+
 
         except Exception as e:
             _write_err("send_exc", {"error": str(e)})
@@ -1373,4 +1661,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # --- QUOTE_429_RC42_MINWRAP_V1 ---
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        msg = str(e)
+        if ('quote failed http= 429' in msg) or ('http= 429' in msg and 'quote' in msg):
+            print('❌ quote failed http= 429', flush=True)
+            sys.exit(42)
+        raise
+    # --- /QUOTE_429_RC42_MINWRAP_V1 ---

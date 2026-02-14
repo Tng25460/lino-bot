@@ -1,4 +1,8 @@
 import os
+# --- SELL_ONLY_SKIP_TRADER_LOOP_V1 ---
+_MODE = os.getenv("MODE", "").strip().upper()
+_SELL_ONLY = (_MODE == "SELL_ONLY")
+
 import sys
 import asyncio
 import os
@@ -72,14 +76,16 @@ async def main():
         print("🧠 trader_loop (universe_builder -> exec -> sign -> send)", flush=True)
         try:
             # trader_loop peut être sync ou async -> safe
-            await _maybe_await(trader_loop())
+            if _SELL_ONLY:
+                print('🛑 MODE=SELL_ONLY -> skip trader_loop', flush=True)
+            else:
+                await _maybe_await(trader_loop())
         except Exception as err:
             print("❌ trader_loop error: " + str(err), flush=True)
 
         # NOTE: trader_loop a son propre TRADER_ONE_SHOT.
         # ONE_SHOT ici ne sert que si tu utilises run_live comme loop unique.
         if one_shot:
-            print("🧪 ONE_SHOT=1 -> stop after one iteration", flush=True)
             break
 
         await asyncio.sleep(sleep_s)
