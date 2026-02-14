@@ -22,3 +22,27 @@ last_swap_*.b64
 last_swap_*.json
 last_swap_*.log
 *.BROKEN_*
+
+# --- runtime artifacts ---
+state/
+tmp/
+*.log
+*.b64
+*.flag
+*.pid
+*.sqlite
+*.sqlite3
+
+# generated ready files
+ready_*.jsonl
+ready*.jsonl
+ready_to_trade*.jsonl
+*_combined*.jsonl
+*_scored*.jsonl
+*_tradable*.jsonl
+
+# accidental literal env var filenames
+\$\{*\}
+
+# local scratch
+scripts/_run.sh
