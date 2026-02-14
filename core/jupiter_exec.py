@@ -1,4 +1,74 @@
 import os
+import time
+import random
+from core.jup_rate_limit import wait_for_slot, note_result
+from collections import OrderedDict
+
+
+JUP_QUOTE_CACHE_TTL_S = float(os.getenv("JUP_QUOTE_CACHE_TTL_S", "4.5"))
+JUP_QUOTE_CACHE_MAX   = int(os.getenv("JUP_QUOTE_CACHE_MAX", "256"))
+JUP_QUOTE_CACHE_DEBUG = int(os.getenv("JUP_QUOTE_CACHE_DEBUG", "0"))
+
+# in-process cache: key -> (ts, json)
+_QUOTE_CACHE = OrderedDict()
+
+def _quote_cache_key(url: str, params: dict) -> str:
+    # normalize params (sorted) to stable key
+    items = []
+    for k in sorted((params or {}).keys()):
+        v = params.get(k)
+        if isinstance(v, (list, tuple)):
+            v = ",".join(map(str, v))
+        items.append(f"{k}={v}")
+    return url + "?" + "&".join(items)
+
+def _quote_cache_get(key: str):
+    if not JUP_QUOTE_CACHE_TTL_S or JUP_QUOTE_CACHE_TTL_S <= 0:
+        return None
+    now = time.time()
+    if key not in _QUOTE_CACHE:
+        return None
+    ts, val = _QUOTE_CACHE.get(key, (0.0, None))
+    if (now - ts) > JUP_QUOTE_CACHE_TTL_S:
+        try:
+            _QUOTE_CACHE.pop(key, None)
+        except Exception:
+            pass
+        return None
+    # LRU bump
+    try:
+        _QUOTE_CACHE.move_to_end(key, last=True)
+    except Exception:
+        pass
+    return val
+
+def _quote_cache_put(key: str, val):
+    if not JUP_QUOTE_CACHE_TTL_S or JUP_QUOTE_CACHE_TTL_S <= 0:
+        return
+    _QUOTE_CACHE[key] = (time.time(), val)
+    try:
+        _QUOTE_CACHE.move_to_end(key, last=True)
+    except Exception:
+        pass
+    # evict oldest
+    while len(_QUOTE_CACHE) > max(8, JUP_QUOTE_CACHE_MAX):
+        try:
+            _QUOTE_CACHE.popitem(last=False)
+        except Exception:
+            break
+
+
+JUP_429_BACKOFF_BASE_S = float(__import__("os").getenv("JUP_429_BACKOFF_BASE_S", "4"))
+JUP_429_BACKOFF_MAX_S  = float(__import__("os").getenv("JUP_429_BACKOFF_MAX_S", "30"))
+JUP_429_MAX_RETRIES    = int(__import__("os").getenv("JUP_429_MAX_RETRIES", "5"))
+
+def _sleep_429_backoff(attempt: int) -> None:
+    base = JUP_429_BACKOFF_BASE_S * (2 ** max(0, attempt))
+    t = min(JUP_429_BACKOFF_MAX_S, base)
+    # jitter 0..25%
+    t = t * (1.0 + random.random() * 0.25)
+    time.sleep(t)
+
 DEBUG_QUOTE = int(os.getenv("DEBUG_QUOTE","0"))
 
 def _dbg_http_fail(tag: str, url: str, status: int, body: str):
@@ -83,49 +153,132 @@ def _headers() -> Dict[str, str]:
     return h
 
 async def _get_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    if JUP_QUOTE_CACHE_DEBUG:
+        try:
+            qs = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())]) if isinstance(params, dict) else ""
+        except Exception:
+            qs = ""
+        print(f"[jup_cache] ENTER url={url} qs={qs[:140]}", flush=True)
+    
     last_err = None
-    for _ in range(JUP_RETRIES):
+
+    # --- quote-only cache (SAFE) ---
+    is_quote = ("/swap/v1/quote" in url)
+    cache_key = None
+    if is_quote and JUP_QUOTE_CACHE_TTL_S and JUP_QUOTE_CACHE_TTL_S > 0:
+        try:
+            cache_key = _quote_cache_key(url, params if isinstance(params, dict) else {})
+        except Exception:
+            cache_key = None
+        if cache_key:
+            hit = _quote_cache_get(cache_key)
+            if hit is not None:
+                if JUP_QUOTE_CACHE_DEBUG:
+                    print(f"[jup_cache] HIT key={cache_key[:120]}...", flush=True)
+                return hit
+            if JUP_QUOTE_CACHE_DEBUG:
+                print(f"[jup_cache] MISS key={cache_key[:120]}...", flush=True)
+
+    # --- adaptive rate limit gate (quotes only) ---
+    if is_quote:
+        try:
+            wait_for_slot()
+        except Exception:
+            pass
+
+    for attempt in range(JUP_RETRIES):
         try:
             async with session.get(
                 url,
                 params=params,
                 headers=_headers(),
                 timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S),
-            ) as r:
-                if DEBUG_QUOTE:
+            ) as resp:
+                # 429 rate limit
+                if resp.status == 429:
                     try:
-                        _st = getattr(r, 'status', None)
-                        if _st and int(_st) != 200:
-                            _tx = await r.text()
-                            print(f"🧪 JUP_QUOTE_HTTP status={{_st}} body={{(_tx or '')[:900]}}")
-                        else:
-                            print(f"🧪 JUP_QUOTE_HTTP status={{_st}} (ok)")
-                    except Exception as _e:
-                        print('🧪 JUP_QUOTE_HTTP read failed:', _e)
-                txt = await r.text()
-                if r.status >= 400:
-                    raise RuntimeError(f"Jupiter quote HTTP {r.status}: {txt[:400]}")
-                return await r.json()
+                        note_result(False, was_429=True)
+                    except Exception:
+                        pass
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        ra_s = float(ra) if ra else None
+                    except Exception:
+                        ra_s = None
+                    if ra_s and ra_s > 0:
+                        time.sleep(min(JUP_429_BACKOFF_MAX_S, ra_s))
+                    else:
+                        _sleep_429_backoff(attempt)
+                    continue
+
+                # transient 5xx
+                if resp.status in (500, 502, 503, 504):
+                    _sleep_429_backoff(attempt)
+                    continue
+
+                if resp.status != 200:
+                    txt = await resp.text()
+                    raise RuntimeError(f"Jupiter GET failed http={resp.status} url={url} body={txt[:300]}")
+
+                val = await resp.json()
+
+                try:
+
+                    note_result(True)
+
+                except Exception:
+
+                    pass
+                if cache_key and is_quote:
+                    _quote_cache_put(cache_key, val)
+                    if JUP_QUOTE_CACHE_DEBUG:
+                        print(f"[jup_cache] PUT key={cache_key[:120]}...", flush=True)
+                return val
+
         except Exception as e:
             last_err = e
+            # small backoff on network/timeout too
+            _sleep_429_backoff(attempt)
+
     raise RuntimeError(f"Jupiter GET failed after {JUP_RETRIES} tries: {last_err}")
 
 async def _post_json(session: aiohttp.ClientSession, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    
     last_err = None
-    for _ in range(JUP_RETRIES):
+    for attempt in range(JUP_RETRIES):
         try:
             async with session.post(
                 url,
                 json=payload,
                 headers=_headers(),
                 timeout=aiohttp.ClientTimeout(total=JUP_TIMEOUT_S),
-            ) as r:
-                txt = await r.text()
-                if r.status >= 400:
-                    raise RuntimeError(f"Jupiter swap HTTP {r.status}: {txt[:400]}")
-                return await r.json()
+            ) as resp:
+                if resp.status == 429:
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        ra_s = float(ra) if ra else None
+                    except Exception:
+                        ra_s = None
+                    if ra_s and ra_s > 0:
+                        time.sleep(min(JUP_429_BACKOFF_MAX_S, ra_s))
+                    else:
+                        _sleep_429_backoff(attempt)
+                    continue
+
+                if resp.status in (500, 502, 503, 504):
+                    _sleep_429_backoff(attempt)
+                    continue
+
+                if resp.status != 200:
+                    txt = await resp.text()
+                    raise RuntimeError(f"Jupiter POST failed http={resp.status} url={url} body={txt[:300]}")
+
+                return await resp.json()
+
         except Exception as e:
             last_err = e
+            _sleep_429_backoff(attempt)
+
     raise RuntimeError(f"Jupiter POST failed after {JUP_RETRIES} tries: {last_err}")
 
 def _to_labels(allowed_dexes: Optional[List[str]]) -> List[str]:
@@ -155,6 +308,8 @@ async def jup_build_swap_tx(
     amount_in: int,
     allowed_dexes: Optional[List[str]] = None,
 ) -> str:
+    wait_for_slot()
+
     qurl = f"{JUP_BASE}/swap/v1/quote"
 
     params: Dict[str, Any] = {
