@@ -1,8 +1,39 @@
+import argparse
 #!/usr/bin/env python3
 import os, json, time
 from pathlib import Path
 
 import requests
+
+
+# --- FILTER_READY_TRADABLE_CLI_V1 ---
+def _parse_args():
+    ap = argparse.ArgumentParser(description="Filter ready jsonl to keep only mints tradable on Jupiter")
+    ap.add_argument("--in", dest="inp", default=None, help="input jsonl")
+    ap.add_argument("--out", dest="out", default=None, help="output jsonl")
+    return ap.parse_args()
+
+_ARGS = None
+try:
+    _ARGS = _parse_args()
+except SystemExit:
+    # allow importing without argparse exit
+    _ARGS = None
+
+def _pick_io(default_in: str, default_out: str):
+    inp = None
+    out = None
+    if _ARGS is not None:
+        inp = _ARGS.inp
+        out = _ARGS.out
+    # env fallback
+    if not inp:
+        inp = os.getenv("READY_IN") or default_in
+    if not out:
+        out = os.getenv("READY_OUT") or default_out
+    return inp, out
+# --- /FILTER_READY_TRADABLE_CLI_V1 ---
+
 
 # === CONFIG ===
 INP = os.getenv("READY_TRADABLE_IN", "state/ready_pump_early.jsonl")
@@ -99,6 +130,8 @@ def _quote(sess: requests.Session, output_mint: str):
     return False, (last[0] if last else "NO"), (last[1] if last else "")
 
 def main():
+    INP, OUT = _pick_io("state/ready_scored.jsonl", "state/ready_tradable.jsonl")
+
     items = _read_jsonl(INP)
     if MAX_N > 0:
         items = items[:MAX_N]
