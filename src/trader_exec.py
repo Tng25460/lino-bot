@@ -1,5 +1,91 @@
 from __future__ import annotations
+import os as _os
+import sqlite3
+
+# --- TRADER_RLSKIP_FILTER_V4 ---
+# marker: TRADER_RLSKIP_FILTER_V4
+def _rl_skip_is_active(mint: str) -> bool:
+    try:
+        import time as _t
+        path = str(os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")).strip() or "state/rl_skip_mints.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+        now = int(_t.time())
+        until = data.get(mint)
+        if until is None:
+            return False
+        try:
+            until = int(until)
+        except Exception:
+            return False
+        return until > now
+    except Exception:
+        return False
+# --- /TRADER_RLSKIP_FILTER_V4 ---
+
+# --- REBUY_POOL_V1 ---
+def _in_rebuy_pool(mint: str) -> bool:
+    try:
+        if int(os.getenv("ALLOW_REBUY_POOL","0")) != 1:
+            return False
+        fp = str(os.getenv("REBUY_POOL_FILE","state/rebuy_pool.txt")).strip()
+        if not fp:
+            return False
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                pool = {ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")}
+        except FileNotFoundError:
+            return False
+        return mint in pool
+    except Exception:
+        return False
+# --- /REBUY_POOL_V1 ---
+
 import os
+
+# --- HIST_BAD_RLSKIP_V2 ---
+def _hist_bad_should_skip(output_mint: str):
+    """Return (should_skip, msg, n_closed, avg_pnl, skip_sec)."""
+    try:
+        import os, sqlite3
+        brain_path = str(os.getenv("BRAIN_DB_PATH", "state/brain.sqlite")).strip()
+        min_n = int(os.getenv("HIST_SKIP_MIN_N", "3"))
+        max_avg = float(os.getenv("HIST_SKIP_AVG_PNL_MAX", "0.0"))
+        skip_sec = int(os.getenv("HIST_SKIP_SEC", "3600"))
+
+        if not output_mint:
+            return (False, "no_mint", 0, 0.0, skip_sec)
+
+        con = sqlite3.connect(brain_path, timeout=3.0)
+        row = con.execute("SELECT n_closed, avg_pnl FROM mint_hist WHERE mint=?", (output_mint.strip(),)).fetchone()
+        con.close()
+
+        if not row:
+            return (False, "no_hist", 0, 0.0, skip_sec)
+
+        n_closed = int(row[0] or 0)
+        avg_pnl = float(row[1] or 0.0)
+
+        if n_closed >= min_n and avg_pnl <= max_avg:
+            msg = "🧠 HIST_BAD -> RL_SKIP mint=%s n=%d avg=%.4f (min_n=%d max_avg=%.4f sec=%d)" % (
+                output_mint, n_closed, avg_pnl, min_n, max_avg, skip_sec
+            )
+            return (True, msg, n_closed, avg_pnl, skip_sec)
+
+        return (False, "hist_ok n=%d avg=%.4f" % (n_closed, avg_pnl), n_closed, avg_pnl, skip_sec)
+    except Exception as e:
+        try:
+            import os as _os
+            skip_sec = int(os.getenv("HIST_SKIP_SEC", "3600"))
+        except Exception:
+            skip_sec = 3600
+        return (False, "hist_skip_error: %s" % e, 0, 0.0, skip_sec)
+# --- /HIST_BAD_RLSKIP_V2 ---
 
 
 
@@ -877,6 +963,16 @@ def _get_balance_lamports(rpc_http: str, pubkey: str) -> int:
 
 
 READY_FILE = Path(os.getenv("READY_FILE", "ready_to_trade.jsonl"))
+# Prefer brain-scored file if available
+try:
+    _rsf = (os.getenv("READY_SCORED_FILE") or "").strip()
+    if _rsf:
+        _p = Path(_rsf)
+        if _p.exists() and _p.stat().st_size > 0:
+            READY_FILE = _p
+            print("   ready_file= (from READY_SCORED_FILE)", READY_FILE, flush=True)
+except Exception:
+    pass
 OUT_TX_B64 = Path(os.getenv("OUT_TX_B64", "last_swap_tx.b64"))
 OUT_META = Path(os.getenv("OUT_META", "last_swap_meta.json"))
 OUT_ERR = Path(os.getenv("OUT_ERR", "last_swap_error.json"))
@@ -1072,29 +1168,23 @@ def main() -> int:
 
     ready = _load_ready()
     # APPLY_RL_SKIP_INLINE (safe)
-    try:
-        import time as __t
-        _now = int(__t.time())
-        _before = len(ready) if isinstance(ready, list) else 0
-        _out = []
-        for _x in (ready or []):
-            _mint = None
-            if isinstance(_x, str):
-                _mint = _x.strip()
-            elif isinstance(_x, dict):
-                _mint = (_x.get('mint') or _x.get('address') or _x.get('token'))
-                if isinstance(_mint, str):
-                    _mint = _mint.strip()
-            if _mint and int((_rl_skip.get(_mint, 0) or 0)) > _now:
-                continue
-            _out.append(_x)
-        ready = _out
-        if _before and len(ready) != _before:
-            print('🧊 RL_SKIP filtered ready:', _before, '->', len(ready), flush=True)
-    except Exception as _e:
-        print('rl_skip inline filter failed:', _e, flush=True)
-    # /APPLY_RL_SKIP_INLINE
 
+    # --- TRADER_RLSKIP_APPLY_V4 ---
+    try:
+        _before = len(ready) if isinstance(ready, list) else -1
+        if isinstance(ready, list) and _before > 0:
+            def _get_mint(x):
+                try:
+                    return (x.get('mint') or x.get('output_mint') or x.get('address') or '').strip()
+                except Exception:
+                    return ''
+            ready = [x for x in ready if not _rl_skip_is_active(_get_mint(x))]
+            _after = len(ready)
+            if _after != _before:
+                print(f"🧊 RL_SKIP filtered ready: {_before}->{_after} (file={os.getenv('RL_SKIP_FILE','state/rl_skip_mints.json')})", flush=True)
+    except Exception as _e:
+        print('rl_skip_filter_error:', _e, flush=True)
+    # --- /TRADER_RLSKIP_APPLY_V4 ---
     print("   ready_count=", len(ready))
 
     if not ready:
@@ -1291,6 +1381,29 @@ def main() -> int:
         return 2
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
+    # --- HIST_BAD_HOOK_APPLIED_V2 ---
+    try:
+        _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
+        if _hs:
+            print(_hmsg, flush=True)
+            # Prefer RL_SKIP if available, else fallback to SKIP_MINTS_FILE
+            try:
+                _rl_skip_add(output_mint, int(_hsec), reason='hist_bad')
+                print('🧊 RL_SKIP hist_bad sec=%d mint=%s' % (int(_hsec), output_mint), flush=True)
+            except Exception as _e:
+                try:
+                    import os as _os
+                    _sf = str(_os.getenv('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip()
+                    if _sf:
+                        with open(_sf,'a',encoding='utf-8') as _f: _f.write(output_mint.strip()+'\n')
+                        print('🧷 SKIP_MINTS fallback hist_bad -> %s' % _sf, flush=True)
+                except Exception:
+                    pass
+            return 0
+    except Exception as _e:
+        print('hist_hook_error:', _e, flush=True)
+    # --- /HIST_BAD_HOOK_APPLIED_V2 ---
+
     # --- LOW_SOL_GUARD_V5 ---
     import os as _os
 
@@ -1598,6 +1711,50 @@ def main() -> int:
         # --- /DRYRUN_BUILDTX_RL_SKIP_HOOK_V3 ---
         if DRY_RUN:
             print("🧪 DRY_RUN=1 -> not sending")
+            # --- AUTO_SKIP_DRY_RUN_V2 ---
+            try:
+                if str(os.getenv('TRADER_DRY_RUN','0')).strip().lower() in ('1','true','yes','on'):
+                    _m = str(output_mint or '').strip()
+                    _sf = str(_os.getenv('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip()
+                    if _m and _sf:
+                        _seen = False
+                        try:
+                            if os.path.exists(_sf):
+                                with open(_sf, 'r', encoding='utf-8', errors='ignore') as _rf:
+                                    for _ln in _rf:
+                                        if _ln.strip() == _m:
+                                            _seen = True
+                                            break
+                        except Exception:
+                            _seen = False
+                        if not _seen:
+                            try:
+                                os.makedirs(os.path.dirname(_sf) or '.', exist_ok=True)
+                            except Exception:
+                                pass
+                            try:
+                                with open(_sf, 'a', encoding='utf-8') as _af:
+                                    _af.write(_m + '\n')
+                                if _in_rebuy_pool(output_mint):
+                                    print(f"🧪 REBUY_POOL allow mint={output_mint} (no autoskip)", flush=True)
+                                else:
+                                    print(f"🧷 DRY_RUN autoskip -> {_m} (SKIP_MINTS_FILE={_sf})", flush=True)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            # --- /AUTO_SKIP_DRY_RUN_V2 ---
+
+            # --- DRY_RUN_AUTOSKIP_SLEEP_V1 ---
+            try:
+                if str(os.getenv('TRADER_DRY_RUN','0')).strip().lower() in ('1','true','yes','on'):
+                    _s = float(os.getenv('DRY_RUN_AUTOSKIP_SLEEP_S','0.75') or 0.75)
+                    if _s > 0:
+                        time.sleep(_s)
+            except Exception:
+                pass
+            # --- /DRY_RUN_AUTOSKIP_SLEEP_V1 ---
+
             return 0
 
         try:

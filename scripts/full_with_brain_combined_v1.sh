@@ -70,7 +70,15 @@ PY
 
 # --- core env ---
 export MODE=FULL
-export READY_FILE="${READY_COMBINED_FILE}"
+if [ -n "${READY_FILE:-}" ] && [ -s "${READY_FILE}" ]; then
+  echo "[READY] external READY_FILE=${READY_FILE}"
+else
+  if [ -n "${READY_FILE:-}" ] && [ -s "${READY_FILE}" ]; then
+  echo "[READY] external READY_FILE=${READY_FILE}"
+else
+  export READY_FILE="${READY_COMBINED_FILE}"
+fi
+fi
 
 # IMPORTANT: union labels (PUMP+SAFE)
 export STRICT_ONLY="${STRICT_ONLY:-1}"

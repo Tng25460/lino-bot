@@ -1,6 +1,346 @@
 import os, json, time, sqlite3, statistics
 from typing import Dict, Any, List, Tuple, Optional
 import os
+import json
+import time
+
+
+# --- BRAIN_HIST_GOOD_LOADER_V1 ---
+def _hist_good_boost_map(db_path: str):
+    """Return {mint: (n_closed, avg_pnl, last_close_ts)} from brain sqlite mint_hist."""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        for mint, n_closed, avg_pnl, last_ts in cur.execute(
+            "SELECT mint, n_closed, avg_pnl, last_close_ts FROM mint_hist"
+        ):
+            m = str(mint).strip()
+            if not m:
+                continue
+            out[m] = (int(n_closed or 0), float(avg_pnl or 0.0), int(last_ts or 0))
+    except Exception:
+        return {}
+    try:
+        con.close()
+    except Exception:
+        pass
+    return out
+# --- /BRAIN_HIST_GOOD_LOADER_V1 ---
+
+# --- BRAIN_HIST_GOOD_BOOST_V1 ---
+def _hist_good_lookup(mint: str):
+    """
+    Return (n_closed:int, avg_pnl:float) for mint from brain.sqlite.
+    Cached per-process (loads map once).
+    """
+    import os
+    import sqlite3
+    from functools import lru_cache
+
+    db_path = os.getenv("BRAIN_DB_PATH", "state/brain.sqlite")
+
+    @lru_cache(maxsize=1)
+    def _load_map(_db_path: str):
+        out = {}
+        try:
+            con = sqlite3.connect(_db_path)
+            cur = con.cursor()
+            for m, n_closed, avg_pnl in cur.execute("SELECT mint, n_closed, avg_pnl FROM mint_hist"):
+                mm = (m or "").strip()
+                if not mm:
+                    continue
+                try:
+                    n = int(n_closed or 0)
+                except Exception:
+                    n = 0
+                try:
+                    ap = float(avg_pnl or 0.0)
+                except Exception:
+                    ap = 0.0
+                out[mm] = (n, ap)
+            con.close()
+        except Exception:
+            return {}
+        return out
+
+    mm = (mint or "").strip()
+    if not mm:
+        return (0, 0.0)
+    d = _load_map(db_path)
+    return d.get(mm, (0, 0.0))
+# --- /BRAIN_HIST_GOOD_BOOST_V1 ---
+
+# --- BRAIN_RLSKIP_FILTER_V1 ---
+def _rl_skip_load(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _rl_skip_filter_mints(mints, rl_skip: dict, now_ts: int):
+    if not rl_skip:
+        return mints
+    out = []
+    for x in (mints or []):
+        m = ""
+        try:
+            if isinstance(x, str):
+                m = x.strip()
+            elif isinstance(x, dict):
+                m = (x.get("mint") or x.get("output_mint") or x.get("address") or "").strip()
+        except Exception:
+            m = ""
+        if not m:
+            out.append(x)
+            continue
+        try:
+            until = int(rl_skip.get(m, 0) or 0)
+        except Exception:
+            until = 0
+        if until > now_ts:
+            continue
+        out.append(x)
+    return out
+# --- /BRAIN_RLSKIP_FILTER_V1 ---
+
+
+# --- HIST_FROM_TRADES_V1 ---
+import math
+
+def _clamp(x, lo, hi):
+    try:
+        x = float(x)
+    except Exception:
+        return lo
+    return lo if x < lo else hi if x > hi else x
+
+def _ensure_mint_hist(brain_con):
+    brain_con.execute("""
+    CREATE TABLE IF NOT EXISTS mint_hist (
+        mint TEXT PRIMARY KEY,
+        n_closed INTEGER DEFAULT 0,
+        n_win INTEGER DEFAULT 0,
+        win_rate REAL DEFAULT 0.0,
+        avg_pnl REAL DEFAULT 0.0,
+        last_close_ts INTEGER DEFAULT 0
+    )
+    """)
+    brain_con.execute("CREATE INDEX IF NOT EXISTS idx_mint_hist_last_close_ts ON mint_hist(last_close_ts)")
+    try:
+        brain_con.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+
+# --- HIST_SCORE_V1 ---
+def _mint_hist_score(con, mint: str) -> float:
+    """
+    Returns a hist score in [0..2].
+      - 1.0 = neutral baseline if no history
+      - >1.0 boosts mints with good history
+      - <1.0 penalizes mints with bad history
+    Uses mint_hist(n_closed, win_rate, avg_pnl).
+    """
+    try:
+        mint = str(mint or "").strip()
+        if not mint:
+            return 1.0
+        row = con.execute(
+            "SELECT n_closed, win_rate, avg_pnl FROM mint_hist WHERE mint=?",
+            (mint,),
+        ).fetchone()
+        if not row:
+            return 1.0
+
+        n_closed = int(row[0] or 0)
+        win_rate = float(row[1] or 0.0)
+        avg_pnl = float(row[2] or 0.0)
+
+        # confidence grows with samples
+        conf = min(1.0, max(0.0, n_closed / 5.0))  # 0..1
+
+        # clamp avg_pnl to avoid insane numbers (your stop_price/max_price fallback can be huge)
+        perf = max(-1.0, min(1.0, avg_pnl))  # -1..+1
+
+        # win rate centered at 0.5 -> [-1..+1]
+        wr = max(0.0, min(1.0, win_rate))
+        win_adj = (wr - 0.5) * 2.0  # -1..+1
+
+        # combine (slightly more weight on win_rate)
+        delta = 0.6 * win_adj + 0.4 * perf  # -1..+1
+        score = 1.0 + conf * delta
+        # --- BRAIN_HIST_GOOD_BOOST_V1 apply ---
+        _hist_dbg = (os.getenv("HIST_GOOD_DEBUG","0") == "1")
+        # --- BRAIN_HIST_GOOD_MAPFIX_V2 ---
+        try:
+            if not globals().get('_HIST_GOOD_MAP_CACHED'):
+                globals()['_HIST_GOOD_MAP_CACHED'] = True
+                globals()['_hist_good_map_cache'] = _hist_good_boost_map(os.getenv('BRAIN_DB_PATH','state/brain.sqlite'))
+                _hm = globals().get('_hist_good_map_cache') or {}
+                _ks = list(_hm.keys())[:5] if isinstance(_hm, dict) else []
+                if _hist_dbg:
+                    print(f"🟣 HIST_GOOD map_size={len(_hm) if isinstance(_hm, dict) else -1} sample={_ks}", flush=True)
+        except Exception as _e:
+            globals()['_hist_good_map_cache'] = {}
+            print(f"🟣 HIST_GOOD map_build_error={_e}", flush=True)
+        _hist_map = globals().get('_hist_good_map_cache') or {}
+        # --- /BRAIN_HIST_GOOD_MAPFIX_V2 ---
+
+
+
+        try:
+            _m = ""
+            # try common local names first
+            for _k in ("mint","output_mint","outputMint","address","out_mint"):
+                try:
+                    _v = locals().get(_k, "")
+                    if isinstance(_v, str) and _v.strip():
+                        _m = _v.strip()
+                        break
+                except Exception:
+                    pass
+            if _m:
+                _n, _ap = _hist_good_lookup(_m)
+                _min_n = int(float(os.getenv("HIST_GOOD_MIN_N", "2") or 2))
+                _t1 = float(os.getenv("HIST_GOOD_AVG_PNL_MIN_1", "0.10") or 0.10)
+                _t2 = float(os.getenv("HIST_GOOD_AVG_PNL_MIN_2", "0.25") or 0.25)
+                _b1 = float(os.getenv("HIST_GOOD_BOOST_1", "0.15") or 0.15)
+                _b2 = float(os.getenv("HIST_GOOD_BOOST_2", "0.30") or 0.30)
+                _boost = 0.0
+                if _n >= _min_n and _ap >= _t2:
+                    _boost = _b2
+                elif _n >= _min_n and _ap >= _t1:
+                    _boost = _b1
+                if _boost:
+                    score += _boost
+
+
+                    if _hist_dbg:
+                        print(f"🟢 HIST_GOOD boost mint={_m} n={_n} avg={_ap:.4f} +{_boost} -> score={score:.4f}", flush=True)
+        except Exception:
+            pass
+        # --- /BRAIN_HIST_GOOD_BOOST_V1 apply ---
+
+
+        # clamp to [0..2]
+        if score < 0.0:
+            score = 0.0
+        elif score > 2.0:
+            score = 2.0
+        return float(score)
+    except Exception:
+        return 1.0
+# --- /HIST_SCORE_V1 ---
+# --- HIST_SCORE_WIRED_V1 ---
+
+
+def _import_trades_into_brain(brain_con, trades_path="state/trades.sqlite", max_rows=5000):
+    import sqlite3, os
+    if not trades_path or (not os.path.exists(trades_path)):
+        return 0
+    _ensure_mint_hist(brain_con)
+
+    tcon = sqlite3.connect(trades_path, timeout=5.0)
+    tcur = tcon.cursor()
+
+    # positions table is the best source for closes
+    cols = [r[1] for r in tcur.execute("pragma table_info(positions)").fetchall()]
+    need = {"mint","entry_price","close_price","close_ts","status"}
+    if not need.issubset(set(cols)):
+        tcon.close()
+        return 0
+
+    rows = tcur.execute("""
+        SELECT mint, entry_price, close_price, close_ts
+        FROM positions
+        WHERE close_ts IS NOT NULL AND CAST(close_ts AS INTEGER) > 0
+          AND COALESCE(status,'') != 'open'
+        ORDER BY CAST(close_ts AS INTEGER) DESC
+        LIMIT ?
+    """, (int(max_rows),)).fetchall()
+    tcon.close()
+
+    if not rows:
+        return 0
+
+    agg = {}  # mint -> [n, nwin, sum_pnl, last_ts]
+    for mint, entry, close, cts in rows:
+        mint = (mint or "").strip()
+        if not mint:
+            continue
+        try:
+            entry = float(entry or 0.0)
+            close = float(close or 0.0)
+            cts = int(cts or 0)
+        except Exception:
+            continue
+        if entry <= 0 or close <= 0 or cts <= 0:
+            continue
+        pnl = (close - entry) / entry  # pct as ratio
+        n, nwin, sump, last = agg.get(mint, (0,0,0.0,0))
+        n += 1
+        if pnl > 0:
+            nwin += 1
+        sump += pnl
+        if cts > last:
+            last = cts
+        agg[mint] = (n, nwin, sump, last)
+
+    for mint, (n, nwin, sump, last) in agg.items():
+        win_rate = (nwin / n) if n else 0.0
+        avg_pnl = (sump / n) if n else 0.0
+        brain_con.execute("""
+            INSERT INTO mint_hist(mint,n_closed,n_win,win_rate,avg_pnl,last_close_ts)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(mint) DO UPDATE SET
+              n_closed=excluded.n_closed,
+              n_win=excluded.n_win,
+              win_rate=excluded.win_rate,
+              avg_pnl=excluded.avg_pnl,
+              last_close_ts=excluded.last_close_ts
+        """, (mint, int(n), int(nwin), float(win_rate), float(avg_pnl), int(last)))
+    return len(agg)
+
+def _hist_score(brain_con, mint: str) -> float:
+    """
+    Map history -> [0..2]
+    - win_rate matters
+    - avg_pnl matters (capped)
+    - confidence grows with number of closes
+    """
+    mint = (mint or "").strip()
+    if not mint:
+        return 0.0
+    try:
+        row = brain_con.execute("SELECT n_closed, win_rate, avg_pnl FROM mint_hist WHERE mint=?", (mint,)).fetchone()
+    except Exception:
+        return 0.0
+    if not row:
+        return 0.0
+    n_closed, win_rate, avg_pnl = row
+    try:
+        n_closed = int(n_closed or 0)
+        win_rate = float(win_rate or 0.0)
+        avg_pnl = float(avg_pnl or 0.0)
+    except Exception:
+        return 0.0
+
+    # confidence: 0..1 (>=5 closes ~ full)
+    conf = _clamp(math.sqrt(max(n_closed,0)/5.0), 0.0, 1.0)
+
+    # win part: 0..2
+    win_part = _clamp(win_rate * 2.0, 0.0, 2.0)
+
+    # pnl part: normalize avg_pnl (ratio) around [-0.2..+0.2] -> [0..2]
+    pnl_part = _clamp((avg_pnl + 0.2) / 0.2, 0.0, 2.0)
+
+    # blend then apply confidence
+    base = 0.65 * win_part + 0.35 * pnl_part
+    return float(_clamp(base * conf, 0.0, 2.0))
+# --- /HIST_FROM_TRADES_V1 ---
 
 # skip_mints split (trader vs brain)
 BRAIN_SKIP_MINTS_FILE = os.getenv('BRAIN_SKIP_MINTS_FILE') or os.getenv('SKIP_MINTS_FILE') or 'state/skip_mints_brain.txt'
@@ -85,11 +425,42 @@ def _load_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 def _pick_ready_input() -> str:
-    if os.path.exists(READY_IN) and os.path.getsize(READY_IN) > 0:
-        return READY_IN
-    if os.path.exists(READY_FALLBACK) and os.path.getsize(READY_FALLBACK) > 0:
-        return READY_FALLBACK
-    return READY_IN
+    """
+    Pick ready input file.
+    Priority:
+      1) env READY_FILE if exists and non-empty
+      2) state/ready_tradable.jsonl
+      3) state/ready_scored.jsonl
+      4) state/observed.jsonl
+      5) ready_to_trade.jsonl
+      6) state/ready_pump_early.jsonl
+    """
+    import os
+    from pathlib import Path
+
+    cands = []
+
+    rf = (os.environ.get("READY_FILE") or "").strip()
+    if rf:
+        cands.append(rf)
+
+    cands += [
+        "state/ready_tradable.jsonl",
+        "state/ready_scored.jsonl",
+        "state/observed.jsonl",
+        "ready_to_trade.jsonl",
+        "state/ready_pump_early.jsonl",
+    ]
+
+    for fp in cands:
+        try:
+            if fp and Path(fp).is_file() and Path(fp).stat().st_size > 0:
+                return fp
+        except Exception:
+            pass
+
+    return "state/ready_scored.jsonl"
+
 
 def _fetch_positions_like(con: sqlite3.Connection) -> Tuple[str, List[str]]:
     cur=con.cursor()
@@ -428,6 +799,13 @@ def _brain_history_score(db_path: str, mint: str) -> tuple:
 
     try:
         con = sqlite3.connect(db_path, timeout=2.0)
+        # --- HIST_RUNONCE_HOOK_V1 ---
+        try:
+            _ensure_mint_hist(con)
+        except Exception as _e:
+            print("hist ensure failed:", _e)
+        # --- /HIST_RUNONCE_HOOK_V1 ---
+
         row = con.execute(
             "select usd_net, n_events from token_stats where token_address=?",
             (mint,)
@@ -483,13 +861,136 @@ def _brain_is_stable_like(o: dict) -> bool:
         return False
     return False
 def run_once(note: str = "brain_loop"):
+    # --- HIST_FROM_TRADES_V1 (run_once hook) ---
+    try:
+        _brain_path = str(locals().get('db_path') or os.getenv('BRAIN_DB_PATH','state/brain.sqlite')).strip()
+        _trades_path = str(os.getenv('TRADES_DB_PATH','state/trades.sqlite')).strip()
+        _max_rows = int(os.getenv('HIST_MAX_ROWS','8000'))
+        _hist_every_s = float(os.getenv('HIST_IMPORT_EVERY_S','15') or 15.0)
+        _now = time.time()
+        _last = float(getattr(run_once, '_last_hist_import_ts', 0.0) or 0.0)
+
+        if _now - _last >= _hist_every_s:
+            setattr(run_once, '_last_hist_import_ts', _now)
+
+            if os.path.exists(_trades_path):
+                tcon = sqlite3.connect(_trades_path, timeout=5.0)
+                tcur = tcon.cursor()
+
+                try:
+                    pos_rows = tcur.execute(
+                        """
+                        select mint, entry_price, close_price, max_price,
+                               stop_price, close_ts, close_reason, status
+                        from positions
+                        where (close_ts is not null
+                               or upper(coalesce(status,''))='CLOSED')
+                        order by coalesce(close_ts,0) desc
+                        limit ?
+                        """,
+                        (_max_rows,)
+                    ).fetchall()
+                except Exception:
+                    pos_rows = []
+
+                agg = dict()
+
+                for row in pos_rows:
+                    mint, entry, closep, maxp, stopp, cts, reason, status = row
+                    if not mint or not cts:
+                        continue
+
+                    entry = float(entry or 0.0)
+                    closep = float(closep or 0.0)
+                    rs = str(reason or '').lower()
+
+                    pnl = None
+
+                    if entry > 0 and closep > 0:
+                        pnl = (closep/entry) - 1.0
+
+                    if pnl is None:
+                        if 'hard_sl' in rs:
+                            pnl = -0.35
+                        elif 'trailing' in rs:
+                            pnl = 0.10
+                        elif 'time_stop' in rs:
+                            pnl = -0.05
+                        elif 'dust' in rs:
+                            pnl = -0.02
+                        elif 'resync' in rs:
+                            pnl = -0.02
+                        else:
+                            pnl = 0.0
+
+                    pnl = max(-0.9, min(2.0, pnl))
+
+                    n_closed, n_win, sum_score, last_ts = agg.get(mint, (0,0,0.0,0))
+                    n_closed += 1
+                    if pnl > 0:
+                        n_win += 1
+                    sum_score += pnl
+                    last_ts = max(int(cts), int(last_ts))
+
+                    agg[mint] = (n_closed, n_win, sum_score, last_ts)
+
+                tcon.close()
+
+                bcon = sqlite3.connect(_brain_path, timeout=2.0)
+                try:
+                    _ensure_mint_hist(bcon)
+                except Exception:
+                    pass
+
+                up = 0
+                for mint,(n_closed,n_win,sum_score,last_ts) in agg.items():
+                    win_rate = (float(n_win)/float(n_closed)) if n_closed>0 else 0.0
+                    avg_pnl = (float(sum_score)/float(n_closed)) if n_closed>0 else 0.0
+
+                    bcon.execute(
+                        """
+                        INSERT OR REPLACE INTO mint_hist
+                        (mint,n_closed,n_win,win_rate,avg_pnl,last_close_ts)
+                        VALUES(?,?,?,?,?,?)
+                        """,
+                        (mint,int(n_closed),int(n_win),
+                         float(win_rate),float(avg_pnl),int(last_ts))
+                    )
+                    up += 1
+
+                bcon.commit()
+                bcon.close()
+
+                print("hist_import: pos_rows=%d used=%d mints=%d upsert=%d brain=%s trades=%s" % (
+                    len(pos_rows), len(agg), len(agg), up, _brain_path, _trades_path
+                ), flush=True)
+
+    except Exception as _e:
+        print("hist_import failed:", _e, flush=True)
+    # --- /HIST_FROM_TRADES_V1 (run_once hook) ---
+
     _ensure_brain_db()
     brain=_connect(BRAIN_DB)
 
     # mark run
-    brain.execute("INSERT INTO brain_runs(ts,note) VALUES (?,?)", (int(time.time()), note))
+    # --- brain_runs schema compat ---
+    try:
+        import os as _os
+        _cols = [r[1] for r in brain.execute("PRAGMA table_info(brain_runs)").fetchall()]
+        _now = int(time.time())
+        if ("ts" in _cols) and ("note" in _cols):
+            brain.execute("INSERT INTO brain_runs(ts,note) VALUES (?,?)", (_now, note))
+        elif ("ts_start" in _cols) and ("notes" in _cols):
+            _mode = _os.environ.get("BRAIN_MODE", "loop")
+            brain.execute("INSERT INTO brain_runs(ts_start,mode,notes) VALUES (?,?,?)", (_now, _mode, note))
+        elif ("notes" in _cols):
+            brain.execute("INSERT INTO brain_runs(notes) VALUES (?)", (note,))
+        else:
+            pass
+    except Exception:
+        pass
+    # --- end schema compat ---
     brain.commit()
-
     # update stats from trades
     stats=_compute_stats_from_trades()
     if stats:
@@ -508,11 +1009,35 @@ def run_once(note: str = "brain_loop"):
 
         mkt=_score_market(o)
         flow=_score_flow(o)
-        hist=_score_history(_get_history(brain, mint))
+        hist = _mint_hist_score(brain, mint)  # HIST_WIRE_MINT_HIST_V1
+
+        # --- HIST_METRICS_V1 ---
+        hist_n = 0
+        hist_wr = 0.0
+        hist_avg = 0.0
+        try:
+            _r = brain.execute("SELECT n_closed, win_rate, avg_pnl FROM mint_hist WHERE mint=?", (mint,)).fetchone()
+            if _r:
+                hist_n = int(_r[0] or 0)
+                hist_wr = float(_r[1] or 0.0)
+                hist_avg = float(_r[2] or 0.0)
+        except Exception:
+            pass
+        # penalize bad history (simple, safe)
+        try:
+            _min_n = int(os.getenv('HIST_BLOCK_MIN_N','2'))
+            _bad_avg = float(os.getenv('HIST_BLOCK_AVG_PNL','-0.10'))
+            _pen = float(os.getenv('HIST_BAD_PENALTY','0.25'))
+            if hist_n >= _min_n and hist_avg <= _bad_avg:
+                hist = max(0.0, hist - _pen)
+        except Exception:
+            pass
+        # --- /HIST_METRICS_V1 ---
 
         score = W_MARKET*mkt + W_FLOW*flow + W_HIST*hist
 
-        reason=f"mkt={mkt:.2f} flow={flow:.2f} hist={hist:.2f} w=({W_MARKET},{W_FLOW},{W_HIST})"
+        hist = _hist_score(brain, mint)
+        reason=f"mkt={mkt:.2f} flow={flow:.2f} hist={hist:.2f} hn={hist_n} hwr={hist_wr:.2f} havg={hist_avg:.2f} w=({W_MARKET},{W_FLOW},{W_HIST})"
 
         # upsert score
         brain.execute("""
@@ -614,6 +1139,21 @@ def run_once(note: str = "brain_loop"):
             w.write(json.dumps(x, ensure_ascii=False) + '\n')
 
     print(f"🧠 brain_loop: ready_in={ready_path} in={len(ready)} -> out={len(out)} file={READY_OUT}")
+
+    # --- BRAIN_RLSKIP_APPLY_V1 ---
+    try:
+        _rl_file = str(os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json") or "state/rl_skip_mints.json")
+        _now = int(time.time())
+        _d = _rl_skip_load(_rl_file)
+        _before = len(ready) if isinstance(ready, list) else -1
+        if isinstance(ready, list) and _before > 0 and _d:
+            ready = _rl_skip_filter_mints(ready, _d, _now)
+            _after = len(ready)
+            if _after != _before:
+                print(f"🧊 RL_SKIP filtered ready (brain): {_before}->{_after} file={_rl_file}", flush=True)
+    except Exception as _e:
+        print("rl_skip_filter_error(brain):", _e, flush=True)
+    # --- /BRAIN_RLSKIP_APPLY_V1 ---
     if out:
         print("🧠 top1:", out[0].get('mint'), "score=", out[0].get('brain_score'))
 
