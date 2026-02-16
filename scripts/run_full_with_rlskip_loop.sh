@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+
+maybe_build_reentry_ready() {
+  if [ "${REENTRY_HISTGOOD:-0}" = "1" ]; then
+    echo "[REENTRY] histgood enabled -> building ready_tradable_plus_histgood.jsonl"
+    ./.venv/bin/python scripts/make_ready_plus_histgood.py || true
+    if [ -s state/ready_tradable_plus_histgood.jsonl ]; then
+      export READY_FILE="state/ready_tradable_plus_histgood.jsonl"
+      echo "[REENTRY] READY_FILE switched -> $READY_FILE"
+    else
+      echo "[REENTRY] WARN: plus_histgood not created, keeping READY_FILE=$READY_FILE"
+    fi
+  fi
+}
+
 set -euo pipefail
 cd /home/tng25/lino_FINAL_20260203_182626
 
@@ -22,6 +36,7 @@ echo "[RL] initial sync+clean -> $RL_SKIP_FILE"
 ./.venv/bin/python scripts/rlskip_sync_from_brain.py || true
 ./.venv/bin/python scripts/rlskip_clean.py || true
 
+maybe_build_reentry_ready
 echo "[RUN] starting full_with_brain_external_ready_v1.sh in background"
 bash scripts/full_with_brain_external_ready_v1.sh &
 RUNPID=$!
