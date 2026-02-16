@@ -22,6 +22,22 @@ export SKIP_MINTS_FILE="${SKIP_MINTS_FILE:-state/skip_mints_trader.txt}"
 export BRAIN_DB_PATH="${BRAIN_DB_PATH:-state/brain.sqlite}"
 export RL_SKIP_FILE="${RL_SKIP_FILE:-state/rl_skip_mints.json}"
 
+# --- SKIP runtime rotation (avoid permanent self-blacklist) ---
+export HARD_SKIP_MINTS_FILE="${HARD_SKIP_MINTS_FILE:-state/hard_skip_mints.txt}"
+export SKIP_MINTS_RUNTIME="${SKIP_MINTS_RUNTIME:-state/skip_mints_runtime.txt}"
+
+# default: use runtime skip file (keeps hard skip separate)
+export SKIP_MINTS_FILE="$SKIP_MINTS_RUNTIME"
+
+# if REENTRY_HISTGOOD=1, start with fresh runtime file each boot
+if [ "${REENTRY_HISTGOOD:-0}" = "1" ]; then
+  : > "$SKIP_MINTS_RUNTIME" || true
+  echo "[REENTRY] reset runtime skip file -> $SKIP_MINTS_RUNTIME"
+fi
+# --- end SKIP runtime rotation ---
+
+
+
 export HIST_SKIP_MIN_N="${HIST_SKIP_MIN_N:-1}"
 export HIST_SKIP_AVG_PNL_MAX="${HIST_SKIP_AVG_PNL_MAX:--0.10}"
 export HIST_SKIP_SEC="${HIST_SKIP_SEC:-3600}"
