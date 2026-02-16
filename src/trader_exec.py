@@ -1102,6 +1102,53 @@ def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
         raise RuntimeError(f"sendTransaction no result: {j}")
     return str(res)
 
+def _row_mint(row: dict) -> str:
+    if not isinstance(row, dict):
+        return ""
+    for k in ("mint","output_mint","token","address","tokenAddress","baseMint","quoteMint"):
+        v = row.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+def _load_skip_set(path: str) -> set:
+    try:
+        txt = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return set()
+    out = set()
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.add(line)
+    return out
+
+def _load_rlskip_set(path: str, now: int) -> set:
+    try:
+        import json
+        obj = json.loads(Path(path).read_text(encoding="utf-8", errors="ignore") or "{}")
+    except Exception:
+        return set()
+    out = set()
+    # format attendu: {mint: {"until": <ts>, ...}, ...}
+    if isinstance(obj, dict):
+        for mint, meta in obj.items():
+            if not isinstance(mint, str) or not mint:
+                continue
+            until = None
+            if isinstance(meta, dict):
+                until = meta.get("until") or meta.get("until_ts")
+            try:
+                until = int(until) if until is not None else None
+            except Exception:
+                until = None
+            if until is None or until > now:
+                out.add(mint)
+    return out
+
+
+
 
 def main() -> int:
     if not WALLET_PUBKEY:
@@ -1185,6 +1232,35 @@ def main() -> int:
     except Exception as _e:
         print('rl_skip_filter_error:', _e, flush=True)
     # --- /TRADER_RLSKIP_APPLY_V4 ---
+
+    # --- READY runtime filter (skip_file + rl_skip) ---
+    try:
+        _now = int(time.time())
+    except Exception:
+        _now = 0
+    _skip_file = os.getenv("SKIP_MINTS_FILE", "state/skip_mints_trader.txt")
+    _rl_file   = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
+    _skip_set = _load_skip_set(_skip_file)
+    _rl_set   = _load_rlskip_set(_rl_file, _now)
+    if _skip_set or _rl_set:
+        _in = len(ready)
+        def _ok_row(r):
+            m = _row_mint(r)
+            if not m:
+                return False
+            if m in _skip_set:
+                return False
+            if m in _rl_set:
+                return False
+            return True
+        ready = [r for r in ready if _ok_row(r)]
+        _out = len(ready)
+        if _out != _in:
+            print(f"🧊 RL_SKIP filtered ready (exec): in={_in} -> out={_out} skip={len(_skip_set)} rl={len(_rl_set)}")
+        if _out <= 0:
+            print("⛔ no candidates after ready filter -> exit rc=0")
+            return 0
+    # --- end READY runtime filter ---
     print("   ready_count=", len(ready))
 
     if not ready:
