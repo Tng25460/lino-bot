@@ -166,7 +166,7 @@ def upsert_open_position(
 ) -> None:
     ts = now_ts() if ts is None else int(ts)
     # ensure exists
-    row = db.one("SELECT id FROM positions WHERE wallet=? AND mint=? AND status='OPEN' LIMIT 1", (wallet, mint))
+    row = db.one("SELECT id FROM positions WHERE wallet=? AND mint=? AND LOWER(status)='open' LIMIT 1", (wallet, mint))
     if row:
         db.exec(
             """
@@ -205,7 +205,7 @@ def close_position(
         """
         UPDATE positions
         SET status='CLOSED', close_price_usd=?, close_ts=?, close_reason=?
-        WHERE wallet=? AND mint=? AND status='OPEN'
+        WHERE wallet=? AND mint=? AND LOWER(status)='open'
         """,
         (close_price_usd, ts, reason, wallet, mint),
     )

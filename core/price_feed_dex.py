@@ -13,18 +13,54 @@ class DexScreenerPriceFeed:
         self.s = requests.Session()
 
     def get_price(self, mint: str) -> Optional[float]:
+
+        # Delegate to Jupiter-style quote logic for stable SOL/token pricing
+
         try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            r = self.s.get(url, timeout=DEX_TIMEOUT)
-            if r.status_code != 200:
+
+            import os, json, urllib.request
+
+            SOL = "So11111111111111111111111111111111111111112"
+
+            rpc_url = os.getenv("SOLANA_RPC_HTTP") or os.getenv("RPC_HTTP") or "https://api.mainnet-beta.solana.com"
+
+            jup_base = (os.getenv("JUP_BASE_URL") or "https://lite-api.jup.ag").rstrip("/")
+
+            qurl = jup_base + "/swap/v1/quote"
+
+            tokens_q = float(os.getenv("PRICE_QUOTE_TOKENS", "10000") or "10000")
+
+            if tokens_q < 1:
+
+                tokens_q = 1.0
+
+
+            body = json.dumps({"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":[mint,{"commitment":"processed"}]}).encode()
+
+            req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type":"application/json"})
+
+            resp = json.loads(urllib.request.urlopen(req, timeout=20).read())
+
+            dec = int(resp["result"]["value"]["decimals"])
+
+            amt = int(tokens_q * (10**dec))
+
+
+            url = f"{qurl}?inputMint={mint}&outputMint={SOL}&amount={amt}&slippageBps=50"
+
+            q = json.loads(urllib.request.urlopen(url, timeout=20).read())
+
+            out_lamports = int(q.get("outAmount") or 0)
+
+            if out_lamports <= 0:
+
                 return None
-            j = r.json()
-            pairs = j.get("pairs") or []
-            if not pairs:
-                return None
-            # prendre le meilleur pair par liquidité USD
-            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0))
-            px = best.get("priceUsd")
-            return float(px) if px else None
+
+            sol_out = out_lamports / 1e9
+
+            return float(sol_out / tokens_q)
+
         except Exception:
+
             return None
+

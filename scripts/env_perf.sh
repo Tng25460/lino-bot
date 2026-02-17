@@ -35,3 +35,5 @@ export RPC_HTTP_READ="${RPC_HTTP_READ:-https://api.mainnet-beta.solana.com,https
 
 echo "✅ env_perf loaded"
 env | grep -E '^(JUP_|RPC_HTTP_)' | sort
+export TIME_STOP_MIN_PNL="${TIME_STOP_MIN_PNL:-0.05}"
+export TIME_STOP_SEC="${TIME_STOP_SEC:-900}"

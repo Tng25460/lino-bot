@@ -46,7 +46,7 @@ class PositionsDBAdapter:
         try:
             cur = con.cursor()
             rows = cur.execute(
-                "SELECT * FROM positions WHERE status='OPEN'"
+                "SELECT * FROM positions WHERE LOWER(status)='open'"
             ).fetchall()
             out = [dict(r) for r in rows]
         finally:
@@ -118,55 +118,66 @@ class PositionsDBAdapter:
         finally:
             con.close()
     def close_position(self, mint: str, *args, **kwargs) -> None:
-        reason = kwargs.get("reason") or kwargs.get("close_reason") or "closed"
-        close_ts = kwargs.get("close_ts")
-        close_price = kwargs.get("close_price_usd") or kwargs.get("close_price")
+        """Close a position in a schema-compatible way.
 
-        if args:
-            if len(args) == 1:
-                if isinstance(args[0], (int, float)):
-                    close_ts = int(args[0])
-                else:
-                    reason = str(args[0])
-            else:
-                if isinstance(args[0], (int, float)):
-                    close_ts = int(args[0])
-                    reason = str(args[1])
-                    if len(args) >= 3:
-                        close_price = args[2]
-                else:
-                    reason = str(args[0])
-                    close_price = args[1]
+        Supported call styles found in the repo history:
+          - close_position(mint, reason="...")
+          - close_position(mint, close_reason="...")
+          - close_position(mint, now, "reason", close_price)
+        We normalize and then update:
+          close_ts, close_reason, close_price (optional), status='closed' (if column exists)
+        Only affects rows that are still open ((close_ts IS NULL OR close_ts=0)).
+        """
+        import time, sqlite3
 
-        if close_ts is None:
-            close_ts = int(time.time())
-        else:
+        # --- normalize inputs ---
+        now = None
+        close_reason = None
+        close_price = None
+
+        if len(args) >= 1 and isinstance(args[0], (int, float)):
+            now = int(args[0])
+        if len(args) >= 2 and isinstance(args[1], str):
+            close_reason = args[1]
+        if len(args) >= 3 and isinstance(args[2], (int, float)):
+            close_price = float(args[2])
+
+        close_reason = kwargs.get("close_reason", kwargs.get("reason", close_reason))
+        if "close_price" in kwargs:
             try:
-                close_ts = int(close_ts)
+                close_price = float(kwargs["close_price"])
             except Exception:
-                close_ts = int(time.time())
+                pass
+        if now is None:
+            now = int(time.time())
+        if close_reason is None:
+            close_reason = "closed"
 
-        cols = self._cols()
-        sets = ["status='CLOSED'", "close_ts=?", "close_reason=?"]
-        vals = [close_ts, str(reason)]
-
-        ccol = self._close_col(cols)
-        if ccol:
-            sets.insert(1, f"{ccol}=?")
-            try:
-                vals.insert(0, float(close_price) if close_price is not None else None)
-            except Exception:
-                vals.insert(0, None)
-
-        vals.append(mint)
-
-        con = self._con()
+        con = sqlite3.connect(self.db_path)
         try:
+            con.row_factory = sqlite3.Row
             cur = con.cursor()
-            cur.execute(
-                "UPDATE positions SET " + ", ".join(sets) + " WHERE mint=? AND status='OPEN'",
-                vals
-            )
+
+            cols = [r["name"] for r in cur.execute("PRAGMA table_info(positions)")]
+            has_status = "status" in cols
+            has_close_price = "close_price" in cols
+
+            sets = ["close_ts = ?", "close_reason = ?"]
+            params = [int(now), str(close_reason)]
+
+            if has_close_price:
+                # allow NULL if not provided
+                sets.append("close_price = ?")
+                params.append(None if close_price is None else float(close_price))
+
+            if has_status:
+                sets.append("status='closed'")
+
+            params.append(str(mint))
+
+            q = f"UPDATE positions SET {', '.join(sets)} WHERE mint = ? AND (close_ts IS NULL OR close_ts=0)"
+            cur.execute(q, params)
             con.commit()
         finally:
             con.close()
+

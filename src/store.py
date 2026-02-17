@@ -209,7 +209,7 @@ class _SellMixin:
         con = _connect(self.db_path)
         _ensure_positions_table(con)
         cur = con.cursor()
-        cur.execute("SELECT mint,entry_price,entry_ts,size_sol,peak_price,tp_done,status,meta_json FROM positions WHERE status='OPEN'")
+        cur.execute("SELECT mint,entry_price,entry_ts,size_sol,peak_price,tp_done,status,meta_json FROM positions WHERE LOWER(status)='open'")
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
         out = []
@@ -274,8 +274,7 @@ class __PositionMixin:
               entry_price=excluded.entry_price,
               entry_ts=excluded.entry_ts,
               size_sol=excluded.size_sol,
-              peak_price=COALESCE(positions.peak_price, excluded.peak_price),
-              status='OPEN',
+              peak_price=COALESCE(positions.peak_price, excluded.peak_price), status='open' ,
               meta_json=excluded.meta_json
             """,
             (mint, float(entry_price), int(entry_ts), float(size_sol), float(entry_price), meta_json),

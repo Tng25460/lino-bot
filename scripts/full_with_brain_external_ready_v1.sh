@@ -3,7 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 # load perf/env if present
-[ -f scripts/env_perf.sh ] && source scripts/env_perf.sh || true
+source scripts/env_perf.sh || true
+[[ -f state/env_override.sh ]] && source state/env_override.sh
 
 # REQUIRED: READY_FILE must exist and be non-empty
 : "${READY_FILE:?export READY_FILE=state/ready_tradable.jsonl}"

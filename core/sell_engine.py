@@ -60,6 +60,14 @@ class SellEngine:
         # 429 rate-limit handling (Jupiter lite-api)
         self.SELL_429_COOLDOWN_SEC = int(os.getenv("SELL_429_COOLDOWN_SEC", "90"))
         self.SELL_ROUTE_FAIL_COOLDOWN_SEC = int(os.getenv("SELL_ROUTE_FAIL_COOLDOWN_SEC", "2700"))  # 45min
+        # --- runtime cooldown state (required by some paths, incl. simulate-bypass) ---
+        # _global_cooldown: unix timestamp until which sells are globally blocked
+        # _mint_cooldown: dict mint->unix timestamp until which that mint is blocked
+        self._global_cooldown = float(getattr(self, "_global_cooldown", 0.0) or 0.0)
+        # keep one single dict: alias _mint_cooldown to existing _mint_cooldowns (plural) if present
+        if not hasattr(self, "_mint_cooldowns") or getattr(self, "_mint_cooldowns") is None:
+            self._mint_cooldowns = {}
+        self._mint_cooldown = self._mint_cooldowns
         self._mint_sell_cooldown_until = {}
         self.SELL_429_MAX_RETRY = int(os.getenv("SELL_429_MAX_RETRY", "2"))
         self.SELL_429_BACKOFF_SEC = int(os.getenv("SELL_429_BACKOFF_SEC", "20"))
@@ -175,6 +183,53 @@ class SellEngine:
         out = (proc.stdout or "")
         err = (proc.stderr or "")
         out_all = (out + "\n" + err).strip()
+
+        # --- rc-aware wrapper handling (sell_exec_wrap.py) ---
+        try:
+            rc = int(getattr(p, "returncode", -1))
+        except Exception:
+            rc = -1
+
+        if "__TOKEN_NOT_TRADABLE__" in (out_all or "") or rc == 45:
+            try:
+                print(f"[SELL] token_not_tradable -> close_position reason=token_not_tradable mint={mint}", flush=True)
+            except Exception:
+                pass
+            try:
+                # close in DB; treat as untradeable (like dust)
+                self.db.close_position(mint, close_reason="token_not_tradable")
+            except Exception:
+                try:
+                    # fallback legacy signature
+                    self.db.close_position(mint, reason="token_not_tradable")
+                except Exception:
+                    pass
+            return "__NOT_TRADABLE__"
+
+        if "__JUP_HTTP_429__" in (out_all or "") or rc == 44:
+            try:
+                print("[SELL] jup_http_429 -> global cooldown", flush=True)
+            except Exception:
+                pass
+            self._global_cooldown("sell_429")
+            return "__429__"
+
+        if "__ROUTE_FAIL__" in (out_all or "") or rc == 42:
+            try:
+                print(f"[SELL] route_fail -> mint cooldown mint={mint}", flush=True)
+            except Exception:
+                pass
+            self._mint_cooldown(mint, "sell_route_fail")
+            return "__ROUTE_FAIL__"
+
+        if "__JUP_INSUFFICIENT_FUNDS__" in (out_all or "") or rc == 43:
+            try:
+                print("[SELL] insufficient_funds -> global cooldown", flush=True)
+            except Exception:
+                pass
+            self._global_cooldown("sell_insufficient")
+            return "__INSUFFICIENT__"
+        # --- /rc-aware wrapper handling ---
         lo = out_all.lower()
         rc = int(getattr(proc, "returncode", 0) or 0)
 
@@ -202,6 +257,91 @@ class SellEngine:
 
         return "__FAIL__"
     def run_once(self):
+
+        ### FORCE_SELL_ALL_SIM_BYPASS_TOP_V1 ###
+        # If wrapper outcomes are simulated, bypass all price/on-chain checks and test cooldown logic safely.
+        _sim_map = os.getenv("SELL_WRAP_SIMULATE_MAP", "").strip()
+        _force = str(os.getenv("SELL_FORCE_ALL", "0")).lower() in ("1","true","yes","y")
+        if _force and _sim_map:
+            print("[SELL] FORCE_SELL_ALL simulate-bypass (TOP) enabled", flush=True)
+            # fetch open positions robustly across DB adapter variants
+            _positions = []
+            try:
+                if hasattr(self.db, "get_open_positions"):
+                    _positions = self.db.get_open_positions()
+                elif hasattr(self.db, "open_positions"):
+                    _positions = self.db.open_positions()
+                elif hasattr(self.db, "list_open_positions"):
+                    _positions = self.db.list_open_positions()
+                else:
+                    _positions = []
+            except Exception as _e:
+                print(f"[SELL] simulate-bypass: fetch positions failed err={_e}", flush=True)
+                _positions = []
+    
+            try:
+                _n = len(_positions)
+            except Exception:
+                _n = -1
+            print(f"[SELL] simulate-bypass: open_positions={_n}", flush=True)
+    
+            for _pos in (_positions or []):
+                try:
+                    if hasattr(_pos, "get"):
+                        _mint = _pos.get("mint")
+                        _qty  = _pos.get("qty_token", 0.0)
+                    else:
+                        _mint = _pos["mint"]
+                        _qty  = _pos.get("qty_token", 0.0) if hasattr(_pos, "get") else _pos[2] if len(_pos)>2 else 0.0
+                    try:
+                        _qty = float(_qty or 0.0)
+                    except Exception:
+                        _qty = 0.0
+                    if not _mint or _qty <= 0:
+                        continue
+                    print(f"🧨 FORCE_SELL_ALL(sim) mint={_mint} qty={_qty}", flush=True)
+    
+                    txsig = self._sell_exec(_mint, _qty, reason="force_sell_all")
+    
+                    if txsig == "__NOT_TRADABLE__":
+                        print(f"[SELL] token_not_tradable -> close_position reason=token_not_tradable mint={_mint}", flush=True)
+                        try:
+                            self.db.close_position(_mint, close_reason="token_not_tradable")
+                        except TypeError:
+                            self.db.close_position(_mint, reason="token_not_tradable")
+                        continue
+    
+                    if txsig == "__JUP_HTTP_429__":
+                        print(f"[SELL] http_429 -> mint cooldown {int(self.SELL_429_COOLDOWN_SEC)}s mint={_mint}", flush=True)
+                        try:
+                            self._rl_skip_add(_mint, int(self.SELL_429_COOLDOWN_SEC), reason="sell_http_429")
+                        except Exception as _e:
+                            print(f"[SELL] rl_skip_add failed (429) err={_e}", flush=True)
+                        continue
+    
+                    if txsig == "__INSUFFICIENT__":
+                        print(f"[SELL] insufficient -> mint cooldown {int(self.SELL_429_COOLDOWN_SEC)}s mint={_mint}", flush=True)
+                        try:
+                            self._rl_skip_add(_mint, int(self.SELL_429_COOLDOWN_SEC), reason="sell_insufficient")
+                        except Exception as _e:
+                            print(f"[SELL] rl_skip_add failed (insufficient) err={_e}", flush=True)
+                        continue
+    
+                    if txsig == "__ROUTE_FAIL__":
+                        print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={_mint}", flush=True)
+                        try:
+                            self._rl_skip_add(_mint, int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC), reason="sell_route_fail")
+                        except Exception as _e:
+                            print(f"[SELL] rl_skip_add failed (route_fail) err={_e}", flush=True)
+                        continue
+    
+                    print(f"[SELL] simulate-bypass: txsig={txsig} mint={_mint}", flush=True)
+                except Exception as _e:
+                    print(f"[SELL] simulate-bypass loop error={_e}", flush=True)
+                    continue
+            return
+        ### /FORCE_SELL_ALL_SIM_BYPASS_TOP_V1 ###
+
         only_mint = (os.getenv("SELL_ONLY_MINT", "") or "").strip()
         if only_mint:
             print("🧪 SELL_ONLY_MINT=", only_mint, flush=True)
@@ -225,9 +365,29 @@ class SellEngine:
 
         now = _time.time()
         positions = self.db.get_open_positions() or []
+        ### DBG_POS_LOOP_V3 ###
+        try:
+            _force = bool(getattr(self, "SELL_FORCE_ALL", False)) or (str(__import__("os").getenv("SELL_FORCE_ALL","0")).strip() in ("1","true","True"))
+            print(f"[DBG] fetched positions: n={len(positions)} SELL_FORCE_ALL={_force}", flush=True)
+        except Exception as _e:
+            print(f"[DBG] fetched positions: failed err={_e}", flush=True)
+
         print(f"💰 sell_engine: open_positions={len(positions)}", flush=True)
 
         for pos in positions:
+
+            try:
+
+                _m = pos.get('mint') if hasattr(pos, 'get') else getattr(pos, 'mint', None)
+
+                _q = pos.get('qty_token') if hasattr(pos, 'get') else getattr(pos, 'qty_token', None)
+
+                print(f"[DBG] loop item mint={_m} qty={_q}", flush=True)
+
+            except Exception as _e:
+
+                print(f"[DBG] loop item print failed err={_e}", flush=True)
+
             mint = str(pos.get("mint") or "")
             if not mint:
                 continue
@@ -268,6 +428,29 @@ class SellEngine:
         entry_ts = float(pos.get("entry_ts") or pos.get("opened_ts") or 0.0)
 
         price = float(self.price_feed.get_price(mint) or 0.0)
+        # sanity: if high-water is wildly off (e.g. after pricing fix), reset it
+        try:
+            _hw = float(pos.get("high_water") or pos.get("max_price") or 0.0)
+        except Exception:
+            _hw = 0.0
+        if price > 0 and _hw > 0 and _hw > price * 50.0:
+            print(f"🧯 HW_SANITY_RESET mint={mint} hw={_hw} price={price}", flush=True)
+            _hw = price
+            # best-effort persist (adapter may expose set_high_water / set_max_price)
+            try:
+                if hasattr(self.db, "set_high_water"):
+                    self.db.set_high_water(mint, _hw)
+                if hasattr(self.db, "set_max_price"):
+                    self.db.set_max_price(mint, _hw)
+            except Exception:
+                pass
+            # also update local dict if used later
+            try:
+                pos["high_water"] = _hw
+                pos["max_price"] = _hw
+            except Exception:
+                pass
+
         if price <= 0:
             return
 
@@ -301,6 +484,58 @@ class SellEngine:
         )
 
         # HARD SL (sell ALL)
+        # FORCE: sell ALL open positions regardless of pnl (test cleanup)
+        if os.getenv('SELL_FORCE_ALL', '0') == '1':
+            try:
+                print(f"🧨 FORCE_SELL_ALL mint={mint} qty={qty_total}", flush=True)
+            except Exception:
+                pass
+            if os.getenv('SELL_DRY_RUN', '0') == '1':
+                try:
+                    print('🧪 SELL_DRY_RUN=1 -> skip FORCE_SELL_ALL sell', flush=True)
+                except Exception:
+                    pass
+                return
+            txsig = self._sell_exec(mint, qty_total, 'force_sell_all')
+            if txsig == '__COOLDOWN__':
+                return
+            if txsig == '__DUST__':
+                print(f"[SELL] dust_untradeable -> close in DB mint={mint}", flush=True)
+                try:
+                    self.db.close_position(mint, close_reason='dust_untradeable', close_price=price)
+                except Exception:
+                    try:
+                        self.db.close_position(mint, reason='dust_untradeable')
+                    except Exception:
+                        pass
+                return
+            if not txsig:
+                return
+            print(f"✅ SOLD FORCE_ALL txsig={txsig}", flush=True)
+            # handle not-tradable marker from sell_exec_wrap
+            if txsig in ("__TOKEN_NOT_TRADABLE__", "__JUP_HTTP_400__"):
+                try:
+                    print(f"🧱 not_tradable -> close_position mint={mint}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    self.db.close_position(mint, close_reason="not_tradable")
+                except Exception as e:
+                    try:
+                        print(f"[WARN] close_position not_tradable failed: {e}", flush=True)
+                    except Exception:
+                        pass
+                return
+
+            try:
+                self.db.close_position(mint, close_reason='force_sell_all', close_price=price)
+            except Exception:
+                try:
+                    self.db.close_position(mint, reason='force_sell_all')
+                except Exception:
+                    pass
+            return
+
         if pnl <= self.HARD_SL_PCT:
             print(f"🔴 HARD_SL mint={mint} pnl={pnl:.2%}", flush=True)
             if os.getenv("SELL_DRY_RUN", "0") == "1":
@@ -325,6 +560,34 @@ class SellEngine:
                 return
             if txsig == "__ROUTE_FAIL__":
                 print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={mint}", flush=True)
+
+            if txsig == "__JUP_HTTP_429__":
+                try:
+                    print(f"[SELL] http_429 -> mint cooldown {int(self.SELL_429_COOLDOWN_SEC)}s mint={mint}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    self._rl_skip_add(mint, int(self.SELL_429_COOLDOWN_SEC), reason="sell_http_429")
+                except Exception:
+                    try:
+                        self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    except Exception:
+                        pass
+                return
+
+            if txsig == "__INSUFFICIENT__":
+                try:
+                    print(f"[SELL] insufficient -> mint cooldown {int(self.SELL_429_COOLDOWN_SEC)}s mint={mint}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    self._rl_skip_add(mint, int(self.SELL_429_COOLDOWN_SEC), reason="sell_insufficient")
+                except Exception:
+                    try:
+                        self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    except Exception:
+                        pass
+                return
                 try:
                     if hasattr(self, "_rl_skip_add"):
                         self._rl_skip_add(mint, int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC), reason="sell_route_fail")
@@ -361,7 +624,7 @@ class SellEngine:
                 return
             print(f"✅ SOLD HARD_SL txsig={txsig}", flush=True)
             try:
-                self.db.close_position(mint, reason="hard_sl")
+                self.db.close_position(mint, close_reason="hard_sl", close_price=price)
             except Exception:
                 pass
             return
@@ -389,7 +652,7 @@ class SellEngine:
                 return
             print(f"✅ SOLD TIME_STOP txsig={txsig}", flush=True)
             try:
-                self.db.close_position(mint, reason="time_stop")
+                self.db.close_position(mint, close_reason="time_stop", close_price=price)
             except Exception:
                 pass
             return
@@ -477,7 +740,7 @@ class SellEngine:
                 return
             print(f"✅ SOLD TRAIL txsig={txsig}", flush=True)
             try:
-                self.db.close_position(mint, reason="trailing_stop")
+                self.db.close_position(mint, close_reason="trailing_stop", close_price=price)
             except Exception:
                 pass
             return

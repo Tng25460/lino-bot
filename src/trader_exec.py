@@ -613,7 +613,7 @@ def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str=
             cols.append("high_water"); vals.append(float(price_usd or 0.0))
         cur.execute(f"INSERT INTO positions({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals)
     else:
-        cur.execute("UPDATE positions SET qty_token=?, status='OPEN' WHERE rowid=?", (float(q), pos[0]))
+        cur.execute("UPDATE positions SET qty_token=?, status='open' WHERE rowid=?", (float(q), pos[0]))
         # also set entry/high_water if missing and we have a price
         if float(price_usd or 0.0) > 0.0:
             sets = []
