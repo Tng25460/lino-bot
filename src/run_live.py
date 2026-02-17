@@ -1,4 +1,11 @@
 import os
+
+import signal
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except Exception:
+    pass
+
 # --- SELL_ONLY_SKIP_TRADER_LOOP_V1 ---
 _MODE = os.getenv("MODE", "").strip().upper()
 _SELL_ONLY = (_MODE == "SELL_ONLY")

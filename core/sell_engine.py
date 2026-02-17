@@ -63,11 +63,11 @@ class SellEngine:
         # --- runtime cooldown state (required by some paths, incl. simulate-bypass) ---
         # _global_cooldown: unix timestamp until which sells are globally blocked
         # _mint_cooldown: dict mint->unix timestamp until which that mint is blocked
-        self._global_cooldown = float(getattr(self, "_global_cooldown", 0.0) or 0.0)
+        self._global_cooldown_store = float(getattr(self, "_global_cooldown", 0.0) or 0.0)
         # keep one single dict: alias _mint_cooldown to existing _mint_cooldowns (plural) if present
         if not hasattr(self, "_mint_cooldowns") or getattr(self, "_mint_cooldowns") is None:
             self._mint_cooldowns = {}
-        self._mint_cooldown = self._mint_cooldowns
+        self._mint_cooldown_store = self._mint_cooldowns
         self._mint_sell_cooldown_until = {}
         self.SELL_429_MAX_RETRY = int(os.getenv("SELL_429_MAX_RETRY", "2"))
         self.SELL_429_BACKOFF_SEC = int(os.getenv("SELL_429_BACKOFF_SEC", "20"))
@@ -137,6 +137,115 @@ class SellEngine:
         return float(ui_db or 0.0)
 
 
+    def _rl_skip_add(self, mint: str, sec: int, reason: str = ""):
+
+
+        """Fallback RL-skip used by SELL cooldown paths.
+
+
+        Writes in-memory mint cooldown + state/rl_skip_mints.json best-effort.
+
+
+        """
+
+
+        try:
+
+
+            import time as _t
+
+
+            now = float(_t.time())
+
+
+            sec = int(sec or 0)
+
+
+            if sec < 0:
+
+
+                sec = 0
+
+
+            # in-memory cooldown
+
+
+            try:
+
+
+                d = getattr(self, "_mint_sell_cooldown_until", None)
+
+
+                if not isinstance(d, dict):
+
+
+                    d = {}
+
+
+                    setattr(self, "_mint_sell_cooldown_until", d)
+
+
+                d[str(mint)] = now + float(sec)
+
+
+            except Exception:
+
+
+                pass
+
+
+            # persist for debug
+
+
+            try:
+
+
+                import os, json
+
+
+                path = os.path.join("state", "rl_skip_mints.json")
+
+
+                os.makedirs("state", exist_ok=True)
+
+
+                try:
+
+
+                    obj = json.loads(open(path, "r", encoding="utf-8").read())
+
+
+                    if not isinstance(obj, dict):
+
+
+                        obj = {}
+
+
+                except Exception:
+
+
+                    obj = {}
+
+
+                obj[str(mint)] = {"until": now + float(sec), "reason": str(reason or ""), "ts": now}
+
+
+                open(path, "w", encoding="utf-8").write(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+            except Exception:
+
+
+                pass
+
+
+        except Exception:
+
+
+            return
+
+
+
     def _sell_exec(self, mint: str, ui_amount: float, reason: str) -> str:
         """Run src/sell_exec_wrap.py and return a marker or txsig."""
 
@@ -184,68 +293,108 @@ class SellEngine:
         err = (proc.stderr or "")
         out_all = (out + "\n" + err).strip()
 
-        # --- rc-aware wrapper handling (sell_exec_wrap.py) ---
-        try:
-            rc = int(getattr(p, "returncode", -1))
-        except Exception:
-            rc = -1
+        # --- unified rc/text marker handling (sell_exec_wrap.py) ---
 
+        lo = (out_all or "").lower()
+
+        rc = int(getattr(proc, "returncode", 0) or 0)
+# rc mapping (wrapper): 42=route_fail_0x1788, 43=insufficient_funds, 44=http_429, 45=token_not_tradable
         if "__TOKEN_NOT_TRADABLE__" in (out_all or "") or rc == 45:
+
             try:
+
                 print(f"[SELL] token_not_tradable -> close_position reason=token_not_tradable mint={mint}", flush=True)
+
             except Exception:
+
                 pass
+
             try:
-                # close in DB; treat as untradeable (like dust)
+
                 self.db.close_position(mint, close_reason="token_not_tradable")
+
             except Exception:
+
                 try:
-                    # fallback legacy signature
+
                     self.db.close_position(mint, reason="token_not_tradable")
+
                 except Exception:
+
                     pass
+
             return "__NOT_TRADABLE__"
 
-        if "__JUP_HTTP_429__" in (out_all or "") or rc == 44:
+
+        if rc == 44 or "__JUP_HTTP_429__" in (out_all or "") or "http=429" in lo or "too many requests" in lo:
+
             try:
+
                 print("[SELL] jup_http_429 -> global cooldown", flush=True)
-            except Exception:
-                pass
-            self._global_cooldown("sell_429")
-            return "__429__"
 
-        if "__ROUTE_FAIL__" in (out_all or "") or rc == 42:
+            except Exception:
+
+                pass
+
             try:
+
+                self._global_cooldown_add("sell_429")
+
+            except Exception:
+
+                pass
+
+            return "__JUP_HTTP_429__"
+
+
+        if rc == 42 or "__ROUTE_FAIL__" in (out_all or "") or "route_fail" in lo or "0x1788" in lo:
+
+            try:
+
                 print(f"[SELL] route_fail -> mint cooldown mint={mint}", flush=True)
-            except Exception:
-                pass
-            self._mint_cooldown(mint, "sell_route_fail")
-            return "__ROUTE_FAIL__"
 
-        if "__JUP_INSUFFICIENT_FUNDS__" in (out_all or "") or rc == 43:
+            except Exception:
+
+                pass
+
             try:
-                print("[SELL] insufficient_funds -> global cooldown", flush=True)
+
+                self._mint_cooldown_add(mint, "sell_route_fail")
+
             except Exception:
+
                 pass
-            self._global_cooldown("sell_insufficient")
+
+            return "__ROUTE_FAIL__"
+
+
+        if rc == 43 or "__JUP_INSUFFICIENT_FUNDS__" in (out_all or "") or "insufficient" in lo:
+
+            try:
+
+                print("[SELL] insufficient_funds -> global cooldown", flush=True)
+
+            except Exception:
+
+                pass
+
+            try:
+
+                self._global_cooldown_add("sell_insufficient")
+
+            except Exception:
+
+                pass
+
             return "__INSUFFICIENT__"
-        # --- /rc-aware wrapper handling ---
-        lo = out_all.lower()
-        rc = int(getattr(proc, "returncode", 0) or 0)
 
-        # rc priority from sell_exec_wrap.py
-        if rc in (42, 43, 44):
-            return "__ROUTE_FAIL__"
 
-        # marker priority
-        if "route_fail_0x1788" in lo or "route_fail" in lo:
-            return "__ROUTE_FAIL__"
-        if "http=429" in lo or " 429 " in lo or "too many requests" in lo:
-            return "__429__"
-        if "jup_insufficient_funds" in lo or "insufficient_funds" in lo or "insufficient funds" in lo:
-            return "__INSUF__"
         if "__dust__" in lo or "dust_untradeable" in lo or ("bad request" in lo and "amount=1" in lo):
+
             return "__DUST__"
+
+        # --- /unified rc/text marker handling ---
+
 
         # extract txsig
         mm = re.search(r'\btxsig=([1-9A-HJ-NP-Za-km-z]{40,})\b', out_all)
@@ -337,7 +486,9 @@ class SellEngine:
     
                     print(f"[SELL] simulate-bypass: txsig={txsig} mint={_mint}", flush=True)
                 except Exception as _e:
-                    print(f"[SELL] simulate-bypass loop error={_e}", flush=True)
+                    print(f"[SELL] simulate-bypass loop error={{_e!r}}", flush=True)
+                    print("[SELL] simulate-bypass traceback:", flush=True)
+                    print(traceback.format_exc(), flush=True)
                     continue
             return
         ### /FORCE_SELL_ALL_SIM_BYPASS_TOP_V1 ###
@@ -403,6 +554,48 @@ class SellEngine:
             except Exception as e:
                 print(f"❌ sell_engine error mint={mint}: {e}", flush=True)
                 print(traceback.format_exc(), flush=True)
+
+    # --- cooldown helpers (avoid name collisions with dict/float attrs) ---
+    def _global_cooldown_add(self, sec: int, reason: str = ""):
+        try:
+            now = float(__import__('time').time())
+            sec = int(sec or 0)
+            until = now + max(sec, 0)
+            setattr(self, '_global_sell_cooldown_until', until)
+            if sec > 0:
+                print(f"⏳ GLOBAL SELL cooldown set {sec}s reason={reason}", flush=True)
+        except Exception:
+            pass
+
+    def _mint_cooldown_add(self, mint: str, reason: str = "", sec: int | None = None):
+        """Per-mint cooldown store used by _handle_one guard.
+        If sec is None, pick based on reason/env defaults.
+        """
+        try:
+            mint = str(mint or '').strip()
+            if not mint:
+                return
+            now = float(__import__('time').time())
+            # choose duration
+            if sec is None:
+                if 'route' in (reason or '').lower():
+                    sec = int(getattr(self, 'SELL_ROUTE_FAIL_COOLDOWN_SEC', 2700) or 2700)
+                elif '429' in (reason or '').lower():
+                    sec = int(getattr(self, 'SELL_429_COOLDOWN_SEC', 180) or 180)
+                else:
+                    sec = int(getattr(self, 'SELL_INSUFFICIENT_COOLDOWN_SEC', getattr(self, 'SELL_429_COOLDOWN_SEC', 180)) or 180)
+            sec = int(sec or 0)
+            store = getattr(self, '_mint_sell_cooldown_until', None)
+            if not isinstance(store, dict):
+                store = {}
+                setattr(self, '_mint_sell_cooldown_until', store)
+            until = now + max(sec, 0)
+            store[mint] = max(float(store.get(mint, 0.0) or 0.0), until)
+            if sec > 0:
+                print(f"⏳ SELL mint cooldown set {sec}s reason={reason} mint={mint}", flush=True)
+        except Exception:
+            pass
+
 
     def _handle_one(self, pos, now: float):
         # MINT_COOLDOWN_SKIP
@@ -544,14 +737,14 @@ class SellEngine:
             sell_qty = qty_total
             txsig = self._sell_exec(mint, sell_qty, "hard_sl")
             # markers from _sell_exec / sell_exec_wrap.py
-            if txsig == "__429__":
+            if txsig == "__JUP_HTTP_429__":
                 print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=429", flush=True)
                 try:
                     self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
                 except Exception:
                     pass
                 return
-            if txsig == "__INSUF__":
+            if txsig == "__INSUFFICIENT__":
                 print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=insufficient_funds", flush=True)
                 try:
                     self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
