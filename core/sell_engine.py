@@ -754,6 +754,7 @@ class SellEngine:
             if txsig == "__ROUTE_FAIL__":
                 print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={mint}", flush=True)
 
+                return
             if txsig == "__JUP_HTTP_429__":
                 try:
                     print(f"[SELL] http_429 -> mint cooldown {int(self.SELL_429_COOLDOWN_SEC)}s mint={mint}", flush=True)
@@ -780,14 +781,6 @@ class SellEngine:
                         self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
                     except Exception:
                         pass
-                return
-                try:
-                    if hasattr(self, "_rl_skip_add"):
-                        self._rl_skip_add(mint, int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC), reason="sell_route_fail")
-                    elif hasattr(self, "_mint_sell_cooldown_until"):
-                        self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)
-                except Exception:
-                    pass
                 return
             if txsig == "__DUST__":
                 print(f"[SELL] dust_untradeable -> close in DB mint={mint}", flush=True)

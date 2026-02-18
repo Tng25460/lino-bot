@@ -66,6 +66,9 @@ async def main():
             print("💰 SELL_TICK: running sell_engine.run_once()", flush=True)
             try:
                 sell_engine.run_once()
+                if os.getenv("ONE_SHOT","0")=="1" or os.getenv("SELL_ONE_SHOT","0")=="1":
+                    print("🧪 ONE_SHOT=1 -> stop after 1 SELL_TICK", flush=True)
+                    return
             except Exception as err:
                 print("❌ sell_engine tick error: " + str(err), flush=True)
             await asyncio.sleep(sleep_s)
