@@ -752,8 +752,17 @@ class SellEngine:
                     pass
                 return
             if txsig == "__ROUTE_FAIL__":
-                print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={mint}", flush=True)
-
+                try:
+                    print(f"[SELL] route_fail -> mint cooldown {int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)}s mint={mint}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    self._rl_skip_add(mint, int(self.SELL_ROUTE_FAIL_COOLDOWN_SEC), reason="sell_route_fail")
+                except Exception:
+                    try:
+                        self._mint_sell_cooldown_until[mint] = float(time.time()) + float(self.SELL_ROUTE_FAIL_COOLDOWN_SEC)
+                    except Exception:
+                        pass
                 return
             if txsig == "__JUP_HTTP_429__":
                 try:
