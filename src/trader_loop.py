@@ -170,6 +170,20 @@ async def trader_loop():
             ).returncode
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
+
+
+            # strict rc: if trader_exec failed, propagate non-zero exit code
+
+            import os as _os
+
+            if str(_os.getenv('STRICT_TRADER_RC','')).strip() in ('1','true','True','yes','YES'):
+
+                if isinstance(rc, int) and rc != 0:
+
+                    raise SystemExit(rc)
+
+            return rc
+
             # --- BUY_429_ADAPTIVE_HOOK_V1 (after TRADER_EXEC_RC print) ---
             # ensure adaptive state dict is available in both rc==42 and rc==0 branches
             try:

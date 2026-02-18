@@ -89,7 +89,9 @@ async def main():
             if _SELL_ONLY:
                 print('🛑 MODE=SELL_ONLY -> skip trader_loop', flush=True)
             else:
-                await _maybe_await(trader_loop())
+                rc = await _maybe_await(trader_loop())
+                if isinstance(rc, int) and rc != 0:
+                    raise SystemExit(rc)
         except Exception as err:
             print("❌ trader_loop error: " + str(err), flush=True)
 
