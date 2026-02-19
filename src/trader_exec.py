@@ -1367,7 +1367,28 @@ def main() -> int:
                     print("🧷 autoskip already-holding disabled (set AUTOSKIP_ALREADY_HOLDING=1 to enable)")
             else:
                 print(f"   no autoskip: ui={ui} < BAG_MIN_UI={BAG_MIN_UI}", flush=True)
+            if str(os.getenv('REPICK_ON_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
+                try:
+                    _max = int(os.getenv('REPICK_MAX','5'))
+                except Exception:
+                    _max = 5
+                try:
+                    _depth = int(os.getenv('REPICK_DEPTH','0'))
+                except Exception:
+                    _depth = 0
+                if _depth < _max:
+                    try:
+                        _append_skip_mint(str(output_mint))
+                        print(f"🔁 REPICK (re-exec) depth={_depth+1}/{_max} -> skip mint={output_mint}", flush=True)
+                    except Exception as _e:
+                        print('repick autoskip failed:', _e, flush=True)
+                    _env = os.environ.copy()
+                    _env['REPICK_DEPTH'] = str(_depth + 1)
+                    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
+                else:
+                    print(f"🧱 REPICK max reached depth={_depth}/{_max} -> stop", flush=True)
             return 0
+
     if not output_mint:
 
         _write_err("bad_candidate_no_mint", {"candidate": cand})
