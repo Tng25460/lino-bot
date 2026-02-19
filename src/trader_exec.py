@@ -1402,6 +1402,7 @@ def main() -> int:
                     _env = os.environ.copy()
                     _env['REPICK_DEPTH'] = str(_depth + 1)
                     import sys as _sys
+                    _env['SKIP_MINTS_FILE'] = str(os.getenv('SKIP_MINTS_FILE','')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt'))
                     os.execve(_sys.executable, [_sys.executable] + _sys.argv, _env)
                 else:
                     print(f"🧱 REPICK max reached depth={_depth}/{_max} -> stop", flush=True)
