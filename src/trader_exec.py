@@ -1380,6 +1380,11 @@ def main() -> int:
                     try:
                         _append_skip_mint(str(output_mint))
                         print(f"🔁 REPICK (re-exec) depth={_depth+1}/{_max} -> skip mint={output_mint}", flush=True)
+                        try:
+                            _append_skip_mint(str(output_mint))
+                            print(f"🧷 REPICK wrote skip mint={output_mint} -> {SKIP_MINTS_FILE}", flush=True)
+                        except Exception as _e:
+                            print("[WARN] REPICK skip write failed:", _e, flush=True)
                     except Exception as _e:
                         print('repick autoskip failed:', _e, flush=True)
                     _env = os.environ.copy()
