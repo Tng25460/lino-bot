@@ -1384,7 +1384,8 @@ def main() -> int:
                         print('repick autoskip failed:', _e, flush=True)
                     _env = os.environ.copy()
                     _env['REPICK_DEPTH'] = str(_depth + 1)
-                    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
+                    import sys as _sys
+                    os.execve(_sys.executable, [_sys.executable] + _sys.argv, _env)
                 else:
                     print(f"🧱 REPICK max reached depth={_depth}/{_max} -> stop", flush=True)
             return 0
