@@ -1,181 +1,141 @@
-import argparse
 #!/usr/bin/env python3
-import os, json, time
-from pathlib import Path
+import argparse, json, os, time
+import urllib.request, urllib.error
 
-import requests
+SOL = "So11111111111111111111111111111111111111112"
 
-
-# --- FILTER_READY_TRADABLE_CLI_V1 ---
-def _parse_args():
-    ap = argparse.ArgumentParser(description="Filter ready jsonl to keep only mints tradable on Jupiter")
-    ap.add_argument("--in", dest="inp", default=None, help="input jsonl")
-    ap.add_argument("--out", dest="out", default=None, help="output jsonl")
-    return ap.parse_args()
-
-_ARGS = None
-try:
-    _ARGS = _parse_args()
-except SystemExit:
-    # allow importing without argparse exit
-    _ARGS = None
-
-def _pick_io(default_in: str, default_out: str):
-    inp = None
-    out = None
-    if _ARGS is not None:
-        inp = _ARGS.inp
-        out = _ARGS.out
-    # env fallback
-    if not inp:
-        inp = os.getenv("READY_IN") or default_in
-    if not out:
-        out = os.getenv("READY_OUT") or default_out
-    return inp, out
-# --- /FILTER_READY_TRADABLE_CLI_V1 ---
-
-
-# === CONFIG ===
-INP = os.getenv("READY_TRADABLE_IN", "state/ready_pump_early.jsonl")
-OUT = os.getenv("READY_TRADABLE_OUT", "state/ready_tradable.jsonl")
-
-INPUT_MINT = os.getenv("INPUT_MINT", "So11111111111111111111111111111111111111112")
-JUP = (os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag") or "").rstrip("/")
-
-AMOUNT_LAMPORTS = int(float(os.getenv("BUY_AMOUNT_SOL", "0.003")) * 1_000_000_000)
-SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "120"))
-
-RETRIES = int(os.getenv("FILTER_QUOTE_RETRIES", "6"))
-TIMEOUT_S = float(os.getenv("FILTER_TIMEOUT_S", "10.0"))
-
-SLEEP_S = float(os.getenv("FILTER_SLEEP_S", "0.20"))
-SLEEP_429_S = float(os.getenv("FILTER_429_SLEEP_S", "2.0"))
-
-# If 429, keep item (soft pass) or drop it (soft skip)
-ON_429_KEEP = os.getenv("FILTER_ON_429_KEEP", "1") == "1"
-
-MAX_N = int(os.getenv("FILTER_MAX_N", "0"))  # 0 = no limit
-
-def _jup_headers(jup_base: str):
-    # api.jup.ag requires x-api-key (pro). lite-api generally doesn't.
-    if "api.jup.ag" in (jup_base or ""):
-        key = (os.getenv("JUP_API_KEY", "") or "").strip()
-        if key:
-            return {"x-api-key": key}
-    return {}
+MINT_KEYS  = ("mint","output_mint","outputMint","token","address")
+SCORE_KEYS = ("score","brain_score","final_score","score_v4","scoreV4","score_total")
 
 def _read_jsonl(path: str):
-    p = Path(path)
-    if not p.exists():
-        return []
-    out = []
-    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
+    out=[]
+    with open(path,"r",encoding="utf-8",errors="replace") as f:
+        for ln in f:
+            ln=ln.strip()
+            if not ln: 
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
     return out
 
-def _quote(sess: requests.Session, output_mint: str):
-    url = f"{JUP}/swap/v1/quote"
-    params = {
-        "inputMint": INPUT_MINT,
-        "outputMint": output_mint,
-        "amount": str(int(AMOUNT_LAMPORTS)),
-        "slippageBps": str(int(SLIPPAGE_BPS)),
-    }
+def _write_jsonl(path: str, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path,"w",encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    last = None
-    for i in range(RETRIES + 1):
-        try:
-            if SLEEP_S > 0:
-                time.sleep(SLEEP_S)
+def _mint(r):
+    for k in MINT_KEYS:
+        v = r.get(k)
+        if isinstance(v,str) and v.strip():
+            return v.strip()
+    return ""
 
-            r = sess.get(
-                url,
-                params=params,
-                timeout=TIMEOUT_S,
-                headers=_jup_headers(JUP),
-            )
+def _score(r):
+    for k in SCORE_KEYS:
+        if k in r:
+            try:
+                return float(r.get(k))
+            except Exception:
+                pass
+    return float("-inf")
 
-            sc = r.status_code
-            txt = (r.text or "")[:240]
-            last = (sc, txt)
+def _sleep_throttle(last_ts, min_interval):
+    if min_interval <= 0:
+        return time.time()
+    now=time.time()
+    dt=now-last_ts
+    if dt < min_interval:
+        time.sleep(min_interval-dt)
+        return time.time()
+    return now
 
-            if sc == 200:
-                return True, sc, txt
-
-            if sc == 401:
-                # hard fail on auth problems (wrong/missing key)
-                return False, sc, txt
-
-            if sc == 429:
-                if SLEEP_429_S > 0:
-                    time.sleep(SLEEP_429_S)
-                continue
-
-            # other HTTP => retry a bit
-            time.sleep(min(0.4 + 0.2 * i, 2.0))
-            continue
-
-        except Exception as e:
-            last = ("EXC", repr(e))
-            time.sleep(min(0.4 + 0.2 * i, 2.0))
-            continue
-
-    # exhausted retries
-    return False, (last[0] if last else "NO"), (last[1] if last else "")
+def _quote(jup_base: str, mint: str, amount: int, slip_bps: int, timeout=20):
+    url=(f"{jup_base.rstrip('/')}/swap/v1/quote"
+         f"?inputMint={SOL}&outputMint={mint}&amount={int(amount)}&slippageBps={int(slip_bps)}")
+    req=urllib.request.Request(url, headers={"accept":"application/json"})
+    raw=urllib.request.urlopen(req, timeout=timeout).read()
+    return json.loads(raw)
 
 def main():
-    INP, OUT = _pick_io("state/ready_scored.jsonl", "state/ready_tradable.jsonl")
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--in", dest="inp", required=True)
+    ap.add_argument("--out", dest="out", required=True)
+    ap.add_argument("--jup-base", default=os.getenv("JUP_BASE_URL","https://lite-api.jup.ag"))
+    ap.add_argument("--amount", type=int, default=int(float(os.getenv("FILTER_TRADABLE_AMOUNT","10000000"))))
+    ap.add_argument("--slip-bps", type=int, default=int(float(os.getenv("SLIPPAGE_BPS", os.getenv("FILTER_TRADABLE_SLIP_BPS","120")))))
+    ap.add_argument("--retries", type=int, default=int(float(os.getenv("FILTER_TRADABLE_RETRIES","6"))))
+    ap.add_argument("--on429-keep", type=int, default=int(float(os.getenv("FILTER_TRADABLE_ON429_KEEP","1"))))
+    ap.add_argument("--min-score", type=float, default=float(os.getenv("BRAIN_SCORE_MIN", os.getenv("FILTER_TRADABLE_MIN_SCORE","-1"))))
+    ap.add_argument("--top-n", type=int, default=int(float(os.getenv("BRAIN_TOPN", os.getenv("FILTER_TRADABLE_TOPN","60")))))
+    ap.add_argument("--min-interval-sec", type=float, default=float(os.getenv("FILTER_TRADABLE_MIN_INTERVAL_SEC","0.25")))
+    ap.add_argument("--debug", type=int, default=int(float(os.getenv("FILTER_TRADABLE_DEBUG","1"))))
+    args=ap.parse_args()
 
-    items = _read_jsonl(INP)
-    if MAX_N > 0:
-        items = items[:MAX_N]
+    rows=_read_jsonl(args.inp)
+    if args.debug:
+        print(f"[filter_ready_tradable] rows_in={len(rows)} file={args.inp}")
 
-    print(f"[filter_ready_tradable] INP={INP} OUT={OUT}", flush=True)
-    print(f"[filter_ready_tradable] JUP={JUP} amount={AMOUNT_LAMPORTS} slip_bps={SLIPPAGE_BPS} retries={RETRIES} on429_keep={1 if ON_429_KEEP else 0}", flush=True)
+    # drop rows sans mint
+    rows=[r for r in rows if _mint(r)]
+    if args.debug:
+        print(f"[filter_ready_tradable] rows_with_mint={len(rows)}")
 
-    kept, bad, soft429, unauth = 0, 0, 0, 0
-    out_lines = []
+    # score filter
+    if args.min_score is not None and args.min_score > -1:
+        rows=[r for r in rows if _score(r) >= args.min_score]
+    rows.sort(key=_score, reverse=True)
 
-    with requests.Session() as sess:
-        for idx, it in enumerate(items, 1):
-            mint = (it.get("mint") or it.get("outputMint") or "").strip()
-            if not mint:
-                bad += 1
+    if args.top_n and args.top_n > 0:
+        rows=rows[:args.top_n]
+
+    if args.debug:
+        if rows:
+            r0=rows[0]
+            print(f"[filter_ready_tradable] after_score top={len(rows)} top1_mint={_mint(r0)} top1_score={_score(r0):.4f}")
+        else:
+            print(f"[filter_ready_tradable] after_score top=0 (min_score={args.min_score} top_n={args.top_n})")
+
+    kept=[]; bad=0; soft429=0; unauth=0; last_ts=0.0
+
+    for r in rows:
+        mint=_mint(r)
+        ok=False
+        last_err=None
+        for attempt in range(max(1,args.retries)):
+            last_ts=_sleep_throttle(last_ts, args.min_interval_sec)
+            try:
+                q=_quote(args.jup_base, mint, args.amount, args.slip_bps)
+                out_amt=int(q.get("outAmount") or 0)
+                if out_amt>0:
+                    ok=True; break
+                last_err="outAmount<=0"
+            except urllib.error.HTTPError as e:
+                code=getattr(e,"code",None)
+                if code in (401,403):
+                    unauth += 1; last_err=f"http={code}"; break
+                if code==429:
+                    soft429 += 1; last_err="http=429"
+                    time.sleep(0.25 + 0.35*attempt)
+                    continue
+                last_err=f"http={code}"
+                break
+            except Exception as e:
+                last_err=f"{type(e).__name__}:{e}"
+                time.sleep(0.15)
                 continue
 
-            ok, code, txt = _quote(sess, mint)
+        if ok:
+            kept.append(r)
+        else:
+            bad += 1
+            if args.on429_keep==1 and last_err=="http=429":
+                kept.append(r)
 
-            if ok:
-                out_lines.append(json.dumps(it, ensure_ascii=False))
-                kept += 1
-            else:
-                if code == 429 or str(code) == "429":
-                    soft429 += 1
-                    if ON_429_KEEP:
-                        out_lines.append(json.dumps(it, ensure_ascii=False))
-                        kept += 1
-                elif code == 401 or str(code) == "401":
-                    unauth += 1
-                    bad += 1
-                    # print one sample then stop early (no point continuing)
-                    print(f"[filter_ready_tradable] ❌ http=401 Unauthorized (check JUP_API_KEY). sample={txt}", flush=True)
-                    break
-                else:
-                    bad += 1
+    _write_jsonl(args.out, kept)
+    print(f"DONE kept={len(kept)} bad={bad} soft429={soft429} unauth={unauth} OUT={args.out}")
 
-            if idx % 10 == 0:
-                print(f"[{idx}/{len(items)}] kept={kept} bad={bad} soft429={soft429} unauth={unauth}", flush=True)
-
-    Path(OUT).parent.mkdir(parents=True, exist_ok=True)
-    Path(OUT).write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
-
-    print(f"DONE kept={kept} bad={bad} soft429={soft429} unauth={unauth} OUT={OUT}", flush=True)
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    raise SystemExit(main())
