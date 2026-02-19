@@ -635,17 +635,19 @@ def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str=
 # === END POSTBUY_RESYNC_DB ===
 
 def _append_skip_mint(mint: str):
-    from pathlib import Path
-    m = (mint or '').strip()
-    if not m:
-        return
-    fp = Path(SKIP_MINTS_FILE)
+    """Append mint to SKIP_MINTS_FILE (reads env each call)."""
     try:
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        with fp.open('a', encoding='utf-8') as f:
+        import os
+        m = (mint or '').strip()
+        if not m:
+            return
+        sf = str(os.getenv('SKIP_MINTS_FILE', '')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip() or 'state/skip_mints_trader.txt'
+        # best effort append
+        with open(sf, 'a', encoding='utf-8') as f:
             f.write(m + '\n')
-    except Exception as e:
-        print(f"⚠️ autoskip write failed: {e}")
+    except Exception:
+        return
+
 def _autoskip_mint(mint: str):
     from pathlib import Path
     m = (mint or '').strip()
