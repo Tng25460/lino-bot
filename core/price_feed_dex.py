@@ -1,3 +1,27 @@
+def _urlopen_json_429(req_or_url, timeout=20, retries=3, base_sleep=0.35, tag=""):
+    """
+    urlopen -> json.loads with retry on HTTP 429 only.
+    retries=3 => up to 3 attempts (0,1,2).
+    """
+    import json, time, urllib.request, urllib.error
+    last = None
+    for attempt in range(int(retries)):
+        try:
+            data = urllib.request.urlopen(req_or_url, timeout=timeout).read()
+            return json.loads(data)
+        except urllib.error.HTTPError as e:
+            last = e
+            code = getattr(e, "code", None)
+            if code == 429 and attempt < int(retries) - 1:
+                time.sleep(base_sleep * (2 ** attempt))
+                continue
+            raise
+        except Exception as e:
+            last = e
+            # no retry except 429
+            raise
+    raise last
+
 import requests
 from typing import Optional
 import os
@@ -39,7 +63,7 @@ class DexScreenerPriceFeed:
 
             req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type":"application/json"})
 
-            resp = json.loads(urllib.request.urlopen(req, timeout=20).read())
+            resp = _urlopen_json_429(req, timeout=20, retries=int(os.getenv('PRICE_RPC_RETRIES','3')), base_sleep=float(os.getenv('PRICE_RPC_SLEEP','0.35')), tag='rpc')
 
             dec = int(resp["result"]["value"]["decimals"])
 
@@ -50,7 +74,7 @@ class DexScreenerPriceFeed:
 
 
             try:
-                q = json.loads(urllib.request.urlopen(url, timeout=20).read())
+                q = _urlopen_json_429(url, timeout=20, retries=int(os.getenv('PRICE_QUOTE_RETRIES','3')), base_sleep=float(os.getenv('PRICE_QUOTE_SLEEP','0.35')), tag='quote')
             except Exception as e:
                 print(f"[WARN] price_feed_dex get_price failed mint={mint} err={type(e).__name__}:{e}")
                 return None
