@@ -48,11 +48,14 @@ class DexScreenerPriceFeed:
 
             url = f"{qurl}?inputMint={mint}&outputMint={SOL}&amount={amt}&slippageBps=50"
 
+
             try:
                 q = json.loads(urllib.request.urlopen(url, timeout=20).read())
-              except Exception as e:
-                  print(f"[WARN] price_feed_dex get_price failed mint={mint} err={type(e).__name__}:{e}")
-                  return None
+            except Exception as e:
+                print(f"[WARN] price_feed_dex get_price failed mint={mint} err={type(e).__name__}:{e}")
+                return None
+
+            q = json.loads(urllib.request.urlopen(url, timeout=20).read())
 
             out_lamports = int(q.get("outAmount") or 0)
 
