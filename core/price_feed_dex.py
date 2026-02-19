@@ -55,7 +55,6 @@ class DexScreenerPriceFeed:
                 print(f"[WARN] price_feed_dex get_price failed mint={mint} err={type(e).__name__}:{e}")
                 return None
 
-            q = json.loads(urllib.request.urlopen(url, timeout=20).read())
 
             out_lamports = int(q.get("outAmount") or 0)
 
