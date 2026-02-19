@@ -1153,7 +1153,7 @@ def _load_rlskip_set(path: str, now: int) -> set:
 def main() -> int:
     if not WALLET_PUBKEY:
         print("❌ missing WALLET_PUBKEY/TRADER_USER_PUBLIC_KEY")
-        return 1
+        raise SystemExit(1)  # fatal: wallet pubkey missing
 
     print("🚀 trader_exec BUY")
 
@@ -1357,11 +1357,14 @@ def main() -> int:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
             _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC','900')), reason='already_holding')
             if ui >= BAG_MIN_UI:
-                try:
-                    _append_skip_mint(str(output_mint))
-                    print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
-                except Exception as _e:
-                    print("autoskip already-holding failed:", _e)
+                if str(os.getenv('AUTOSKIP_ALREADY_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
+                    try:
+                        _append_skip_mint(str(output_mint))
+                        print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
+                    except Exception as _e:
+                        print("autoskip already-holding failed:", _e)
+                else:
+                    print("🧷 autoskip already-holding disabled (set AUTOSKIP_ALREADY_HOLDING=1 to enable)")
             else:
                 print(f"   no autoskip: ui={ui} < BAG_MIN_UI={BAG_MIN_UI}", flush=True)
             return 0
@@ -1809,12 +1812,16 @@ def main() -> int:
                             except Exception:
                                 pass
                             try:
-                                with open(_sf, 'a', encoding='utf-8') as _af:
-                                    _af.write(_m + '\n')
+                                if str(os.getenv('DRYRUN_AUTOSKIP','0')).strip() in ('1','true','True','yes','YES'):
+                                    with open(_sf, 'a', encoding='utf-8') as _af:
+                                        _af.write(_m + '\n')
+                                else:
+                                    print("🧷 DRY_RUN autoskip disabled (set DRYRUN_AUTOSKIP=1 to enable)")
                                 if _in_rebuy_pool(output_mint):
                                     print(f"🧪 REBUY_POOL allow mint={output_mint} (no autoskip)", flush=True)
                                 else:
-                                    print(f"🧷 DRY_RUN autoskip -> {_m} (SKIP_MINTS_FILE={_sf})", flush=True)
+                                    if str(os.getenv('DRYRUN_AUTOSKIP','0')).strip() in ('1','true','True','yes','YES'):
+                                        print(f"🧷 DRY_RUN autoskip -> {_m} (SKIP_MINTS_FILE={_sf})", flush=True)
                             except Exception:
                                 pass
             except Exception:
