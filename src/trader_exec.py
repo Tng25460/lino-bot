@@ -635,14 +635,24 @@ def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str=
 # === END POSTBUY_RESYNC_DB ===
 
 def _append_skip_mint(mint: str):
-    """Append mint to SKIP_MINTS_FILE (reads env each call)."""
+    """Append mint to SKIP_MINTS_FILE (env-aware, best-effort, de-dup)."""
     try:
         import os
         m = (mint or '').strip()
         if not m:
             return
         sf = str(os.getenv('SKIP_MINTS_FILE', '')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip() or 'state/skip_mints_trader.txt'
-        # best effort append
+        # de-dup: si le fichier est raisonnable, on évite de réécrire un mint déjà présent
+        try:
+            if os.path.exists(sf):
+                sz = os.path.getsize(sf)
+                if sz <= 1024*1024:  # 1MB
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                        for ln in f:
+                            if ln.strip() == m:
+                                return
+        except Exception:
+            pass
         with open(sf, 'a', encoding='utf-8') as f:
             f.write(m + '\n')
     except Exception:
