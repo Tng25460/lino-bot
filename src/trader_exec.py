@@ -634,6 +634,13 @@ def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str=
 
 # === END POSTBUY_RESYNC_DB ===
 
+def _skip_file_path() -> str:
+    try:
+        import os
+        return str(os.getenv('SKIP_MINTS_FILE','')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt'))
+    except Exception:
+        return str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt'))
+
 def _append_skip_mint(mint: str):
     """Append mint to SKIP_MINTS_FILE (env-aware, best-effort, de-dup)."""
     try:
@@ -641,7 +648,7 @@ def _append_skip_mint(mint: str):
         m = (mint or '').strip()
         if not m:
             return
-        sf = str(os.getenv('SKIP_MINTS_FILE', '')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip() or 'state/skip_mints_trader.txt'
+        sf = _skip_file_path().strip() or 'state/skip_mints_trader.txt'
         # de-dup: si le fichier est raisonnable, on évite de réécrire un mint déjà présent
         try:
             if os.path.exists(sf):
@@ -1372,7 +1379,7 @@ def main() -> int:
                 if str(os.getenv('AUTOSKIP_ALREADY_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
                     try:
                         _append_skip_mint(str(output_mint))
-                        print(f"🧷 autoskip already-holding mint={output_mint} -> {SKIP_MINTS_FILE}")
+                        print(f"🧷 autoskip already-holding mint={output_mint} -> {_skip_file_path()}")
                     except Exception as _e:
                         print("autoskip already-holding failed:", _e)
                 else:
@@ -1394,7 +1401,7 @@ def main() -> int:
                         print(f"🔁 REPICK (re-exec) depth={_depth+1}/{_max} -> skip mint={output_mint}", flush=True)
                         try:
                             _append_skip_mint(str(output_mint))
-                            print(f"🧷 REPICK wrote skip mint={output_mint} -> {SKIP_MINTS_FILE}", flush=True)
+                            print(f"🧷 REPICK wrote skip mint={output_mint} -> {_skip_file_path()}", flush=True)
                         except Exception as _e:
                             print("[WARN] REPICK skip write failed:", _e, flush=True)
                     except Exception as _e:
