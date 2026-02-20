@@ -217,12 +217,12 @@ def _rl_skip_add(mint: str, sec: int | None = None, reason: str = ''):
         rl_file = Path(rl_file)
 
     if sec is None:
-        sec = int(os.getenv('RL_SKIP_SEC', '600'))
+        sec = int(os.getenv('RL_SKIP_SEC', '180'))
     else:
         try:
             sec = int(sec)
         except Exception:
-            sec = int(os.getenv('RL_SKIP_SEC', '600'))
+            sec = int(os.getenv('RL_SKIP_SEC', '180'))
 
     now = int(_time.time())
     until = now + int(sec)
