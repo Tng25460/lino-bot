@@ -1333,6 +1333,21 @@ def main() -> int:
     if FORCE_OUTPUT_MINT:
         output_mint = FORCE_OUTPUT_MINT.strip()
         print(f"   [CFG] FORCE_OUTPUT_MINT -> {output_mint}")
+    # --- DUAL_PROFILE_V1 ---
+    if str(output_mint).lower().endswith("pump"):
+        _profile = "PUMP"
+        os.environ["HARD_SL_PCT"]   = "-0.35"
+        os.environ["TP1_PCT"]       = "0.40"
+        os.environ["TP2_PCT"]       = "1.00"
+        os.environ["TIME_STOP_SEC"] = "600"
+    else:
+        _profile = "NORMAL"
+        os.environ["HARD_SL_PCT"]   = "-0.20"
+        os.environ["TP1_PCT"]       = "0.20"
+        os.environ["TP2_PCT"]       = "0.50"
+        os.environ["TIME_STOP_SEC"] = "1800"
+    print(f"   [PROFILE] {_profile} mint={output_mint} HARD_SL_PCT={os.environ['HARD_SL_PCT']} TP1={os.environ['TP1_PCT']} TP2={os.environ['TP2_PCT']} TIME_STOP_SEC={os.environ['TIME_STOP_SEC']}", flush=True)
+    # --- /DUAL_PROFILE_V1 ---
     # skiplist + bag check
     try:
         skip = _load_skip_mints()
@@ -1669,7 +1684,7 @@ def main() -> int:
                     pass
                 import time as _time
                 _time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','0.3')))
-                return 0
+                raise SystemExit(42)
             try:
                 _http = int(http)
             except Exception:
