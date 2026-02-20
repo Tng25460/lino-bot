@@ -217,12 +217,12 @@ def _rl_skip_add(mint: str, sec: int | None = None, reason: str = ''):
         rl_file = Path(rl_file)
 
     if sec is None:
-        sec = int(os.getenv('RL_SKIP_SEC', '600'))
+        sec = int(os.getenv('RL_SKIP_SEC', '180'))
     else:
         try:
             sec = int(sec)
         except Exception:
-            sec = int(os.getenv('RL_SKIP_SEC', '600'))
+            sec = int(os.getenv('RL_SKIP_SEC', '180'))
 
     now = int(_time.time())
     until = now + int(sec)
@@ -1121,6 +1121,36 @@ def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
         raise RuntimeError(f"sendTransaction no result: {j}")
     return str(res)
 
+
+def _apply_trade_profile(output_mint: str) -> str:
+    _mint = str(output_mint or "").strip().lower()
+    if _mint.endswith("pump"):
+        profile = "PUMP"
+        _vals = {
+            "HARD_SL_PCT": "-0.35",
+            "TP1_PCT": "0.40",
+            "TP2_PCT": "1.00",
+            "TIME_STOP_SEC": "600",
+        }
+    else:
+        profile = "NORMAL"
+        _vals = {
+            "HARD_SL_PCT": "-0.20",
+            "TP1_PCT": "0.20",
+            "TP2_PCT": "0.50",
+            "TIME_STOP_SEC": "1800",
+        }
+    for _k, _v in _vals.items():
+        os.environ[_k] = _v
+    os.environ["TRADER_PROFILE"] = profile
+    print(
+        f"🧭 trade_profile={profile} mint={output_mint} "
+        f"HARD_SL_PCT={_vals['HARD_SL_PCT']} TP1_PCT={_vals['TP1_PCT']} "
+        f"TP2_PCT={_vals['TP2_PCT']} TIME_STOP_SEC={_vals['TIME_STOP_SEC']}",
+        flush=True,
+    )
+    return profile
+
 def _row_mint(row: dict) -> str:
     if not isinstance(row, dict):
         return ""
@@ -1507,6 +1537,7 @@ def main() -> int:
         return 0
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
+    _apply_trade_profile(output_mint)
     # --- HIST_BAD_HOOK_APPLIED_V2 ---
     try:
         _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
@@ -1581,7 +1612,7 @@ def main() -> int:
     if _sol is not None and _sol < _need:
         print(f"LOW_SOL_GUARD SKIP sol={_sol:.6f} need>={_need:.6f}", flush=True)
         try:
-            _rl_skip_add(output_mint, 600, reason="low_sol_guard")
+            _rl_skip_add(output_mint, 180, reason="low_sol_guard")
         except Exception:
             pass
         import sys
@@ -1667,9 +1698,7 @@ def main() -> int:
                     _t.sleep(max(1, _b))
                 except Exception:
                     pass
-                import time as _time
-                _time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','0.3')))
-                return 0
+                raise SystemExit(42)
             try:
                 _http = int(http)
             except Exception:

@@ -159,7 +159,7 @@ async def trader_loop():
     while True:
         try:
             print(f"TRADER_LOOP_PYTHON={sys.executable}")
-            rc = subprocess.run(
+            raw_rc = subprocess.run(
 
                 [sys.executable, "-u", "src/trader_exec.py"],
 
@@ -168,10 +168,11 @@ async def trader_loop():
                 env=env,
 
             ).returncode
+            rc = raw_rc
 
-            print(f"TRADER_EXEC_RC={rc}", flush=True)
+            print(f"TRADER_EXEC_RC={raw_rc}", flush=True)
             # normalize_rc2_v1
-            if rc == 2:
+            if raw_rc == 2:
                 rc = 0
 
 
@@ -283,19 +284,19 @@ async def trader_loop():
                 pass
             # --- /LOW_SOL_COOLDOWN_V1 ---
             # RESYNC_BUY_QTY_AFTER_RC2_V1: after BUY sent (rc=2), resync on-chain qty into DB (avoid OPEN qty=0)
-            if rc == 2:
+            if raw_rc == 2:
                 try:
                     subprocess.run([sys.executable, '-u', 'scripts/resync_buy_qty.py'], check=False, env=env)
                 except Exception as _e:
                     print('⚠️ RESYNC_BUY_QTY_AFTER_RC2_V1 failed:', _e, flush=True)
             # ONE_SHOT_STOP_AFTER_RC23_V1: stop if trader_exec exited rc=2 (sent) or rc=3 (built tx)
-            if one_shot and rc in (2,3):
-                print("🛑 ONE_SHOT_STOP_AFTER_RC23_V1 rc=" + str(rc) + " -> stop trader_loop", flush=True)
+            if one_shot and raw_rc in (2,3):
+                print("🛑 ONE_SHOT_STOP_AFTER_RC23_V1 rc=" + str(raw_rc) + " -> stop trader_loop", flush=True)
                 return
 
             # ONE_SHOT_RC2_V1: stop ONLY if trader_exec exited with rc=2 (sent swap)
 
-            if one_shot and int(rc or 0) == 2:
+            if one_shot and int(raw_rc or 0) == 2:
 
                 print("🛑 ONE_SHOT_RC2_V1 rc=2 (sent) -> stop trader_loop", flush=True)
 
