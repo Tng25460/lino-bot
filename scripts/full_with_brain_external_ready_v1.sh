@@ -13,15 +13,27 @@ if [ ! -s "$READY_FILE" ]; then
   exit 2
 fi
 
-# export wallet pubkey if missing
-if [ -z "${WALLET_PUBKEY:-}" ]; then
-  if command -v solana >/dev/null 2>&1 && [ -f keypair.json ]; then
-    WALLET_PUBKEY="$(solana address -k keypair.json 2>/dev/null || true)"
-  fi
+# export wallet pubkey if missing (python+solders, no solana-cli needed)
+if [ -z "${KEYPAIR_PATH:-}" ]; then
+  [ -f "keypair.json" ] && KEYPAIR_PATH="$(pwd)/keypair.json"
 fi
-if [ -n "${WALLET_PUBKEY:-}" ]; then
-  export WALLET_PUBKEY
-  export TRADER_USER_PUBLIC_KEY="${TRADER_USER_PUBLIC_KEY:-$WALLET_PUBKEY}"
+if { [ -z "${WALLET_PUBKEY:-}" ] || [ -z "${TRADER_USER_PUBLIC_KEY:-}" ]; } \
+    && [ -n "${KEYPAIR_PATH:-}" ] && [ -f "$KEYPAIR_PATH" ]; then
+  _PK="$(python - <<PY
+import json,sys
+try:
+    from solders.keypair import Keypair
+    kp=Keypair.from_bytes(bytes(json.load(open("$KEYPAIR_PATH","r"))))
+    print(str(kp.pubkey()))
+except Exception:
+    pass
+PY
+)"
+  if [ -n "${_PK:-}" ]; then
+    export WALLET_PUBKEY="${WALLET_PUBKEY:-$_PK}"
+    export TRADER_USER_PUBLIC_KEY="${TRADER_USER_PUBLIC_KEY:-$_PK}"
+    echo "WALLET_ENV: pubkey=$_PK keypair=$KEYPAIR_PATH"
+  fi
 fi
 
 echo "[READY] external READY_FILE=$READY_FILE (lines=$(wc -l < "$READY_FILE"))"
