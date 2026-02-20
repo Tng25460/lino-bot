@@ -86,15 +86,26 @@ export ROUTE_GATE_MODE="${ROUTE_GATE_MODE:-all}"
 export ALLOWED_ROUTE_LABELS="${ALLOWED_ROUTE_LABELS:-meteora,dlmm,raydium,cp,orca,whirlpool,clmm,amm}"
 export DENY_ROUTE_LABELS="${DENY_ROUTE_LABELS:-}"
 
-# wallet pubkey auto if missing (needs solana-cli)
-if [ -z "${WALLET_PUBKEY:-}" ] && [ -z "${TRADER_USER_PUBLIC_KEY:-}" ]; then
-  if command -v solana >/dev/null 2>&1 && [ -f "keypair.json" ]; then
-    PK="$(solana address -k keypair.json 2>/dev/null || true)"
-    if [ -n "$PK" ]; then
-      export WALLET_PUBKEY="$PK"
-      export TRADER_USER_PUBLIC_KEY="$PK"
-      echo "[WALLET] WALLET_PUBKEY=$PK"
-    fi
+# wallet pubkey auto if missing (python+solders, no solana-cli needed)
+if [ -z "${KEYPAIR_PATH:-}" ]; then
+  [ -f "keypair.json" ] && KEYPAIR_PATH="$(pwd)/keypair.json"
+fi
+if { [ -z "${WALLET_PUBKEY:-}" ] || [ -z "${TRADER_USER_PUBLIC_KEY:-}" ]; } \
+    && [ -n "${KEYPAIR_PATH:-}" ] && [ -f "$KEYPAIR_PATH" ]; then
+  _PK="$(python - <<PY
+import json,sys
+try:
+    from solders.keypair import Keypair
+    kp=Keypair.from_bytes(bytes(json.load(open("$KEYPAIR_PATH","r"))))
+    print(str(kp.pubkey()))
+except Exception:
+    pass
+PY
+)"
+  if [ -n "${_PK:-}" ]; then
+    export WALLET_PUBKEY="${WALLET_PUBKEY:-$_PK}"
+    export TRADER_USER_PUBLIC_KEY="${TRADER_USER_PUBLIC_KEY:-$_PK}"
+    echo "WALLET_ENV: pubkey=$_PK keypair=$KEYPAIR_PATH"
   fi
 fi
 

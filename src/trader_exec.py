@@ -1167,6 +1167,34 @@ def _load_rlskip_set(path: str, now: int) -> set:
     return out
 
 
+def _rl_skip_purge_and_save(path: str, now: int, cap: int = 5000) -> dict:
+    """Load rl_skip JSON, remove expired entries, clamp to cap most-recent, save if changed.
+    Format: {mint: <unix_ts>}. Returns the post-purge dict.
+    """
+    import json as _j
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+        obj = _j.loads(raw or "{}")
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    n_before = len(obj)
+    # purge expired entries
+    obj = {m: v for m, v in obj.items()
+           if isinstance(v, (int, float)) and int(v) > now}
+    # clamp to cap most-recent entries
+    if len(obj) > cap:
+        obj = dict(sorted(obj.items(), key=lambda kv: kv[1], reverse=True)[:cap])
+    n_after = len(obj)
+    if n_after != n_before:
+        print(f"[RL_SKIP] purge: before={n_before} after={n_after}", flush=True)
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(_j.dumps(obj, separators=(',', ':')), encoding="utf-8")
+        except Exception:
+            pass
+    return obj
 
 
 def main() -> int:
@@ -1260,9 +1288,12 @@ def main() -> int:
     _skip_file = os.getenv("SKIP_MINTS_FILE", "state/skip_mints_trader.txt")
     _rl_file   = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
     _skip_set = _load_skip_set(_skip_file)
-    _rl_set   = _load_rlskip_set(_rl_file, _now)
+    # purge expired + clamp before building the active skip set
+    _rl_dict  = _rl_skip_purge_and_save(_rl_file, _now)
+    _rl_set   = {m for m, v in _rl_dict.items() if int(v) > _now}
     if _skip_set or _rl_set:
         _in = len(ready)
+        _ready_pre_rl = list(ready)
         def _ok_row(r):
             m = _row_mint(r)
             if not m:
@@ -1276,6 +1307,16 @@ def main() -> int:
         _out = len(ready)
         if _out != _in:
             print(f"🧊 RL_SKIP filtered ready (exec): in={_in} -> out={_out} skip={len(_skip_set)} rl={len(_rl_set)}")
+        # RL_SKIP emptied all candidates: purge stale entries and retry once
+        if _in > 0 and _out == 0 and _rl_set:
+            print("[RL_SKIP] RL_SKIP_EMPTY_AFTER_FILTER: purging expired entries and retrying", flush=True)
+            _now2 = int(time.time())
+            _rl_dict2 = _rl_skip_purge_and_save(_rl_file, _now2)
+            _rl_set2  = {m for m, v in _rl_dict2.items() if int(v) > _now2}
+            ready = [r for r in _ready_pre_rl
+                     if _row_mint(r) not in _skip_set and _row_mint(r) not in _rl_set2]
+            _out = len(ready)
+            print(f"[RL_SKIP] retry after purge: out={_out}", flush=True)
         if _out <= 0:
             print("⛔ no candidates after ready filter -> exit rc=0")
             return 0
