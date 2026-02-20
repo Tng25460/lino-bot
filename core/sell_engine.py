@@ -73,6 +73,12 @@ class SellEngine:
         self.SELL_429_BACKOFF_SEC = int(os.getenv("SELL_429_BACKOFF_SEC", "20"))
         self._cfg_logged = False
         self._blocked_until = {}  # mint -> ts until which we skip (e.g. no SOL)
+        # price feed 429 handling
+        self._price_cache = {}       # mint -> (price, ts)
+        self._price_429_until = {}   # mint -> ts until which price fetch is on cooldown
+        self._price_429_log_ts = {}  # mint -> ts of last [COOLDOWN] log (anti-spam)
+        self.PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "30"))
+        self.PRICE_429_COOLDOWN_S = int(os.getenv("PRICE_429_COOLDOWN_S", "90"))
 
     def _ui_qty(self, pos) -> float:
         try:
@@ -597,6 +603,48 @@ class SellEngine:
             pass
 
 
+    def _get_price_cached(self, mint: str) -> float:
+        """Fetch price with 30s in-memory cache and per-mint 429 cooldown.
+        Returns 0.0 when price is unavailable (caller should skip the mint).
+        Never blocks the sell loop.
+        Tags: [SELL][PRICE_429] on 429, [SELL][COOLDOWN] on active cooldown skip.
+        """
+        now = _time.time()
+        _429_until = self._price_429_until
+        _cache = self._price_cache
+        _log_ts = self._price_429_log_ts
+        ttl = float(self.PRICE_CACHE_TTL_S)
+        cooldown_s = float(self.PRICE_429_COOLDOWN_S)
+        # check active per-mint 429 cooldown
+        if now < _429_until.get(mint, 0.0):
+            # log at most once per 60s to avoid spam
+            if now - _log_ts.get(mint, 0.0) > 60.0:
+                left = int(_429_until[mint] - now)
+                print(f"[SELL][COOLDOWN] price_429 cooldown active mint={mint} left={left}s", flush=True)
+                _log_ts[mint] = now
+            cached = _cache.get(mint)
+            return float(cached[0]) if cached else 0.0
+        # try cache (< TTL seconds old)
+        cached = _cache.get(mint)
+        if cached and (now - cached[1]) < ttl:
+            return float(cached[0])
+        # fetch fresh price
+        try:
+            p = float(self.price_feed.get_price(mint) or 0.0)
+            if p > 0:
+                _cache[mint] = (p, now)
+            return p
+        except Exception as _err:
+            _msg = str(_err)
+            if "429" in _msg or "Too Many" in _msg or "rate limit" in _msg.lower():
+                _429_until[mint] = now + cooldown_s
+                _log_ts[mint] = now
+                print(f"[SELL][PRICE_429] 429 on price feed mint={mint} cooldown={int(cooldown_s)}s", flush=True)
+                if cached:
+                    print(f"[SELL][PRICE_429] using cached price mint={mint} age={int(now-cached[1])}s", flush=True)
+                    return float(cached[0])
+            return 0.0
+
     def _handle_one(self, pos, now: float):
         # MINT_COOLDOWN_SKIP
         mint = pos.get('mint') if isinstance(pos, dict) else getattr(pos, 'mint', None)
@@ -620,7 +668,7 @@ class SellEngine:
         qty_total = self._ui_qty(pos)
         entry_ts = float(pos.get("entry_ts") or pos.get("opened_ts") or 0.0)
 
-        price = float(self.price_feed.get_price(mint) or 0.0)
+        price = self._get_price_cached(mint)
         # sanity: if high-water is wildly off (e.g. after pricing fix), reset it
         try:
             _hw = float(pos.get("high_water") or pos.get("max_price") or 0.0)
