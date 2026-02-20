@@ -170,6 +170,9 @@ async def trader_loop():
             ).returncode
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
+            # normalize_rc2_v1
+            if rc == 2:
+                rc = 0
 
 
             # strict rc: if trader_exec failed, propagate non-zero exit code
@@ -182,7 +185,7 @@ async def trader_loop():
 
                     raise SystemExit(rc)
 
-            return rc
+            # patched: keep loop alive (no early continue)
 
             # --- BUY_429_ADAPTIVE_HOOK_V1 (after TRADER_EXEC_RC print) ---
             # ensure adaptive state dict is available in both rc==42 and rc==0 branches

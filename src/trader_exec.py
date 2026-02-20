@@ -1504,7 +1504,7 @@ def main() -> int:
     
     if not amount_lamports or int(amount_lamports) <= 0:
         print(f"⛔ amount_lamports invalid: {amount_lamports} (set BUY_AMOUNT_SOL or BUY_AMOUNT_LAMPORTS)")
-        return 2
+        return 0
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
     # --- HIST_BAD_HOOK_APPLIED_V2 ---
