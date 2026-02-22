@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # H24 watchdog: runs full_live_with_brain.sh, restarts on exit, logs per run.
 # Stop cleanly by creating state/STOP file.
+# Singleton: only one instance allowed (via pidfile).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/tng25/lino_FINAL_20260203_182626}"
@@ -8,8 +9,23 @@ cd "$REPO_ROOT"
 
 WATCHDOG_RESTART_DELAY="${WATCHDOG_RESTART_DELAY:-5}"
 STOP_FILE="state/STOP"
+PID_FILE="state/h24_watchdog.pid"
 
 mkdir -p state
+
+# --- Singleton guard ---
+if [ -f "$PID_FILE" ]; then
+  _existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [ -n "$_existing_pid" ] && kill -0 "$_existing_pid" 2>/dev/null; then
+    echo "[h24_watchdog] already running as pid=$_existing_pid -> exiting (singleton)"
+    exit 1
+  fi
+  echo "[h24_watchdog] stale pidfile (pid=$_existing_pid dead) -> removing"
+  rm -f "$PID_FILE"
+fi
+echo $$ > "$PID_FILE"
+trap 'rm -f "$PID_FILE"; echo "[h24_watchdog] pidfile removed"' EXIT INT TERM
+# --- /Singleton guard ---
 
 echo "[h24_watchdog] started pid=$$ repo=$REPO_ROOT restart_delay=${WATCHDOG_RESTART_DELAY}s"
 echo "[h24_watchdog] create '$STOP_FILE' to stop cleanly"

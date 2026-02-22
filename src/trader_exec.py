@@ -53,10 +53,15 @@ def _hist_bad_should_skip(output_mint: str):
     """Return (should_skip, msg, n_closed, avg_pnl, skip_sec)."""
     try:
         import os, sqlite3
+        # Allow complete disable via env
+        if str(os.getenv("DISABLE_HIST_BAD", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            return (False, "disabled", 0, 0.0, 0)
         brain_path = str(os.getenv("BRAIN_DB_PATH", "state/brain.sqlite")).strip()
         min_n = int(os.getenv("HIST_SKIP_MIN_N", "3"))
         max_avg = float(os.getenv("HIST_SKIP_AVG_PNL_MAX", "0.0"))
         skip_sec = int(os.getenv("HIST_SKIP_SEC", "3600"))
+        # Epsilon: only trigger when avg is CLEARLY below threshold (avoids 0==0 false positive)
+        _eps = float(os.getenv("HIST_SKIP_EPSILON", "1e-6"))
 
         if not output_mint:
             return (False, "no_mint", 0, 0.0, skip_sec)
@@ -71,7 +76,8 @@ def _hist_bad_should_skip(output_mint: str):
         n_closed = int(row[0] or 0)
         avg_pnl = float(row[1] or 0.0)
 
-        if n_closed >= min_n and avg_pnl <= max_avg:
+        # Strict check: avg must be clearly below max_avg (not just equal to 0 when max_avg==0)
+        if n_closed >= min_n and avg_pnl < (max_avg - _eps):
             msg = "🧠 HIST_BAD -> RL_SKIP mint=%s n=%d avg=%.4f (min_n=%d max_avg=%.4f sec=%d)" % (
                 output_mint, n_closed, avg_pnl, min_n, max_avg, skip_sec
             )
@@ -1585,11 +1591,12 @@ def main() -> int:
                 _write_err("quote_http", {"status": _qr.status_code, "text": _qr.text[:2000], "url": _qr.url})
                 print(f"❌ [cand] quote failed http={_qr.status_code} mint={output_mint}", flush=True)
                 if int(_qr.status_code) == 429:
+                    _q429_sec = int(os.getenv('QUOTE_429_COOLDOWN_SEC', os.getenv('RL_SKIP_SEC', '300')))
                     try:
-                        _rl_skip_add(str(output_mint), reason='quote_429')
+                        _rl_skip_add(str(output_mint), sec=_q429_sec, reason='quote_429')
                     except Exception:
                         pass
-                    print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {RL_SKIP_SEC}s", flush=True)
+                    print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {_q429_sec}s", flush=True)
                     _b429 = int(os.getenv('QUOTE_429_BACKOFF_S', '25'))
                     print(f'⏳ 429 backoff sleep={_b429}s', flush=True)
                     time.sleep(max(1, _b429))
