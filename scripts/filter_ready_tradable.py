@@ -161,6 +161,25 @@ def main():
 
     _write_jsonl(args.out, kept)
     print(f"DONE kept={len(kept)} bad={bad} soft429={soft429} unauth=0 OUT={args.out}", flush=True)
+
+    # --- LASTGOOD_UPDATE ---
+    # Write lastgood file if kept count meets MIN_TRADABLE_LINES threshold
+    try:
+        _min_lines = int(os.getenv("MIN_TRADABLE_LINES", "5"))
+        _lastgood = os.getenv("FILTER_TRADABLE_LASTGOOD",
+                              args.out.replace(".jsonl", ".lastgood.jsonl"))
+        if len(kept) >= _min_lines and _lastgood:
+            _write_jsonl(_lastgood, kept)
+            print(f"[lastgood] updated kept={len(kept)} -> {_lastgood}", flush=True)
+        elif kept and _lastgood:
+            # still update lastgood if better than nothing and file missing
+            if not os.path.exists(_lastgood):
+                _write_jsonl(_lastgood, kept)
+                print(f"[lastgood] bootstrapped (small) kept={len(kept)} -> {_lastgood}", flush=True)
+    except Exception as _e:
+        print(f"[lastgood] update failed: {_e}", flush=True)
+    # --- /LASTGOOD_UPDATE ---
+
     return 0
 
 if __name__ == "__main__":

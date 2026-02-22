@@ -1261,23 +1261,70 @@ def main() -> int:
 
 
     ready = _load_ready()
+
+    # --- LASTGOOD_FALLBACK ---
+    # If ready list is empty or too small, try lastgood, then ready_scored fallback
+    _min_tradable = int(os.getenv("MIN_TRADABLE_LINES", "5"))
+    if len(ready) < _min_tradable:
+        _lg_path = os.getenv("FILTER_TRADABLE_LASTGOOD",
+                             str(READY_FILE).replace(".jsonl", ".lastgood.jsonl"))
+        if _lg_path and Path(_lg_path).exists():
+            try:
+                _lg = []
+                with open(_lg_path, "r", encoding="utf-8", errors="ignore") as _f:
+                    for _ln in _f:
+                        _ln = _ln.strip()
+                        if _ln:
+                            try:
+                                _lg.append(json.loads(_ln))
+                            except Exception:
+                                pass
+                if len(_lg) > len(ready):
+                    print(f"⚠️ LASTGOOD_FALLBACK: ready={len(ready)} < {_min_tradable} -> using lastgood={len(_lg)} ({_lg_path})", flush=True)
+                    ready = _lg
+            except Exception as _e:
+                print(f"⚠️ LASTGOOD_FALLBACK load failed: {_e}", flush=True)
+        if len(ready) < _min_tradable:
+            _scored_path = os.getenv("READY_SCORED_FILE", "state/ready_scored.jsonl")
+            if _scored_path and Path(_scored_path).exists() and str(READY_FILE) != _scored_path:
+                try:
+                    _sc = []
+                    with open(_scored_path, "r", encoding="utf-8", errors="ignore") as _f:
+                        for _ln in _f:
+                            _ln = _ln.strip()
+                            if _ln:
+                                try:
+                                    _sc.append(json.loads(_ln))
+                                except Exception:
+                                    pass
+                    if len(_sc) > len(ready):
+                        print(f"⚠️ SCORED_FALLBACK: ready={len(ready)} -> using ready_scored={len(_sc)} ({_scored_path})", flush=True)
+                        ready = _sc
+                except Exception as _e:
+                    print(f"⚠️ SCORED_FALLBACK load failed: {_e}", flush=True)
+    # --- /LASTGOOD_FALLBACK ---
+
     # APPLY_RL_SKIP_INLINE (safe)
 
     # --- TRADER_RLSKIP_APPLY_V4 ---
-    try:
-        _before = len(ready) if isinstance(ready, list) else -1
-        if isinstance(ready, list) and _before > 0:
-            def _get_mint(x):
-                try:
-                    return (x.get('mint') or x.get('output_mint') or x.get('address') or '').strip()
-                except Exception:
-                    return ''
-            ready = [x for x in ready if not _rl_skip_is_active(_get_mint(x))]
-            _after = len(ready)
-            if _after != _before:
-                print(f"🧊 RL_SKIP filtered ready: {_before}->{_after} (file={os.getenv('RL_SKIP_FILE','state/rl_skip_mints.json')})", flush=True)
-    except Exception as _e:
-        print('rl_skip_filter_error:', _e, flush=True)
+    _disable_rl_skip = str(os.getenv("DISABLE_RL_SKIP", "0")).strip().lower() in ("1", "true", "yes", "on")
+    if not _disable_rl_skip:
+        try:
+            _before = len(ready) if isinstance(ready, list) else -1
+            if isinstance(ready, list) and _before > 0:
+                def _get_mint(x):
+                    try:
+                        return (x.get('mint') or x.get('output_mint') or x.get('address') or '').strip()
+                    except Exception:
+                        return ''
+                ready = [x for x in ready if not _rl_skip_is_active(_get_mint(x))]
+                _after = len(ready)
+                if _after != _before:
+                    print(f"🧊 RL_SKIP filtered ready: {_before}->{_after} (file={os.getenv('RL_SKIP_FILE','state/rl_skip_mints.json')})", flush=True)
+        except Exception as _e:
+            print('rl_skip_filter_error:', _e, flush=True)
+    else:
+        print("ℹ️ DISABLE_RL_SKIP=1 -> RL_SKIP filter skipped", flush=True)
     # --- /TRADER_RLSKIP_APPLY_V4 ---
 
     # --- READY runtime filter (skip_file + rl_skip) ---
@@ -1289,8 +1336,12 @@ def main() -> int:
     _rl_file   = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
     _skip_set = _load_skip_set(_skip_file)
     # purge expired + clamp before building the active skip set
-    _rl_dict  = _rl_skip_purge_and_save(_rl_file, _now)
-    _rl_set   = {m for m, v in _rl_dict.items() if int(v) > _now}
+    if not _disable_rl_skip:
+        _rl_dict  = _rl_skip_purge_and_save(_rl_file, _now)
+        _rl_set   = {m for m, v in _rl_dict.items() if int(v) > _now}
+    else:
+        _rl_dict = {}
+        _rl_set = set()
     if _skip_set or _rl_set:
         _in = len(ready)
         _ready_pre_rl = list(ready)
@@ -1308,7 +1359,7 @@ def main() -> int:
         if _out != _in:
             print(f"🧊 RL_SKIP filtered ready (exec): in={_in} -> out={_out} skip={len(_skip_set)} rl={len(_rl_set)}")
         # RL_SKIP emptied all candidates: purge stale entries and retry once
-        if _in > 0 and _out == 0 and _rl_set:
+        if _in > 0 and _out == 0 and _rl_set and not _disable_rl_skip:
             print("[RL_SKIP] RL_SKIP_EMPTY_AFTER_FILTER: purging expired entries and retrying", flush=True)
             _now2 = int(time.time())
             _rl_dict2 = _rl_skip_purge_and_save(_rl_file, _now2)

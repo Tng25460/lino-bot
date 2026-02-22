@@ -156,18 +156,22 @@ async def trader_loop():
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH","")
 
+    no_buy_backoff_s = float(os.getenv("NO_BUY_BACKOFF_SEC", "60"))
+
     while True:
         try:
             print(f"TRADER_LOOP_PYTHON={sys.executable}")
-            rc = subprocess.run(
-
+            _proc = subprocess.run(
                 [sys.executable, "-u", "src/trader_exec.py"],
-
                 check=False,
-
                 env=env,
-
-            ).returncode
+                capture_output=True,
+                text=True,
+            )
+            rc = _proc.returncode
+            out_all = (_proc.stdout or "") + (_proc.stderr or "")
+            if out_all:
+                print(out_all, end="", flush=True)
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
             # normalize_rc2_v1
@@ -270,18 +274,28 @@ async def trader_loop():
             except Exception:
                 _cool_s = 900
             try:
-                _out = None
-                try:
-                    _out = locals().get("out_all")
-                except Exception:
-                    _out = None
-                if isinstance(_out, str) and "LOW_SOL_GUARD SKIP" in _out:
+                if isinstance(out_all, str) and "LOW_SOL_GUARD SKIP" in out_all:
                     print(f"⏸️ LOW_SOL_COOLDOWN sleep_s={_cool_s} (LOW_SOL_GUARD)", flush=True)
                     import time as _t
                     _t.sleep(_cool_s)
             except Exception:
                 pass
             # --- /LOW_SOL_COOLDOWN_V1 ---
+
+            # --- NO_BUY_BACKOFF_V1 ---
+            # When trader_exec ran but did NOT execute a buy (rc=0, no "sent txsig" in output),
+            # apply a configurable backoff to avoid tight no-buy spinning.
+            try:
+                _bought = (
+                    rc == 2
+                    or (isinstance(out_all, str) and ("sent txsig=" in out_all or "BUY sent" in out_all))
+                )
+                if not _bought and rc not in (42,) and no_buy_backoff_s > 0:
+                    print(f"⏸️ NO_BUY_BACKOFF sleep_s={no_buy_backoff_s:.1f}", flush=True)
+                    await asyncio.sleep(no_buy_backoff_s)
+            except Exception:
+                pass
+            # --- /NO_BUY_BACKOFF_V1 ---
             # RESYNC_BUY_QTY_AFTER_RC2_V1: after BUY sent (rc=2), resync on-chain qty into DB (avoid OPEN qty=0)
             if rc == 2:
                 try:
