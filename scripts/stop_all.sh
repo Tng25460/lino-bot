@@ -5,7 +5,7 @@ set -euo pipefail
 echo "🛑 stop_all: terminating lino-bot processes"
 
 # Kill by pattern using pgrep + kill (avoids killall/pkill)
-for PATTERN in "brain_refresh_loop.sh" "brain_loop.py" "run_live.py" "trader_loop.py" "trader_exec.py" "filter_ready_tradable.py" "lino_watchdog.sh"; do
+for PATTERN in "brain_refresh_loop.sh" "brain_loop.py" "run_live.py" "trader_loop.py" "trader_exec.py" "filter_ready_tradable.py" "lino_watchdog.sh" "h24_watchdog.sh" "full_live_with_brain.sh"; do
   PIDS=$(pgrep -f "$PATTERN" 2>/dev/null || true)
   if [ -n "$PIDS" ]; then
     echo "  killing $PATTERN pids: $PIDS"
