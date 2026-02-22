@@ -1383,675 +1383,376 @@ def main() -> int:
         return 0
 
 
-    # IMPORTANT: trader_exec ne score PAS. Le scoring/filters doivent être upstream (core/trading.py)
+    # --- MULTI_CANDIDATE_ROTATION_V1 ---
+    _cand_tries = int(os.getenv("CANDIDATE_TRIES", "10"))
+    _tried_mints: set = set()
+    _reason_hist: dict = {}
 
-    # pick first candidate not in skiplist (avoid getting stuck on ready[0])
-    cand = None
-    try:
-        _skip = set()
-        try:
-            _skip = set(_load_skip_mints() or [])
-        except Exception:
-            _skip = set()
-        for _c in ready:
-            _m = (_c.get("outputMint") or _c.get("mint") or _c.get("address") or "").strip()
-            if not _m:
-                continue
-            if _m in _skip:
-                continue
-            cand = _c
-            break
-    except Exception:
-        cand = None
+    # Sort candidates by score descending, limit to top CANDIDATE_TRIES
+    _cands_sorted = sorted(
+        [r for r in ready if isinstance(r, dict)],
+        key=lambda r: float(r.get("score") or r.get("brain_score") or r.get("_score") or -1e9),
+        reverse=True,
+    )[:max(1, _cand_tries)]
 
-    if cand is None:
-        cand = ready[0]
+    print(f"🎯 MULTI_CAND: total_ready={len(ready)} candidates_to_try={len(_cands_sorted)} (CANDIDATE_TRIES={_cand_tries})", flush=True)
 
-    output_mint = (cand.get("outputMint") or cand.get("mint") or cand.get("address") or "").strip()
-# ANTI_REBUY_PICK_LOOP_V1
-    # Re-pick if mint is skipped or last-buy cooldown blocks it
-    skip_set = _load_skip_mints()
-    if output_mint and (output_mint in skip_set or _is_last_buy_blocked(output_mint)):
-        why = 'skip_file' if output_mint in skip_set else 'last_buy_cooldown'
-        print(f"⚠️ re-pick: blocked by {why} mint={output_mint}")
-        # remove blocked mints and pick again
-        ready2 = [r for r in ready if (r.get('outputMint') or r.get('mint') or r.get('address') or '').strip() not in skip_set]
-        cand2 = _pick_best_scored_ready(ready2) if USE_SCORED_IF_PRESENT else (ready2[0] if ready2 else None)
-        if cand2:
-            cand = cand2
-            output_mint = (cand.get('outputMint') or cand.get('mint') or cand.get('address') or '').strip()
-            print(f"   repick -> {output_mint}")
-    FORCE_OUTPUT_MINT = os.getenv("FORCE_OUTPUT_MINT")
-    if FORCE_OUTPUT_MINT:
-        output_mint = FORCE_OUTPUT_MINT.strip()
-        print(f"   [CFG] FORCE_OUTPUT_MINT -> {output_mint}")
-    # --- DUAL_PROFILE_V1 ---
-    if str(output_mint).lower().endswith("pump"):
-        _profile = "PUMP"
-        os.environ["HARD_SL_PCT"]   = "-0.35"
-        os.environ["TP1_PCT"]       = "0.40"
-        os.environ["TP2_PCT"]       = "1.00"
-        os.environ["TIME_STOP_SEC"] = "600"
-    else:
-        _profile = "NORMAL"
-        os.environ["HARD_SL_PCT"]   = "-0.20"
-        os.environ["TP1_PCT"]       = "0.20"
-        os.environ["TP2_PCT"]       = "0.50"
-        os.environ["TIME_STOP_SEC"] = "1800"
-    print(f"   [PROFILE] {_profile} mint={output_mint} HARD_SL_PCT={os.environ['HARD_SL_PCT']} TP1={os.environ['TP1_PCT']} TP2={os.environ['TP2_PCT']} TIME_STOP_SEC={os.environ['TIME_STOP_SEC']}", flush=True)
-    # --- /DUAL_PROFILE_V1 ---
-    # skiplist + bag check
-    try:
-        skip = _load_skip_mints()
-        if output_mint in skip:
-            print(f"⚠️ skip BUY: mint in SKIP_MINTS_FILE mint={output_mint}")
-            return 0
-    except Exception:
-        pass
-    if SKIP_IF_BAG:
-        try:
-            ui = float(_onchain_ui_balance_stable(str(output_mint), tries=3, sleep_s=0.4, timeout_s=3.5) or 0.0)
-        except Exception as _e:
-            ui = 0.0
-            print(f"⚠️ holding ui fetch failed -> ui=0.0 err={_e}", flush=True)
-
-        # if ui==0, recheck harder (avoid transient empty RPC)
-        if ui <= 0.0:
-            try:
-                ui2 = float(_onchain_ui_balance_stable(str(output_mint), tries=6, sleep_s=0.5, timeout_s=6.0) or 0.0)
-                if ui2 > 0.0:
-                    ui = ui2
-            except Exception as _e2:
-                pass
-
-        # update cache when we see ui>0
-        if ui > 0.0:
-            _holding_cache_update(str(output_mint), float(ui))
+    def _try_one_candidate(cand, output_mint):
+        """
+        Try to buy a single candidate.
+        Returns  0 = soft skip (try next candidate)
+        Returns -1 = hard stop (low SOL, bad config)
+        Raises SystemExit(42)  on Jupiter rate limit
+        Raises SystemExit(2)   on successful swap sent
+        Raises SystemExit(3)   on STOP_AFTER_BUILD_TX
+        """
+        # --- DUAL_PROFILE_V1 ---
+        if str(output_mint).lower().endswith("pump"):
+            _profile = "PUMP"
+            os.environ["HARD_SL_PCT"]   = "-0.35"
+            os.environ["TP1_PCT"]       = "0.40"
+            os.environ["TP2_PCT"]       = "1.00"
+            os.environ["TIME_STOP_SEC"] = "600"
         else:
-            # ui==0 : fallback to recent cache (safe: prevent accidental rebuy)
-            _cached = _holding_cache_get_recent_ui(str(output_mint))
-            if _cached > 0.0:
-                print(f"🧠 holding cache used mint={output_mint} cached_ui={_cached}", flush=True)
-                ui = float(_cached)
+            _profile = "NORMAL"
+            os.environ["HARD_SL_PCT"]   = "-0.20"
+            os.environ["TP1_PCT"]       = "0.20"
+            os.environ["TP2_PCT"]       = "0.50"
+            os.environ["TIME_STOP_SEC"] = "1800"
+        print(f"   [PROFILE] {_profile} HARD_SL_PCT={os.environ['HARD_SL_PCT']} TP1={os.environ['TP1_PCT']} TP2={os.environ['TP2_PCT']} TIME_STOP_SEC={os.environ['TIME_STOP_SEC']}", flush=True)
+        # --- /DUAL_PROFILE_V1 ---
 
-        IGNORE_DUST = float(os.getenv("IGNORE_HOLDING_BELOW", "0"))
+        # skiplist check
+        try:
+            _skip = _load_skip_mints()
+            if output_mint in _skip:
+                print(f"⏭️  [cand] skip_file mint={output_mint}", flush=True)
+                return 0
+        except Exception:
+            pass
 
-        if ui < IGNORE_DUST:
-            ui = 0.0
-
-        if ui > 0.0:
-            print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
-            _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC','900')), reason='already_holding')
-            if ui >= BAG_MIN_UI:
-                if str(os.getenv('AUTOSKIP_ALREADY_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
-                    try:
-                        _append_skip_mint(str(output_mint))
-                        print(f"🧷 autoskip already-holding mint={output_mint} -> {_skip_file_path()}")
-                    except Exception as _e:
-                        print("autoskip already-holding failed:", _e)
-                else:
-                    print("🧷 autoskip already-holding disabled (set AUTOSKIP_ALREADY_HOLDING=1 to enable)")
+        # bag check (already holding)
+        if SKIP_IF_BAG:
+            try:
+                ui = float(_onchain_ui_balance_stable(str(output_mint), tries=3, sleep_s=0.4, timeout_s=3.5) or 0.0)
+            except Exception as _e:
+                ui = 0.0
+                print(f"⚠️  holding ui fetch failed -> ui=0.0 err={_e}", flush=True)
+            # recheck harder to avoid transient empty RPC
+            if ui <= 0.0:
+                try:
+                    ui2 = float(_onchain_ui_balance_stable(str(output_mint), tries=6, sleep_s=0.5, timeout_s=6.0) or 0.0)
+                    if ui2 > 0.0:
+                        ui = ui2
+                except Exception:
+                    pass
+            if ui > 0.0:
+                _holding_cache_update(str(output_mint), float(ui))
             else:
-                print(f"   no autoskip: ui={ui} < BAG_MIN_UI={BAG_MIN_UI}", flush=True)
-            if str(os.getenv('REPICK_ON_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
-                try:
-                    _max = int(os.getenv('REPICK_MAX','5'))
-                except Exception:
-                    _max = 5
-                try:
-                    _depth = int(os.getenv('REPICK_DEPTH','0'))
-                except Exception:
-                    _depth = 0
-                if _depth < _max:
+                _cached = _holding_cache_get_recent_ui(str(output_mint))
+                if _cached > 0.0:
+                    print(f"🧠 holding cache used mint={output_mint} cached_ui={_cached}", flush=True)
+                    ui = float(_cached)
+            _ignore_dust = float(os.getenv("IGNORE_HOLDING_BELOW", "0"))
+            if ui < _ignore_dust:
+                ui = 0.0
+            if ui > 0.0:
+                print(f"⏭️  [cand] already_holding mint={output_mint} ui={ui}", flush=True)
+                _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC', '900')), reason='already_holding')
+                if ui >= BAG_MIN_UI and str(os.getenv('AUTOSKIP_ALREADY_HOLDING', '0')).strip() in ('1', 'true', 'True', 'yes', 'YES'):
                     try:
                         _append_skip_mint(str(output_mint))
-                        print(f"🔁 REPICK (re-exec) depth={_depth+1}/{_max} -> skip mint={output_mint}", flush=True)
-                        try:
-                            _append_skip_mint(str(output_mint))
-                            print(f"🧷 REPICK wrote skip mint={output_mint} -> {_skip_file_path()}", flush=True)
-                        except Exception as _e:
-                            print("[WARN] REPICK skip write failed:", _e, flush=True)
+                        print(f"🧷 autoskip already-holding mint={output_mint}", flush=True)
                     except Exception as _e:
-                        print('repick autoskip failed:', _e, flush=True)
-                    _env = os.environ.copy()
-                    _env['REPICK_DEPTH'] = str(_depth + 1)
-                    import sys as _sys
-                    _env['SKIP_MINTS_FILE'] = str(os.getenv('SKIP_MINTS_FILE','')).strip() or str(globals().get('SKIP_MINTS_FILE','state/skip_mints_trader.txt'))
-                    os.execve(_sys.executable, [_sys.executable] + _sys.argv, _env)
-                else:
-                    print(f"🧱 REPICK max reached depth={_depth}/{_max} -> stop", flush=True)
-            return 0
-
-    if not output_mint:
-
-        _write_err("bad_candidate_no_mint", {"candidate": cand})
-
-        print("⚠️ candidate sans mint/outputMint/address")
-
-        return 0
-
-    # rebuy cooldown
-    try:
-        import time as _time
-        last = _load_last_buys()
-        ts = int((last or {}).get(output_mint) or 0)
-        if ts > 0:
-            age = int(_time.time()) - ts
-            if (not BYPASS_COOLDOWN) and age < BUY_COOLDOWN_S:
-                wait = BUY_COOLDOWN_S - age
-                print(f"   [COOLDOWN] selected mint={output_mint}")
-                print(f"⚠️ skip BUY: rebuy cooldown mint={output_mint} age_s={age} wait_s={wait}")
-                # rebuy_cooldown_rl_skip
-                try:
-                    # 'wait' is computed just above: wait = BUY_COOLDOWN_S - age
-                    _wait_s = int(wait) if 'wait' in locals() else int(os.getenv('COOLDOWN_S','1800'))
-                except Exception:
-                    _wait_s = int(os.getenv('COOLDOWN_S','1800'))
-                # clamp (avoid nonsense)
-                _wait_s = max(30, min(_wait_s, 6*3600))
-                try:
-                    _rl_skip_add(str(output_mint), sec=_wait_s, reason='rebuy_cooldown')
-                    print(f"🧊 RL_SKIP rebuy_cooldown -> {output_mint} for {_wait_s}s (repick next)", flush=True)
-                except Exception as _e:
-                    print('rl_skip_add rebuy_cooldown failed:', _e, flush=True)
+                        print(f"autoskip already-holding failed: {_e}", flush=True)
                 return 0
-    except Exception:
-        pass
 
-
-
-    amount_lamports = _lamports_from_any(cand.get("amount_lamports"))
-    BUY_LAMPORTS_OVERRIDE = os.getenv("BUY_LAMPORTS")
-    if BUY_LAMPORTS_OVERRIDE:
-        # --- RL_SKIP REPICK BEFORE PRINT (auto) ---
+        # rebuy cooldown
         try:
-            _rl = _rl_skip_load() or {}
-            _now = int(_t.time())
-            _until = int(_rl.get(output_mint, 0) or 0)
-            if output_mint and _until > _now:
-                _old = output_mint
-                _cands = list(ready) if isinstance(ready, (list, tuple)) else []
-                try:
-                    _cands.sort(key=lambda d: (d.get('score') if isinstance(d, dict) else -1), reverse=True)
-                except Exception:
-                    pass
-                _new = None
-                for _c in _cands:
-                    if not isinstance(_c, dict):
-                        continue
-                    _m = _c.get('mint') or _c.get('address') or _c.get('token')
-                    if not isinstance(_m, str) or not _m.strip():
-                        continue
-                    _m = _m.strip()
+            _last_bs = _load_last_buys()
+            _last_ts = int((_last_bs or {}).get(output_mint) or 0)
+            if _last_ts > 0:
+                _age = int(time.time()) - _last_ts
+                if (not BYPASS_COOLDOWN) and _age < BUY_COOLDOWN_S:
+                    _wait = BUY_COOLDOWN_S - _age
+                    print(f"⏭️  [cand] rebuy_cooldown mint={output_mint} age_s={_age} wait_s={_wait}", flush=True)
+                    _wait_s = max(30, min(int(_wait), 6 * 3600))
                     try:
-                        _u = int(_rl.get(_m, 0) or 0)
+                        _rl_skip_add(str(output_mint), sec=_wait_s, reason='rebuy_cooldown')
                     except Exception:
-                        _u = 0
-                    if _u <= _now:
-                        _new = _c
-                        break
-                if _new is not None:
-                    output_mint = (_new.get('mint') or _new.get('address') or _new.get('token') or output_mint)
-                    if isinstance(output_mint, str):
-                        output_mint = output_mint.strip() or _old
-                    print(f"🧊 RL_SKIP repick(before print): {_old} -> {output_mint}", flush=True)
-        except Exception as _e:
-            print(f"rl_skip repick(before print) failed: {_e}", flush=True)
-    # --- amount_lamports guard (v2) ---
-    if amount_lamports is None:
-        _buy_sol = os.environ.get("BUY_AMOUNT_SOL", "").strip()
-        _buy_lam = os.environ.get("BUY_AMOUNT_LAMPORTS", "").strip() or os.environ.get("AMOUNT_LAMPORTS", "").strip()
-        try:
-            if _buy_sol:
-                amount_lamports = int(float(_buy_sol) * 1_000_000_000)
-            elif _buy_lam:
-                amount_lamports = int(_buy_lam)
-        except Exception:
-            amount_lamports = None
-    
-    if not amount_lamports or int(amount_lamports) <= 0:
-        print(f"⛔ amount_lamports invalid: {amount_lamports} (set BUY_AMOUNT_SOL or BUY_AMOUNT_LAMPORTS)")
-        return 0
-    # --- /amount_lamports guard (v2) ---
-    print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
-    # --- HIST_BAD_HOOK_APPLIED_V2 ---
-    try:
-        _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
-        if _hs:
-            print(_hmsg, flush=True)
-            # Prefer RL_SKIP if available, else fallback to SKIP_MINTS_FILE
-            try:
-                _rl_skip_add(output_mint, int(_hsec), reason='hist_bad')
-                print('🧊 RL_SKIP hist_bad sec=%d mint=%s' % (int(_hsec), output_mint), flush=True)
-            except Exception as _e:
-                try:
-                    import os as _os
-                    _sf = str(_os.getenv('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip()
-                    if _sf:
-                        with open(_sf,'a',encoding='utf-8') as _f: _f.write(output_mint.strip()+'\n')
-                        print('🧷 SKIP_MINTS fallback hist_bad -> %s' % _sf, flush=True)
-                except Exception:
-                    pass
-            return 0
-    except Exception as _e:
-        print('hist_hook_error:', _e, flush=True)
-    # --- /HIST_BAD_HOOK_APPLIED_V2 ---
-
-    # --- LOW_SOL_GUARD_V5 ---
-    import os as _os
-
-    _wallet = _os.getenv("WALLET_PUBKEY") or _os.getenv("TRADER_USER_PUBLIC_KEY") or None
-    _rpc = _os.getenv("RPC_HTTP", "https://api.mainnet-beta.solana.com")
-
-    def _fenv(name, default):
-        try:
-            v = _os.getenv(name, "")
-            return float(v) if str(v).strip() != "" else float(default)
-        except Exception:
-            return float(default)
-
-    # always read from env (do not trust in-code constants)
-    _buf = _fenv("MIN_SOL_BUFFER_SOL", 0.0)
-    _amt = _fenv("BUY_AMOUNT_SOL", (float(amount_lamports)/1_000_000_000 if amount_lamports else 0.0))
-    _extra = _fenv("BUY_EXTRA_SOL_CUSHION", 0.003)
-    _need = _buf + _amt + _extra
-
-    # resolve SOL balance: locals -> RPC getBalance(wallet)
-    _sol = None
-    try:
-        _loc = locals()
-        if "sol_balance_sol" in _loc and _loc["sol_balance_sol"] is not None:
-            _sol = float(_loc["sol_balance_sol"])
-        elif "sol_balance_lamports" in _loc and _loc["sol_balance_lamports"] is not None:
-            _sol = float(_loc["sol_balance_lamports"]) / 1_000_000_000
-        elif "sol_lamports" in _loc and _loc["sol_lamports"] is not None:
-            _sol = float(_loc["sol_lamports"]) / 1_000_000_000
-        elif "sol_balance" in _loc and _loc["sol_balance"] is not None:
-            _sol = float(_loc["sol_balance"])
-    except Exception:
-        _sol = None
-
-    if _sol is None and _wallet:
-        try:
-            import requests as _rq
-            _r = _rq.post(_rpc, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(_wallet)]}, timeout=10)
-            if _r.status_code == 200:
-                _j = _r.json()
-                _lam = (((_j or {}).get("result") or {}).get("value"))
-                if _lam is not None:
-                    _sol = float(_lam) / 1_000_000_000
+                        pass
+                    return 0
         except Exception:
             pass
 
-    print(f"LOW_SOL_GUARD status sol={_sol} need={_need:.6f} (buf={_buf:.6f} amt={_amt:.6f} extra={_extra:.6f}) wallet={_wallet} rpc={_rpc}", flush=True)
-
-    if _sol is not None and _sol < _need:
-        print(f"LOW_SOL_GUARD SKIP sol={_sol:.6f} need>={_need:.6f}", flush=True)
+        # hist_bad check
         try:
-            _rl_skip_add(output_mint, 600, reason="low_sol_guard")
-        except Exception:
-            pass
-        import sys
-        sys.exit(0)
-# --- /LOW_SOL_GUARD_V5 ---
-
-    if TRADER_QUOTE_ONLY:
-        # quote-only: perform 1 Jupiter quote (exercise RL + cache), then stop
-
-        import asyncio as _asyncio
-
-        import aiohttp as _aiohttp
-
-        from core.jupiter_exec import _get_json as _jup_get_json
-
-        _jup_base = os.getenv('JUP_BASE_URL', 'https://lite-api.jup.ag').rstrip('/')
-
-        _qurl = f"{_jup_base}/swap/v1/quote"
-
-        _qparams = {
-
-          'inputMint': SOL_MINT,
-
-          'outputMint': output_mint,
-
-          'amount': str(amount_lamports),
-
-          'slippageBps': str(SLIPPAGE_BPS),
-
-        }
-
-        async def _qo():
-
-          async with _aiohttp.ClientSession() as _s:
-
-            return await _jup_get_json(_s, _qurl, _qparams)
-
-        try:
-
-          _q = _asyncio.run(_qo())
-
-          _rp = _q.get('routePlan') or []
-
-          print(f"🧪 quote_only quote OK outAmount={_q.get('outAmount')} routes={len(_rp)}", flush=True)
-
-        except Exception as _e:
-
-          print(f"🧪 quote_only quote ERR {type(_e).__name__} {str(_e)[:140]}", flush=True)
-
-        return 0
-    # QUOTE
-    qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
-    params = {
-        "inputMint": SOL_MINT,
-        "outputMint": output_mint,
-        "amount": str(int(amount_lamports)),
-        "slippageBps": str(SLIPPAGE_BPS),
-    }
-    try:
-        qr = requests.get(qurl, params=params, headers=_headers(), timeout=25)
-        _append_dbg("QUOTE_URL=" + qr.url)
-        _append_dbg("QUOTE_STATUS=" + str(qr.status_code))
-        _append_dbg("QUOTE_BODY=" + (qr.text[:2000] if qr.text else ""))
-        if qr.status_code != 200:
-            _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
-            print("❌ quote failed http=", qr.status_code)
-            # --- RL_SKIP_ON_429 ---
-            try:
-                _h = int(qr.status_code)
-            except Exception:
-                _h = -1
-            if _h == 429:
-                # PERF: rate-limit => RL_SKIP + repick next tick
+            _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
+            if _hs:
+                print(f"⏭️  [cand] hist_bad mint={output_mint}: {_hmsg}", flush=True)
                 try:
-                    _rl_skip_add(str(output_mint), reason='quote_429')
-                except Exception as _e:
-                    print('rl_skip_add failed:', _e, flush=True)
-                try:
-                    print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {RL_SKIP_SEC}s (repick next)", flush=True)
-                    import time as _t
-                    _b = int(os.getenv('QUOTE_429_BACKOFF_S','25'))
-                    print(f'⏳ 429 backoff sleep={_b}s', flush=True)
-                    _t.sleep(max(1, _b))
+                    _rl_skip_add(output_mint, int(_hsec), reason='hist_bad')
                 except Exception:
                     pass
-                import time as _time
-                _time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','0.3')))
-                raise SystemExit(42)
-            try:
-                _http = int(http)
-            except Exception:
-                _http = -1
-            if _http == 429:
-                _rl_skip_add(str(output_mint))
-                print(f'⏳ quote 429 -> RL_SKIP {output_mint} for {RL_SKIP_SEC}s (no autoskip)', flush=True)
-                time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','1.5')))
                 return 0
-            # AUTO_SKIP_QUOTE_HTTP_FAIL_V2
-            try:
-                _body = (qr.text or '')
-                _head = _body[:500]
-                # logs utiles
-                print('   quote_body_head=', _head)
-   # 429/rate-limit is not a token issue -> do not autoskip
-                _u = str(output_mint)
-                _b = _body.lower()
-                # TOKEN_NOT_TRADABLE / no route => autoskip
-                if ('token_not_tradable' in _b) or ('not tradable' in _b) or ('could not find any route' in _b) or ('no route' in _b):
-                    try:
-                        _append_skip_mint(_u)
-                        print(f'⛔ AUTO_SKIP_QUOTE_FAIL mint={_u} -> {SKIP_MINTS_FILE}')
-                    except Exception as _e:
-                        print('autoskip quote-fail failed:', _e)
-            except Exception as _e:
-                print('quote-fail inspect error:', _e)
+        except Exception as _e:
+            print(f"hist_hook_error: {_e}", flush=True)
 
-            # AUTO_SKIP_QUOTE_HTTP_400_V1
+        # amount_lamports resolution
+        _amount_lamports = _lamports_from_any(cand.get("amount_lamports"))
+        _buy_sol_env = os.environ.get("BUY_AMOUNT_SOL", "").strip()
+        _buy_lam_env = (os.environ.get("BUY_AMOUNT_LAMPORTS", "") or os.environ.get("AMOUNT_LAMPORTS", "")).strip()
+        _buy_lam_override = os.getenv("BUY_LAMPORTS", "").strip()
+        if _amount_lamports is None:
             try:
-                _body = (qr.text or '')
-                print('   quote_body_head=', _body[:600])
-                _low = _body.lower()
-                if ('token_not_tradable' in _low) or ('not tradable' in _low):
-                    try:
-                        _append_skip_mint(str(output_mint))
-                        print(f"⛔ AUTO_SKIP TOKEN_NOT_TRADABLE mint={output_mint} -> {SKIP_MINTS_FILE}")
-                    except Exception as _e:
-                        print('autoskip TOKEN_NOT_TRADABLE failed:', _e)
-                if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
-                    try:
-                        _append_skip_mint(str(output_mint))
-                        print(f"⛔ AUTO_SKIP NO_ROUTE mint={output_mint} -> {SKIP_MINTS_FILE}")
-                    except Exception as _e:
-                        print('autoskip NO_ROUTE failed:', _e)
-            except Exception as _e:
-                print('quote error parse failed:', _e)
-
-            # --- AUTO_SKIP_NO_ROUTE: avoid looping on mints with no Jupiter route ---
+                if _buy_sol_env:
+                    _amount_lamports = int(float(_buy_sol_env) * 1_000_000_000)
+                elif _buy_lam_env:
+                    _amount_lamports = int(_buy_lam_env)
+            except Exception:
+                _amount_lamports = None
+        if _buy_lam_override:
             try:
-                try:
-                    _http = int(http)
-                except Exception:
-                    _http = -1
-            
-                # NEVER autoskip on rate limit
-                if _http == 429:
-                    print('⏳ quote 429 rate-limit -> NOT autoskipping mint', flush=True)
-                else:
-                    _body = (qr.text or '')
-                    _low = _body.lower()
-            
-                    # Only autoskip if we are confident it's really no route (not transient)
-                    if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
-                        _sk = os.getenv('TRADER_SKIP_MINTS_FILE','state/skip_mints_trader.txt')
-                        Path(_sk).parent.mkdir(parents=True, exist_ok=True)
-                        with open(_sk, 'a', encoding='utf-8') as f:
-                            f.write(str(output_mint).strip() + '\n')
-                        print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={output_mint} to SKIP_MINTS_FILE={_sk}", flush=True)
-                    else:
-                        print('ℹ️ quote failed but not NO_ROUTE -> no autoskip', flush=True)
-                        # --- QUOTE_429_RAISE_V1 ---
-                        raise Exception("quote failed http= 429")
-                        # --- /QUOTE_429_RAISE_V1 ---
-            except Exception as _e:
-                print(f"⚠️ AUTO_SKIP_NO_ROUTE handler error mint={output_mint} err={repr(_e)}", flush=True)
-            return 0
-        quote = qr.json()
-    except Exception as e:
-        _write_err("quote_exc", {"error": str(e)})
-        print("❌ quote exception:", e)
-        return 0
-
-    # SWAP build
-    surl = os.getenv("JUP_SWAP_URL", f"{JUP_BASE}/swap/v1/swap")
-    body = {"quoteResponse": quote, "userPublicKey": WALLET_PUBKEY, "wrapAndUnwrapSol": True}
-
-    try:
-        sr = requests.post(surl, headers=_headers(), json=body, timeout=35)
-        _append_dbg("SWAP_STATUS=" + str(sr.status_code))
-        _append_dbg("SWAP_BODY=" + (sr.text[:2000] if sr.text else ""))
-        if sr.status_code != 200:
-            _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
-            print("❌ swap build failed http=", sr.status_code)
-            try:
-                _raw = sr
-                _code = getattr(_raw, 'status_code', _raw)
-                if str(_code).strip() == '429':
-                    print('🧊 BUY_429_DETECTED swap_build -> exit(42)', flush=True)
-                    raise SystemExit(42)
-            except SystemExit:
-                raise
+                _amount_lamports = int(_buy_lam_override)
             except Exception:
                 pass
+        if not _amount_lamports or int(_amount_lamports) <= 0:
+            print(f"⛔ amount_lamports invalid: {_amount_lamports} (set BUY_AMOUNT_SOL or BUY_AMOUNT_LAMPORTS)", flush=True)
+            return -1  # hard stop: config issue
+
+        print(f"   pick= {output_mint} amount_lamports= {_amount_lamports}", flush=True)
+
+        # LOW_SOL_GUARD
+        _wallet = os.getenv("WALLET_PUBKEY") or os.getenv("TRADER_USER_PUBLIC_KEY") or None
+        _rpc_url = os.getenv("RPC_HTTP", "https://api.mainnet-beta.solana.com")
+
+        def _fenv(name, default):
+            try:
+                v = os.getenv(name, "")
+                return float(v) if str(v).strip() != "" else float(default)
+            except Exception:
+                return float(default)
+
+        _buf = _fenv("MIN_SOL_BUFFER_SOL", 0.0)
+        _amt_sol = _fenv("BUY_AMOUNT_SOL", float(_amount_lamports) / 1_000_000_000)
+        _extra = _fenv("BUY_EXTRA_SOL_CUSHION", 0.003)
+        _need = _buf + _amt_sol + _extra
+        _sol_bal = None
+        if _wallet:
+            try:
+                _bal_r = requests.post(_rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(_wallet)]}, timeout=10)
+                if _bal_r.status_code == 200:
+                    _lam_val = ((_bal_r.json().get("result") or {}).get("value"))
+                    if _lam_val is not None:
+                        _sol_bal = float(_lam_val) / 1_000_000_000
+            except Exception:
+                pass
+        print(f"LOW_SOL_GUARD status sol={_sol_bal} need={_need:.6f} (buf={_buf:.6f} amt={_amt_sol:.6f} extra={_extra:.6f}) wallet={_wallet} rpc={_rpc_url}", flush=True)
+        if _sol_bal is not None and _sol_bal < _need:
+            print(f"LOW_SOL_GUARD SKIP sol={_sol_bal:.6f} need>={_need:.6f}", flush=True)
+            try:
+                _rl_skip_add(output_mint, 600, reason="low_sol_guard")
+            except Exception:
+                pass
+            return -1  # hard stop: not enough SOL
+
+        # TRADER_QUOTE_ONLY mode
+        if TRADER_QUOTE_ONLY:
+            _qurl_only = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
+            _qp_only = {"inputMint": SOL_MINT, "outputMint": output_mint, "amount": str(_amount_lamports), "slippageBps": str(SLIPPAGE_BPS)}
+            try:
+                _qr_only = requests.get(_qurl_only, params=_qp_only, headers=_headers(), timeout=25)
+                _rp = (_qr_only.json().get('routePlan') or []) if _qr_only.status_code == 200 else []
+                print(f"🧪 quote_only OK outAmount={_qr_only.json().get('outAmount') if _qr_only.status_code==200 else 'n/a'} routes={len(_rp)}", flush=True)
+            except Exception as _qoe:
+                print(f"🧪 quote_only ERR {type(_qoe).__name__} {str(_qoe)[:140]}", flush=True)
             return 0
 
-        swap = sr.json()
-        txb64 = swap.get("swapTransaction")
-        if not txb64:
-            _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
-            print("⚠️ swap response sans swapTransaction")
-            return 0
-
-        OUT_TX_B64.write_text(txb64, encoding="utf-8")
-        OUT_META.write_text(json.dumps({
-            "ts": int(_time.time()),
-            "mode": "BUY",
+        # QUOTE
+        _qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
+        _qparams = {
             "inputMint": SOL_MINT,
             "outputMint": output_mint,
-            "amount_lamports": amount_lamports,
-            "slippageBps": SLIPPAGE_BPS,
-            "userPublicKey": WALLET_PUBKEY,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        if TRADER_QUOTE_ONLY:
-
-            print("🧪 quote_only -> skip built tx", flush=True)
-
+            "amount": str(int(_amount_lamports)),
+            "slippageBps": str(SLIPPAGE_BPS),
+        }
+        try:
+            _qr = requests.get(_qurl, params=_qparams, headers=_headers(), timeout=25)
+            _append_dbg("QUOTE_URL=" + _qr.url)
+            _append_dbg("QUOTE_STATUS=" + str(_qr.status_code))
+            _append_dbg("QUOTE_BODY=" + (_qr.text[:2000] if _qr.text else ""))
+            if _qr.status_code != 200:
+                _write_err("quote_http", {"status": _qr.status_code, "text": _qr.text[:2000], "url": _qr.url})
+                print(f"❌ [cand] quote failed http={_qr.status_code} mint={output_mint}", flush=True)
+                if int(_qr.status_code) == 429:
+                    try:
+                        _rl_skip_add(str(output_mint), reason='quote_429')
+                    except Exception:
+                        pass
+                    print(f"🧊 RL_SKIP quote_429 -> {output_mint} for {RL_SKIP_SEC}s", flush=True)
+                    _b429 = int(os.getenv('QUOTE_429_BACKOFF_S', '25'))
+                    print(f'⏳ 429 backoff sleep={_b429}s', flush=True)
+                    time.sleep(max(1, _b429))
+                    raise SystemExit(42)
+                _qbody = (_qr.text or '').lower()
+                if any(x in _qbody for x in ('token_not_tradable', 'not tradable', 'could not find any route', 'no_route', 'no route')):
+                    try:
+                        _append_skip_mint(str(output_mint))
+                        print(f"⛔ AUTO_SKIP quote_fail mint={output_mint}", flush=True)
+                    except Exception:
+                        pass
+                return 0
+            _quote = _qr.json()
+        except SystemExit:
+            raise
+        except Exception as _qe:
+            _write_err("quote_exc", {"error": str(_qe)})
+            print(f"❌ [cand] quote exception mint={output_mint}: {_qe}", flush=True)
+            _qmsg = str(_qe).lower()
+            if '429' in _qmsg or 'rate limit' in _qmsg or 'too many' in _qmsg:
+                raise SystemExit(42)
             return 0
 
-        print("✅ built tx -> last_swap_tx.b64")
-        # STOP_AFTER_BUILD_ALWAYS_V1: if STOP_AFTER_BUILD_TX=1, EXIT after build (NO SEND), even in LIVE
-        if os.getenv('STOP_AFTER_BUILD_TX','0').strip().lower() in ('1','true','yes','on'):
-            print('🛑 STOP_AFTER_BUILD_TX=1 -> EXIT after build (NO SEND)', flush=True)
-            # RC3_AFTER_BUILD_V1: signal parent loop that we built a tx (DRY-ish)
-            raise SystemExit(3)
-        # STOP_AFTER_BUILD_TX (avoid spamming quotes/swaps in DRY)
+        # SWAP build
+        _surl = os.getenv("JUP_SWAP_URL", f"{JUP_BASE}/swap/v1/swap")
+        _sbody = {"quoteResponse": _quote, "userPublicKey": WALLET_PUBKEY, "wrapAndUnwrapSol": True}
         try:
-            _is_dry = os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on')
-        except Exception:
-            _is_dry = False
-        # AUTO_SKIP_AFTER_BUILD_TX (perf)
-        # --- DRYRUN_BUILDTX_RL_SKIP_HOOK_V3 ---
-        # In DRY_RUN, optionally add short RL_SKIP to rotate candidates after building a tx.
-        try:
-            _is_dry = (os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on'))
-        except Exception:
-            _is_dry = False
-        if _is_dry:
-            try:
-                _sec = int(float(os.getenv('DRYRUN_BUILDTX_RL_SKIP_SEC','0')))
-            except Exception:
-                _sec = 0
-            if _sec > 0:
+            _sr = requests.post(_surl, headers=_headers(), json=_sbody, timeout=35)
+            _append_dbg("SWAP_STATUS=" + str(_sr.status_code))
+            _append_dbg("SWAP_BODY=" + (_sr.text[:2000] if _sr.text else ""))
+            if _sr.status_code != 200:
+                _write_err("swap_http", {"status": _sr.status_code, "text": _sr.text[:2000]})
+                print(f"❌ [cand] swap build failed http={_sr.status_code} mint={output_mint}", flush=True)
+                if str(_sr.status_code).strip() == '429':
+                    print('🧊 BUY_429_DETECTED swap_build -> exit(42)', flush=True)
+                    raise SystemExit(42)
+                return 0
+
+            _swap = _sr.json()
+            _txb64 = _swap.get("swapTransaction")
+            if not _txb64:
+                _write_err("swap_no_tx", {"keys": list(_swap.keys())})
+                print(f"⚠️  [cand] swap no swapTransaction mint={output_mint}", flush=True)
+                return 0
+
+            OUT_TX_B64.write_text(_txb64, encoding="utf-8")
+            OUT_META.write_text(json.dumps({
+                "ts": int(time.time()),
+                "mode": "BUY",
+                "inputMint": SOL_MINT,
+                "outputMint": output_mint,
+                "amount_lamports": _amount_lamports,
+                "slippageBps": SLIPPAGE_BPS,
+                "userPublicKey": WALLET_PUBKEY,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            print(f"✅ built tx -> last_swap_tx.b64 mint={output_mint}", flush=True)
+
+            if os.getenv('STOP_AFTER_BUILD_TX', '0').strip().lower() in ('1', 'true', 'yes', 'on'):
+                print('🛑 STOP_AFTER_BUILD_TX=1 -> EXIT after build (NO SEND)', flush=True)
+                raise SystemExit(3)
+
+            _is_dry_run = os.getenv('TRADER_DRY_RUN', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+            _dryrun_rl_sec = int(float(os.getenv('DRYRUN_BUILDTX_RL_SKIP_SEC', '0') or '0'))
+            if _is_dry_run and _dryrun_rl_sec > 0:
                 try:
-                    _rl_skip_add(str(output_mint), sec=_sec, reason='dryrun_built_tx')
-                except Exception as _e:
-                    print(f"rl_skip_add(dryrun_built_tx) failed: {_e}", flush=True)
-        else:
-            # LIVE: keep existing behavior (mark built_tx) but don't crash if rl_skip isn't available
-            try:
-                _rl_skip_add(str(output_mint), reason='built_tx')
-            except Exception:
-                pass
-        # --- /DRYRUN_BUILDTX_RL_SKIP_HOOK_V3 ---
-        if DRY_RUN:
-            print("🧪 DRY_RUN=1 -> not sending")
-            # --- AUTO_SKIP_DRY_RUN_V2 ---
-            try:
-                if str(os.getenv('TRADER_DRY_RUN','0')).strip().lower() in ('1','true','yes','on'):
-                    _m = str(output_mint or '').strip()
-                    _sf = str(_os.getenv('SKIP_MINTS_FILE','state/skip_mints_trader.txt')).strip()
-                    if _m and _sf:
-                        _seen = False
+                    _rl_skip_add(str(output_mint), sec=_dryrun_rl_sec, reason='dryrun_built_tx')
+                except Exception:
+                    pass
+            elif not _is_dry_run:
+                try:
+                    _rl_skip_add(str(output_mint), reason='built_tx')
+                except Exception:
+                    pass
+
+            if DRY_RUN:
+                print(f"🧪 DRY_RUN=1 -> not sending mint={output_mint}", flush=True)
+                if str(os.getenv('DRYRUN_AUTOSKIP', '0')).strip() in ('1', 'true', 'True', 'yes', 'YES'):
+                    _m_dry = str(output_mint or '').strip()
+                    _sf_dry = str(os.getenv('SKIP_MINTS_FILE', 'state/skip_mints_trader.txt')).strip()
+                    if _m_dry and _sf_dry and not _in_rebuy_pool(_m_dry):
                         try:
-                            if os.path.exists(_sf):
-                                with open(_sf, 'r', encoding='utf-8', errors='ignore') as _rf:
-                                    for _ln in _rf:
-                                        if _ln.strip() == _m:
-                                            _seen = True
-                                            break
+                            _append_skip_mint(_m_dry)
+                            print(f"🧷 DRY_RUN autoskip -> {_m_dry}", flush=True)
                         except Exception:
-                            _seen = False
-                        if not _seen:
-                            try:
-                                os.makedirs(os.path.dirname(_sf) or '.', exist_ok=True)
-                            except Exception:
-                                pass
-                            try:
-                                if str(os.getenv('DRYRUN_AUTOSKIP','0')).strip() in ('1','true','True','yes','YES'):
-                                    with open(_sf, 'a', encoding='utf-8') as _af:
-                                        _af.write(_m + '\n')
-                                else:
-                                    print("🧷 DRY_RUN autoskip disabled (set DRYRUN_AUTOSKIP=1 to enable)")
-                                if _in_rebuy_pool(output_mint):
-                                    print(f"🧪 REBUY_POOL allow mint={output_mint} (no autoskip)", flush=True)
-                                else:
-                                    if str(os.getenv('DRYRUN_AUTOSKIP','0')).strip() in ('1','true','True','yes','YES'):
-                                        print(f"🧷 DRY_RUN autoskip -> {_m} (SKIP_MINTS_FILE={_sf})", flush=True)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-            # --- /AUTO_SKIP_DRY_RUN_V2 ---
+                            pass
+                _dry_sleep = float(os.getenv('DRY_RUN_AUTOSKIP_SLEEP_S', '0.75') or '0.75')
+                if _dry_sleep > 0:
+                    time.sleep(_dry_sleep)
+                return 0
 
-            # --- DRY_RUN_AUTOSKIP_SLEEP_V1 ---
+            # SEND
             try:
-                if str(os.getenv('TRADER_DRY_RUN','0')).strip().lower() in ('1','true','yes','on'):
-                    _s = float(os.getenv('DRY_RUN_AUTOSKIP_SLEEP_S','0.75') or 0.75)
-                    if _s > 0:
-                        time.sleep(_s)
-            except Exception:
-                pass
-            # --- /DRY_RUN_AUTOSKIP_SLEEP_V1 ---
+                _txsig = _send_signed_b64(_txb64, RPC_HTTP)
+                OUT_SENT.write_text(json.dumps({"ts": int(time.time()), "txsig": _txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"✅ sent txsig= {_txsig} mint={output_mint}", flush=True)
+                if not DRY_RUN:
+                    try:
+                        _dbp = os.getenv('TRADES_DB_PATH', os.getenv('DB_PATH', 'state/trades.sqlite'))
+                        _qty_sol_v = float(_amount_lamports) / 1e9
+                        _db_record_buy_schema_safe(_dbp, output_mint, _txsig, symbol='', qty_token=0.0, price=0.0, qty_sol=_qty_sol_v)
+                        print(f"✅ DB: recorded BUY mint={output_mint} txsig={_txsig[:8]}… db={_dbp}", flush=True)
+                    except Exception as _dbe:
+                        print(f"⚠️  DB record BUY failed: {_dbe}", flush=True)
+                try:
+                    _last_buy_set(output_mint)
+                except Exception:
+                    pass
+                try:
+                    _autoskip_mint(output_mint)
+                except Exception as _ae:
+                    print(f'⚠️  autoskip failed: {_ae}', flush=True)
+                raise SystemExit(2)
+            except SystemExit:
+                raise
+            except Exception as _se:
+                _write_err("send_exc", {"error": str(_se)})
+                print(f"❌ [cand] send exception mint={output_mint}: {_se}", flush=True)
+                return 0
 
+        except SystemExit:
+            raise
+        except Exception as _swe:
+            _write_err("swap_exc", {"error": str(_swe)})
+            print(f"❌ [cand] swap exception mint={output_mint}: {_swe}", flush=True)
             return 0
 
+    # --- Candidate rotation loop ---
+    _hard_stopped = False
+    for _ci, _cand in enumerate(_cands_sorted):
+        _output_mint = (_row_mint(_cand) or _cand.get("outputMint") or "").strip()
+        if not _output_mint or _output_mint in _tried_mints:
+            continue
+        _tried_mints.add(_output_mint)
+
+        # FORCE_OUTPUT_MINT override
+        _force_mint = os.getenv("FORCE_OUTPUT_MINT", "").strip()
+        if _force_mint:
+            _output_mint = _force_mint
+            print(f"   [CFG] FORCE_OUTPUT_MINT -> {_output_mint}", flush=True)
+
+        print(f"🎯 [cand {_ci+1}/{len(_cands_sorted)}] trying mint={_output_mint}", flush=True)
         try:
-            txsig = _send_signed_b64(txb64, RPC_HTTP)
-            OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
-            print("✅ sent txsig=", txsig)
-            # --- DB record BUY (schema-safe) ---
-            # DB_GUARD_DRY_V1: avoid polluting DB in DRY_RUN / STOP_AFTER_BUILD_TX
-            if os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on') or os.getenv('STOP_AFTER_BUILD_TX','0').strip().lower() in ('1','true','yes','on'):
-                print('🧪 DB_GUARD_DRY_V1 -> skip DB record (dry/stop_after_build)', flush=True)
-            else:
-                try:
-                    _dbp = os.getenv('TRADES_DB_PATH', os.getenv('DB_PATH', 'state/trades.sqlite'))
-                    _sym = locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or ''
-                    _qty_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
-                    _price = float(locals().get('exec_price') or locals().get('price') or 0.0)
-                    _db_record_buy_schema_safe(_dbp, output_mint, txsig, symbol=_sym, qty_token=0.0, price=_price, qty_sol=_qty_sol)
-                    print(f"✅ DB: recorded BUY mint={output_mint} txsig={txsig[:8]}… db={_dbp}", flush=True)
-                except Exception as _e:
-                    print(f"⚠️ DB record BUY failed: {_e}", flush=True)
-            # ANTI_REBUY_AFTER_SEND_V1
-            try:
-                _last_buy_set(output_mint)
-            except Exception:
-                pass
-            if 0:
-                pass  # disabled legacy DB hook (schema mismatch)
-                        # --- DB HOOK (legacy) DISABLED: old schema mismatch (wallet/meta_json/price_usd/etc.) ---
-            pass
-            # --- end DB HOOK ---
+            _rc = _try_one_candidate(_cand, _output_mint)
+        except SystemExit:
+            raise
+        except Exception as _ex:
+            print(f"❌ [cand {_ci+1}] unexpected error mint={_output_mint}: {_ex}", flush=True)
+            _reason_hist["error"] = _reason_hist.get("error", 0) + 1
+            continue
 
+        if _rc == -1:
+            _hard_stopped = True
+            print(f"⛔ [cand {_ci+1}] hard_stop -> aborting rotation", flush=True)
+            break
+        # rc == 0: soft skip, try next
+        _reason_hist["soft_skip"] = _reason_hist.get("soft_skip", 0) + 1
 
-            # autoskip: éviter rebuy du même mint après BUY OK
-            try:
-                if output_mint:
-                    _autoskip_mint(output_mint)
-            except Exception as e:
-                print('⚠️ autoskip failed:', e)
-            # EXIT2_AFTER_SEND_V1: signal parent loop that a swap was sent
-            raise SystemExit(2)
-            # record_last_buy
-            try:
-                import time as _time
-                last=_load_last_buys()
-                last[output_mint]=int(_time.time())
-                _save_last_buys(last)
-            except Exception:
-                pass
-
-
-        except Exception as e:
-            _write_err("send_exc", {"error": str(e)})
-            print("❌ send exception:", e)
-
-        return 0
-
-    except Exception as e:
-        _write_err("swap_exc", {"error": str(e)})
-        print("❌ swap exception:", e)
-        return 0
+    # --- NO_BUY summary ---
+    if _tried_mints:
+        print(f"NO_BUY after tries={len(_tried_mints)} candidates={len(_cands_sorted)} hard_stop={_hard_stopped} reasons={_reason_hist}", flush=True)
+    return 0
+    # --- /MULTI_CANDIDATE_ROTATION_V1 ---
 
 
 if __name__ == "__main__":
