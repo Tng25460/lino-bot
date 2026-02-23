@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # H24 watchdog: runs full_live_with_brain.sh, restarts on exit, logs per run.
 # Stop cleanly by creating state/STOP file.
-# Singleton: only one instance allowed (via pidfile).
+# Singleton: enforced via flock (atomic, race-condition-free, no stale-pid risk).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/tng25/lino_FINAL_20260203_182626}"
@@ -9,22 +9,19 @@ cd "$REPO_ROOT"
 
 WATCHDOG_RESTART_DELAY="${WATCHDOG_RESTART_DELAY:-5}"
 STOP_FILE="state/STOP"
-PID_FILE="state/h24_watchdog.pid"
+LOCK_FILE="state/h24_watchdog.lock"
 
 mkdir -p state
 
-# --- Singleton guard ---
-if [ -f "$PID_FILE" ]; then
-  _existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-  if [ -n "$_existing_pid" ] && kill -0 "$_existing_pid" 2>/dev/null; then
-    echo "[h24_watchdog] already running as pid=$_existing_pid -> exiting (singleton)"
-    exit 1
-  fi
-  echo "[h24_watchdog] stale pidfile (pid=$_existing_pid dead) -> removing"
-  rm -f "$PID_FILE"
+# --- Singleton guard via flock ---
+# We re-exec ourselves under flock so the lock is held for the lifetime of the process.
+# FD 200 is used for the lock; flock -n fails immediately if already locked.
+if [ "${_H24_LOCKED:-}" != "1" ]; then
+  exec env _H24_LOCKED=1 flock -n "$LOCK_FILE" "$0" "$@"
+  # exec replaces this process; code below only runs in the locked instance
 fi
-echo $$ > "$PID_FILE"
-trap 'rm -f "$PID_FILE"; echo "[h24_watchdog] pidfile removed"' EXIT INT TERM
+# If we reach here, we hold the flock lock.
+echo "[h24_watchdog] singleton lock acquired (flock $LOCK_FILE) pid=$$"
 # --- /Singleton guard ---
 
 echo "[h24_watchdog] started pid=$$ repo=$REPO_ROOT restart_delay=${WATCHDOG_RESTART_DELAY}s"
