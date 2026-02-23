@@ -156,18 +156,25 @@ async def trader_loop():
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH","")
 
+    no_buy_backoff_s       = float(os.getenv("NO_BUY_BACKOFF_SEC",       "45"))
+    no_candidates_backoff_s = float(os.getenv("NO_CANDIDATES_BACKOFF_SEC", "60"))
+    build_only_backoff_s   = float(os.getenv("BUILD_ONLY_BACKOFF_SEC",    "30"))
+
     while True:
         try:
-            print(f"TRADER_LOOP_PYTHON={sys.executable}")
-            rc = subprocess.run(
-
+            print(f"TRADER_LOOP_PYTHON={sys.executable}", flush=True)
+            # Use Popen + communicate for full stdout+stderr capture
+            _proc = subprocess.Popen(
                 [sys.executable, "-u", "src/trader_exec.py"],
-
-                check=False,
-
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
                 env=env,
-
-            ).returncode
+            )
+            out_all, _ = _proc.communicate()
+            rc = _proc.returncode
+            if out_all:
+                print(out_all, end="", flush=True)
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
             # normalize_rc2_v1
@@ -270,18 +277,47 @@ async def trader_loop():
             except Exception:
                 _cool_s = 900
             try:
-                _out = None
-                try:
-                    _out = locals().get("out_all")
-                except Exception:
-                    _out = None
-                if isinstance(_out, str) and "LOW_SOL_GUARD SKIP" in _out:
+                if isinstance(out_all, str) and "LOW_SOL_GUARD SKIP" in out_all:
                     print(f"⏸️ LOW_SOL_COOLDOWN sleep_s={_cool_s} (LOW_SOL_GUARD)", flush=True)
                     import time as _t
                     _t.sleep(_cool_s)
             except Exception:
                 pass
             # --- /LOW_SOL_COOLDOWN_V1 ---
+
+            # --- NO_BUY_BACKOFF_V2 ---
+            # Detect outcome from trader_exec output and apply appropriate backoff
+            try:
+                _out = out_all if isinstance(out_all, str) else ""
+                _did_buy = (
+                    rc == 2
+                    or "sent txsig=" in _out
+                    or "recorded BUY" in _out
+                    or "BUY sent" in _out
+                )
+                _no_candidates = (
+                    "no candidates" in _out
+                    or "NO_BUY after tries=" in _out
+                    or "ready_to_trade vide" in _out
+                )
+                _built_only = "built tx ->" in _out and not _did_buy
+
+                if _did_buy:
+                    pass  # bought: no extra sleep (adaptive 429 handler already decays)
+                elif rc in (42,):
+                    pass  # 429 handled by adaptive breaker above
+                elif _no_candidates and no_candidates_backoff_s > 0:
+                    print(f"⏸️ NO_CANDIDATES_BACKOFF sleep_s={no_candidates_backoff_s:.1f}", flush=True)
+                    await asyncio.sleep(no_candidates_backoff_s)
+                elif _built_only and build_only_backoff_s > 0:
+                    print(f"⏸️ BUILD_ONLY_BACKOFF sleep_s={build_only_backoff_s:.1f}", flush=True)
+                    await asyncio.sleep(build_only_backoff_s)
+                elif not _did_buy and no_buy_backoff_s > 0:
+                    print(f"⏸️ NO_BUY_BACKOFF sleep_s={no_buy_backoff_s:.1f}", flush=True)
+                    await asyncio.sleep(no_buy_backoff_s)
+            except Exception:
+                pass
+            # --- /NO_BUY_BACKOFF_V2 ---
             # RESYNC_BUY_QTY_AFTER_RC2_V1: after BUY sent (rc=2), resync on-chain qty into DB (avoid OPEN qty=0)
             if rc == 2:
                 try:
