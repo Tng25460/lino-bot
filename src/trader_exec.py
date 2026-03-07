@@ -361,6 +361,10 @@ def _jup_quote_with_retry(jup, *, input_mint, output_mint, amount_lamports, slip
 
 # skip_mints split (trader vs brain)
 TRADER_SKIP_MINTS_FILE = os.getenv('TRADER_SKIP_MINTS_FILE') or os.getenv('SKIP_MINTS_FILE') or 'state/skip_mints_trader.txt'
+TRADER_AUTOSKIP_FILE = os.getenv("TRADER_AUTOSKIP_FILE", "state/skip_mints_trader.txt")
+if str(TRADER_AUTOSKIP_FILE).endswith("skip_mints_trader.merged.txt"):
+    print("⚠️ AUTOSKIP target merged interdit -> fallback state/skip_mints_trader.txt")
+    TRADER_AUTOSKIP_FILE = "state/skip_mints_trader.txt"
 
 # === POSTBUY_RESYNC_DB (autofill trades.qty_token + create/update positions) ===
 def _db_cols(con, table: str):
@@ -678,6 +682,7 @@ def _autoskip_mint(mint: str):
     except Exception as e:
         print(f"⚠️ autoskip write failed: {e}")
 USE_SCORED_IF_PRESENT = os.getenv("USE_SCORED_IF_PRESENT", "1") == "1"
+SCORED_TOPK = int(os.getenv("SCORED_TOPK", os.getenv("TOPK", "12")))
 SKIP_MINTS_FILE = os.getenv("TRADER_SKIP_MINTS_FILE", "state/skip_mints_trader.txt")
 SKIP_IF_BAG = os.getenv("SKIP_IF_BAG", "1") == "1"
 BAG_MIN_UI = float(os.getenv("BAG_MIN_UI", "0.0"))
@@ -1122,13 +1127,37 @@ def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
     return str(res)
 
 def _row_mint(row: dict) -> str:
-    if not isinstance(row, dict):
-        return ""
-    for k in ("mint","output_mint","token","address","tokenAddress","baseMint","quoteMint"):
-        v = row.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return ""
+    """Extract mint/address from a READY row (READY_CANONICAL + other formats).
+    Priority: mint (READY_CANONICAL) > outputMint (Jupiter-ish) > address (generic).
+    """
+    try:
+        if not isinstance(row, dict):
+            return ''
+        return str(row.get('mint') or row.get('outputMint') or row.get('address') or '').strip()
+    except Exception:
+        return ''
+
+def _drop_ready_mint(ready, mint: str):
+    """Return a new ready list with entries matching mint removed."""
+    try:
+        if not mint:
+            return ready
+        if not isinstance(ready, list):
+            return ready
+        mm = str(mint).strip()
+        if not mm:
+            return ready
+        out = []
+        for r in ready:
+            try:
+                if _row_mint(r) == mm:
+                    continue
+            except Exception:
+                pass
+            out.append(r)
+        return out
+    except Exception:
+        return ready
 
 def _load_skip_set(path: str) -> set:
     try:
@@ -1261,6 +1290,37 @@ def main() -> int:
 
 
     ready = _load_ready()
+    # HOLDINGS_FILTER_V1: remove held mints from ready early (before pick)
+    try:
+        holding_mints = set()
+        # sources possibles: positions/open_positions/pos_list
+        for _src in [locals().get('positions'), locals().get('open_positions'), locals().get('pos_list')]:
+            if isinstance(_src, list):
+                for _p in _src:
+                    try:
+                        _m = str(_p.get('mint') or _p.get('output_mint') or _p.get('token_mint') or '').strip()
+                        if _m:
+                            holding_mints.add(_m)
+                    except Exception:
+                        pass
+        # holding cache (si présent)
+        _hc = locals().get('holding_cache') or locals().get('_holding_cache')
+        if isinstance(_hc, dict):
+            for _m in list(_hc.keys()):
+                try:
+                    _m = str(_m).strip()
+                    if _m:
+                        holding_mints.add(_m)
+                except Exception:
+                    pass
+        if holding_mints and isinstance(ready, list):
+            _before = len(ready)
+            for _m in holding_mints:
+                ready = _drop_ready_mint(ready, _m)
+            _after = len(ready)
+            print(f"🧹 HOLDINGS_FILTER: ready {_before}->{_after} (held={len(holding_mints)})", flush=True)
+    except Exception as _e:
+        print("[WARN] HOLDINGS_FILTER failed:", _e, flush=True)
     # APPLY_RL_SKIP_INLINE (safe)
 
     # --- TRADER_RLSKIP_APPLY_V4 ---
@@ -1309,18 +1369,140 @@ def main() -> int:
             print(f"🧊 RL_SKIP filtered ready (exec): in={_in} -> out={_out} skip={len(_skip_set)} rl={len(_rl_set)}")
         # RL_SKIP emptied all candidates: purge stale entries and retry once
         if _in > 0 and _out == 0 and _rl_set:
-            print("[RL_SKIP] RL_SKIP_EMPTY_AFTER_FILTER: purging expired entries and retrying", flush=True)
-            _now2 = int(time.time())
-            _rl_dict2 = _rl_skip_purge_and_save(_rl_file, _now2)
-            _rl_set2  = {m for m, v in _rl_dict2.items() if int(v) > _now2}
-            ready = [r for r in _ready_pre_rl
-                     if _row_mint(r) not in _skip_set and _row_mint(r) not in _rl_set2]
-            _out = len(ready)
-            print(f"[RL_SKIP] retry after purge: out={_out}", flush=True)
+            print("[RL_SKIP] RL_SKIP_EMPTY_AFTER_FILTER: out=0 -> sleep and exit", flush=True)
+            try:
+                _s = float(os.getenv('EMPTY_READY_SLEEP_S','5'))
+            except Exception:
+                _s = 5.0
+            time.sleep(max(0.0, _s))
+            return 0
         if _out <= 0:
             print("⛔ no candidates after ready filter -> exit rc=0")
             return 0
     # --- end READY runtime filter ---
+    
+    
+    # STABLE_FILTER_READY_V1
+    try:
+        _stable_before = len(ready)
+        _stable_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
+        _stable_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
+        _stable_name_hits = ("STABLE", "USDC", "USDT", "DAI", "USDE", "USD1", "PYUSD", "FDUSD", "USDS", "EURC")
+        _stable_sym_hits  = ("USD", "USDT", "USDC", "DAI", "EURC", "USDE", "PYUSD", "FDUSD", "USDS")
+        _tmp_ready = []
+        for _r in ready:
+            try:
+                _mint = str((_r.get("mint") or _r.get("output_mint") or _r.get("address") or "")).strip()
+                _sym  = str((_r.get("symbol") or _r.get("ticker") or "")).strip().upper()
+                _name = str((_r.get("name") or _r.get("token_name") or "")).strip().upper()
+                _deny = False
+                if _mint and _mint in _stable_mints:
+                    _deny = True
+                if _sym and _sym in _stable_syms:
+                    _deny = True
+                if not _deny and _sym and any(hit in _sym for hit in _stable_sym_hits):
+                    _deny = True
+                if not _deny and _name and any(hit in _name for hit in _stable_name_hits):
+                    _deny = True
+                if _deny:
+                    print(f"🚫 STABLE_FILTER drop mint={_mint or '?'} sym={_sym or '?'} name={_name or '?'}")
+                    continue
+                _tmp_ready.append(_r)
+            except Exception:
+                _tmp_ready.append(_r)
+        ready = _tmp_ready
+        if len(ready) != _stable_before:
+            print(f"🚫 STABLE_FILTER ready: {_stable_before}->{len(ready)}")
+    except Exception as e:
+        print(f"⚠️ STABLE_FILTER error: {e}")
+    
+    # STABLE_FILTER_READY_V2
+    try:
+        _stable_before = len(ready)
+        _stable_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
+        _stable_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
+        _stable_name_hits = ("STABLE", "USDC", "USDT", "DAI", "USDE", "USD1", "PYUSD", "FDUSD", "USDS", "EURC")
+        _filtered = []
+        for _r in ready:
+            try:
+                _mint = str((_r.get("mint") or _r.get("output_mint") or "")).strip()
+                _sym  = str((_r.get("symbol") or "")).upper().strip()
+                _name = str((_r.get("name") or "")).upper().strip()
+                if _mint in _stable_mints:
+                    continue
+                if _sym in _stable_syms:
+                    continue
+                if any(x in _name for x in _stable_name_hits):
+                    continue
+                _filtered.append(_r)
+            except Exception:
+                _filtered.append(_r)
+        if len(_filtered) != _stable_before:
+            print(f"🪙 STABLE_FILTER_READY_V2 filtered: {_stable_before}->{len(_filtered)}")
+        ready = _filtered
+    except Exception as _e:
+        print(f"⚠️ STABLE_FILTER_READY_V2 error: {_e}")
+    
+    # FINAL_TOKEN_ONLY_GUARD_V2
+    try:
+        _before_token_only = len(ready)
+        _deny_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
+        _deny_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
+        _deny_words = ("STABLE","USDC","USDT","DAI","USDE","USD1","PYUSD","FDUSD","USDS","EURC")
+        _tmp = []
+        for _r in ready:
+            _mint = str((_r or {}).get("mint") or (_r or {}).get("output_mint") or "").strip()
+            _sym = str((_r or {}).get("symbol") or "").strip().upper()
+            _name = str((_r or {}).get("name") or "").strip().upper()
+            _txt = f"{_sym} {_name}"
+            if _mint in _deny_mints:
+                continue
+            if _sym in _deny_syms:
+                continue
+            if any(_w in _txt for _w in _deny_words):
+                continue
+            _tmp.append(_r)
+        ready = _tmp
+        if len(ready) != _before_token_only:
+            print(f"🪙 TOKEN_ONLY filtered ready: {_before_token_only}->{len(ready)}")
+    except Exception as e:
+        print(f"⚠️ TOKEN_ONLY filter error: {e}")
+    
+    # NO_ACTIONS_TOKEN_ONLY_FILTER_V3
+    try:
+        _before_asset_filter = len(ready)
+        _deny_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
+        _deny_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
+        _deny_stock_syms = {x.strip().upper() for x in os.getenv("ACTION_DENY_SYMBOLS", "SPYX,AMZNX,TSLAX,NVDAX,AAPLX,METAX,GOOGLX,NFLXX,COINX,MSTRX").split(",") if x.strip()}
+        _deny_words = tuple(x.strip().upper() for x in os.getenv("ACTION_DENY_WORDS", "STOCK,SHARE,EQUITY,ETF,NASDAQ,S&P,SP500,NVIDIA,AMAZON,TESLA,APPLE,MICROSOFT,GOOGLE,META,NETFLIX,COINBASE,MICROSTRATEGY,USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip())
+        _tmp = []
+        for _r in ready:
+            _mint = str((_r or {}).get("mint") or (_r or {}).get("output_mint") or "").strip()
+            _sym = str((_r or {}).get("symbol") or "").strip().upper()
+            _name = str((_r or {}).get("name") or "").strip().upper()
+            _txt = f"{_sym} {_name}"
+
+            _deny = False
+            if _mint in _deny_mints:
+                _deny = True
+            if _sym in _deny_syms:
+                _deny = True
+            if _sym in _deny_stock_syms:
+                _deny = True
+            if _sym.endswith("X") and len(_sym) >= 4:
+                _deny = True
+            if any(_w in _txt for _w in _deny_words):
+                _deny = True
+
+            if _deny:
+                continue
+            _tmp.append(_r)
+
+        ready = _tmp
+        if len(ready) != _before_asset_filter:
+            print(f"🚫 ASSET_FILTER ready: {_before_asset_filter}->{len(ready)}")
+    except Exception as e:
+        print(f"⚠️ ASSET_FILTER error: {e}")
     print("   ready_count=", len(ready))
 
     if not ready:
@@ -1394,6 +1576,15 @@ def main() -> int:
         skip = _load_skip_mints()
         if output_mint in skip:
             print(f"⚠️ skip BUY: mint in SKIP_MINTS_FILE mint={output_mint}")
+            try:
+                _sec = int(os.getenv('SKIPFILE_RLSKIP_SEC','600'))
+            except Exception:
+                _sec = 600
+            try:
+                _rl_skip_add(str(output_mint), int(_sec), reason='skip_file')
+                print(f"🧊 RL_SKIP add (skip_file) mint={output_mint} sec={_sec}", flush=True)
+            except Exception as _e:
+                print("[WARN] RL_SKIP skip_file add failed:", _e, flush=True)
             return 0
     except Exception:
         pass
@@ -1432,14 +1623,7 @@ def main() -> int:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
             _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC','900')), reason='already_holding')
             if ui >= BAG_MIN_UI:
-                if str(os.getenv('AUTOSKIP_ALREADY_HOLDING','0')).strip() in ('1','true','True','yes','YES'):
-                    try:
-                        _append_skip_mint(str(output_mint))
-                        print(f"🧷 autoskip already-holding mint={output_mint} -> {_skip_file_path()}")
-                    except Exception as _e:
-                        print("autoskip already-holding failed:", _e)
-                else:
-                    print("🧷 autoskip already-holding disabled (set AUTOSKIP_ALREADY_HOLDING=1 to enable)")
+                print(f"🧷 autoskip already-holding DISABLED: RL_SKIP only mint={output_mint}", flush=True)
             else:
                 print(f"   no autoskip: ui={ui} < BAG_MIN_UI={BAG_MIN_UI}", flush=True)
             if str(os.getenv('REPICK_ON_HOLDING','0')).strip() in ('1','true','True','yes','YES'):

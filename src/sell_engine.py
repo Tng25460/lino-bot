@@ -10,14 +10,14 @@ def _db_open_positions(db_path: str, wallet: str | None = None):
         rows = cur.execute("""
             SELECT mint, symbol, qty_token, entry_ts
             FROM positions
-            WHERE LOWER(status)='open' AND wallet=?
+            WHERE coalesce(qty_token,0) > 0 AND LOWER(status)='open' AND wallet=?
             ORDER BY entry_ts DESC
         """, (wallet,)).fetchall()
     else:
         rows = cur.execute("""
             SELECT mint, symbol, qty_token, entry_ts
             FROM positions
-            WHERE LOWER(status)='open'
+            WHERE coalesce(qty_token,0) > 0 AND LOWER(status)='open'
             ORDER BY entry_ts DESC
         """).fetchall()
     con.close()

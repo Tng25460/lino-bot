@@ -1,4 +1,22 @@
 import os, json, time, sqlite3, statistics
+
+# --- BRAIN_READY_IN_V1 (robust input selection) ---
+BRAIN_READY_IN = str(os.getenv('BRAIN_READY_IN','') or '').strip()
+DEFAULT_READY_CHAIN = [
+    'state/ready_enriched.jsonl',
+    'state/ready_scored_tradable.jsonl',
+    'state/ready_scored.jsonl',
+]
+def _pick_ready_in() -> str:
+    if BRAIN_READY_IN:
+        return BRAIN_READY_IN
+    for _p in DEFAULT_READY_CHAIN:
+        try:
+            if os.path.exists(_p) and os.path.getsize(_p) > 0:
+                return _p
+        except Exception:
+            pass
+    return 'state/ready_scored.jsonl'
 from typing import Dict, Any, List, Tuple, Optional
 import os
 import json
@@ -255,7 +273,7 @@ def _import_trades_into_brain(brain_con, trades_path="state/trades.sqlite", max_
 
     rows = tcur.execute("""
         SELECT mint, entry_price, close_price, close_ts
-        FROM positions
+        FROM positions WHERE status='CLOSED'
         WHERE close_ts IS NOT NULL AND CAST(close_ts AS INTEGER) > 0
           AND COALESCE(status,'') != 'open'
         ORDER BY CAST(close_ts AS INTEGER) DESC
@@ -997,7 +1015,26 @@ def run_once(note: str = "brain_loop"):
         _upsert_mint_stats(brain, stats)
 
     # load ready candidates
-    ready_path=_pick_ready_input()
+    # brain input file (auto)
+    _cand = []
+    _env_in = (os.getenv("BRAIN_READY_IN") or os.getenv("READY_IN") or "").strip()
+    if _env_in: _cand.append(_env_in)
+    _cand += [
+        "state/ready_enriched.jsonl",
+        "state/universe.jsonl",
+        "state/ready_scored.jsonl",
+    ]
+    ready_path = _pick_ready_in()
+    for _rp in _cand:
+        try:
+            if _rp and os.path.isfile(_rp) and os.path.getsize(_rp) > 0:
+                ready_path = _rp
+                break
+        except Exception:
+            pass
+    if not ready_path:
+        ready_path = "state/ready_scored.jsonl"
+
     ready=_load_jsonl(ready_path)
 
     scored=[]
@@ -1116,9 +1153,6 @@ def run_once(note: str = "brain_loop"):
             print(f"🧠 brain_loop: filtered_stables={_before-len(out)} remaining={len(out)}")
     except Exception as _e:
         print("🧠 brain_loop: stable filter failed:", _e)
-    with open(READY_OUT,"w",encoding="utf-8") as w:
-        for x in out:
-            w.write(json.dumps(x, ensure_ascii=False) + "\n")
 
     # --- brain: filter out skip_mints (already holding / manual skip) ---
     skip_mints = set()
@@ -1139,23 +1173,6 @@ def run_once(note: str = "brain_loop"):
             w.write(json.dumps(x, ensure_ascii=False) + '\n')
 
     print(f"🧠 brain_loop: ready_in={ready_path} in={len(ready)} -> out={len(out)} file={READY_OUT}")
-
-    # --- BRAIN_RLSKIP_APPLY_V1 ---
-    try:
-        _rl_file = str(os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json") or "state/rl_skip_mints.json")
-        _now = int(time.time())
-        _d = _rl_skip_load(_rl_file)
-        _before = len(ready) if isinstance(ready, list) else -1
-        if isinstance(ready, list) and _before > 0 and _d:
-            ready = _rl_skip_filter_mints(ready, _d, _now)
-            _after = len(ready)
-            if _after != _before:
-                print(f"🧊 RL_SKIP filtered ready (brain): {_before}->{_after} file={_rl_file}", flush=True)
-    except Exception as _e:
-        print("rl_skip_filter_error(brain):", _e, flush=True)
-    # --- /BRAIN_RLSKIP_APPLY_V1 ---
-    if out:
-        print("🧠 top1:", out[0].get('mint'), "score=", out[0].get('brain_score'))
 
 if __name__ == "__main__":
     run_once()

@@ -50,7 +50,7 @@ class SellEngine:
         self.TP2_PCT = float(os.getenv("SELL_TP2_PCT", "0.80"))
         self.TP2_SIZE = float(os.getenv("SELL_TP2_SIZE", "0.35"))
 
-        self.HARD_SL_PCT = -abs(_env_float('HARD_SL_PCT', _env_float('SELL_HARD_SL_PCT', 0.25)))
+        self.HARD_SL_PCT = -abs(_env_float('SELL_HARD_SL_PCT', _env_float('HARD_SL_PCT', 0.25)))  # HARDSL_PRIO_SELL_V1
         self.TRAIL_TIGHT = float(os.getenv("SELL_TRAIL_TIGHT", "0.10"))
         self.TRAIL_WIDE  = float(os.getenv("SELL_TRAIL_WIDE",  "0.20"))
 
@@ -79,12 +79,40 @@ class SellEngine:
         self._price_429_log_ts = {}  # mint -> ts of last [COOLDOWN] log (anti-spam)
         self.PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "30"))
         self.PRICE_429_COOLDOWN_S = int(os.getenv("PRICE_429_COOLDOWN_S", "90"))
-
     def _ui_qty(self, pos) -> float:
+        # --- UI_QTY_ONCHAIN_FALLBACK_V1 ---
+        # DB qty_token/qty peut être 0 (positions fantômes / DB désync).
+        # Si c'est 0 mais qu'on a un mint, on tente un fallback RPC pour récupérer la vraie balance UI.
         try:
-            return float(pos.get("qty_token") or pos.get("qty") or 0.0)
+            ui = float(pos.get('qty_token') or pos.get('qty') or 0.0)
         except Exception:
+            ui = 0.0
+        if ui > 0:
+            return float(ui)
+
+        try:
+            mint = str(pos.get('mint') or '').strip()
+        except Exception:
+            mint = ''
+        if not mint:
             return 0.0
+
+        # fallback on-chain (best-effort)
+        try:
+            ui_on = float(self._onchain_ui_balance_simple(mint) or 0.0)
+        except Exception:
+            ui_on = 0.0
+
+        if ui_on > 0:
+            # injecte dans le dict local (ça aide les étapes suivantes du sell)
+            try:
+                if isinstance(pos, dict):
+                    pos['qty_token'] = ui_on
+            except Exception:
+                pass
+            return float(ui_on)
+
+        return 0.0
 
     def _entry(self, pos) -> float:
         try:
@@ -123,25 +151,23 @@ class SellEngine:
         return float(tot)
 
     def _clamp_sell_ui(self, mint: str, ui_db: float) -> float:
-        """
-        Clamp sell ui to on-chain (prevents oversell -> Jupiter simulation 0x1788).
-        """
+        """Clamp sell ui to on-chain (prevents oversell / 0x1788)."""
         try:
             ui_on = float(self._onchain_ui_balance_simple(mint) or 0.0)
         except Exception:
             ui_on = 0.0
 
+        ui_db = float(ui_db or 0.0)
         if ui_on > 0:
-            ui = min(float(ui_db or 0.0), ui_on)
-            # safety epsilon (avoid exact dust/rounding)
-            ui = ui * 0.995
-            if ui < 0: ui = 0.0
-            if ui != float(ui_db or 0.0):
+            ui = min(ui_db, ui_on)
+            ui *= 0.995
+            if ui < 0:
+                ui = 0.0
+            if ui != ui_db:
                 print(f"🧩 CLAMP_SELL_UI mint={mint} db={ui_db} onchain={ui_on} -> {ui}", flush=True)
             return ui
 
-        return float(ui_db or 0.0)
-
+        return ui_db
 
     def _rl_skip_add(self, mint: str, sec: int, reason: str = ""):
 
@@ -253,6 +279,23 @@ class SellEngine:
 
 
     def _sell_exec(self, mint: str, ui_amount: float, reason: str) -> str:
+        # --- SELL_EXEC_GUARD_QTY0_V1 ---
+        try:
+            ui_amount = float(ui_amount or 0.0)
+        except Exception:
+            ui_amount = 0.0
+        if ui_amount <= 0:
+            print(f"[SELL] skip ui<=0 mint={mint} ui={ui_amount} reason={reason}", flush=True)
+            return '__SKIP_QTY0__'
+        # global dust guard (avoid spam + pointless routes)
+        try:
+            _min_ui = float(__import__('os').getenv('SELL_MIN_UI', '0.00001'))
+        except Exception:
+            _min_ui = 0.00001
+        if ui_amount < _min_ui:
+            print(f"[SELL] skip_dust mint={mint} ui={ui_amount} min_ui={_min_ui} reason={reason}", flush=True)
+            return '__SKIP_DUST__'
+        # --- /SELL_EXEC_GUARD_QTY0_V1 ---
         """Run src/sell_exec_wrap.py and return a marker or txsig."""
 
         # throttle swaps (best-effort)
@@ -335,17 +378,12 @@ class SellEngine:
         if rc == 44 or "__JUP_HTTP_429__" in (out_all or "") or "http=429" in lo or "too many requests" in lo:
 
             try:
-
-                print("[SELL] jup_http_429 -> global cooldown", flush=True)
-
-            except Exception:
-
-                pass
-
-            try:
-
-                self._global_cooldown_add("sell_429")
-
+                _force_all = os.getenv('SELL_FORCE_ALL','0').strip().lower() in ('1','true','yes','on')
+                if not _force_all:
+                    print("[SELL] jup_http_429 -> global cooldown", flush=True)
+                    self._global_cooldown_add("sell_429")
+                else:
+                    print("[SELL] jup_http_429 -> NO global cooldown (SELL_FORCE_ALL=1) [NO_GLOBAL_COOLDOWN_FORCE_CLEAN]", flush=True)
             except Exception:
 
                 pass
@@ -424,6 +462,20 @@ class SellEngine:
             try:
                 if hasattr(self.db, "get_open_positions"):
                     _positions = self.db.get_open_positions()
+                    # SELL_FILTER_QTY0_SAFE_V4: drop zero-qty positions early (reduces price fetch spam)
+                    def _sf_qty(x, default=0.0):
+                        try:
+                            return float(x)
+                        except Exception:
+                            return float(default)
+                    _positions = [pp for pp in _positions if (isinstance(pp, dict) and _sf_qty(pp.get('qty', pp.get('qty_token', 0)), 0) > 0)]
+                    # SELL_FILTER_QTY0_SAFE_V3: drop zero-qty positions early (reduces price fetch spam)
+                    def _sf_qty(x, default=0.0):
+                        try:
+                            return float(x)
+                        except Exception:
+                            return float(default)
+                    _positions = [pp for pp in _positions if _sf_qty((pp.get('qty', pp.get('qty_token', 0)) if isinstance(pp, dict) else 0), 0) > 0]
                 elif hasattr(self.db, "open_positions"):
                     _positions = self.db.open_positions()
                 elif hasattr(self.db, "list_open_positions"):
@@ -441,6 +493,23 @@ class SellEngine:
             print(f"[SELL] simulate-bypass: open_positions={_n}", flush=True)
     
             for _pos in (_positions or []):
+    
+                # SELL_CAP_POSITIONS_V1: cap price fetches per tick to reduce 429
+    
+                _cap = _env_int('SELL_MAX_POSITIONS_PER_TICK', 8)
+    
+                _i = 0
+    
+                
+    
+                    
+                _i += 1
+    
+                if _i > _cap:
+    
+                    print(f'🧯 SELL_CAP: positions per tick cap={_cap} (stop loop)', flush=True)
+    
+                    break
                 try:
                     if hasattr(_pos, "get"):
                         _mint = _pos.get("mint")
@@ -522,6 +591,31 @@ class SellEngine:
 
         now = _time.time()
         positions = self.db.get_open_positions() or []
+        # SELL_FILTER_QTY0_SAFE_V4: drop zero-qty positions early (reduces price fetch spam)
+        def _sf_qty(x, default=0.0):
+            try:
+                return float(x)
+            except Exception:
+                return float(default)
+        positions = [pp for pp in positions if (isinstance(pp, dict) and _sf_qty(pp.get('qty', pp.get('qty_token', 0)), 0) > 0)]
+        # --- SELLFORCE_SHUFFLE_POS_V1 ---
+        try:
+            __import__('random').shuffle(positions)
+        except Exception:
+            pass
+        # --- /SELLFORCE_SHUFFLE_POS_V1 ---
+
+        # --- FORCE_SELL_ALL_V1_AUTOPATCH (vars) ---
+        _force_all = os.getenv('SELL_FORCE_ALL','0').strip().lower() in ('1','true','yes','on')
+        _sellforce_max = int(float(os.getenv('SELL_MAX_PER_TICK','6')))
+        _sellforce_done = 0
+        # --- SELLFORCE_SCANDBG_V1 ---
+        _sellforce_scanned = 0
+        _sellforce_eligible = 0
+        # --- /SELLFORCE_SCANDBG_V1 ---
+
+        # --- /FORCE_SELL_ALL_V1_AUTOPATCH (vars) ---
+
         ### DBG_POS_LOOP_V3 ###
         try:
             _force = bool(getattr(self, "SELL_FORCE_ALL", False)) or (str(__import__("os").getenv("SELL_FORCE_ALL","0")).strip() in ("1","true","True"))
@@ -532,6 +626,94 @@ class SellEngine:
         print(f"💰 sell_engine: open_positions={len(positions)}", flush=True)
 
         for pos in positions:
+
+            # --- FORCE_SELL_ALL_V1_AUTOPATCH (loop) ---
+            if _force_all and _sellforce_done < _sellforce_max:
+                try:
+                    _mint = str(pos.get('mint') or pos.get('outputMint') or pos.get('address') or '').strip()
+                    # --- SELLFORCE_COOLDOWN_GUARD_V2 ---
+                    try:
+                        _now_cd = float(__import__('time').time())
+                        _cd = getattr(self, '_mint_sell_cooldown_until', None)
+                        if isinstance(_cd, dict):
+                            _until = float(_cd.get(str(_mint), 0.0) or 0.0)
+                            if _until and _now_cd < _until:
+                                _left = int(_until - _now_cd)
+                                print(f"[SELLFORCE] cooldown_skip mint={_mint} left={_left}s", flush=True)
+                                continue
+                    except Exception:
+                        pass
+                    # --- /SELLFORCE_COOLDOWN_GUARD_V2 ---
+
+                    if _mint:
+                        # cooldown guard (avoid re-hitting same mint)
+                        _now = float(__import__('time').time())
+                        _until = float(getattr(self, '_mint_sell_cooldown_until', {}).get(_mint, 0.0) or 0.0)
+                        if _until and _now < _until:
+                            print(f"[SELLFORCE] cooldown_skip mint={_mint} left={int(_until-_now)}s", flush=True)
+                            raise StopIteration
+                        _ui_db = float(pos.get('qty_token') or pos.get('qty') or 0.0)
+                        # --- SELLFORCE_SCANDBG_V2 (incr) ---
+                        _sellforce_scanned += 1
+                        if _mint and _ui_db > 0:
+                            _sellforce_eligible += 1
+                        # --- /SELLFORCE_SCANDBG_V2 (incr) ---
+
+                        _sellforce_scanned += 1
+                        if _mint and _ui_db > 0:
+                            _sellforce_eligible += 1
+
+                        if _ui_db > 0:
+                            _ui = float(self._clamp_sell_ui(_mint, _ui_db) or 0.0)
+                            if _ui > 0:
+                                # --- SELLFORCE_MIN_UI_GUARD_V1 ---
+                                _min_ui = float(os.getenv('SELLFORCE_MIN_UI', os.getenv('SELL_MIN_UI_FORCE','0.00001')))
+                                if _ui < _min_ui:
+                                    print(f"[SELLFORCE] skip_dust mint={_mint} ui={_ui} min_ui={_min_ui}", flush=True)
+                                    # dust -> cooldown long pour ne plus retenter
+                                    try:
+                                        _now2 = float(__import__('time').time())
+                                        _sec2 = int(float(os.getenv('SELLFORCE_DUST_COOLDOWN_SEC','86400')))
+                                        _cd2 = getattr(self, '_mint_sell_cooldown_until', None)
+                                        if not isinstance(_cd2, dict):
+                                            _cd2 = {}
+                                            setattr(self, '_mint_sell_cooldown_until', _cd2)
+                                        _cd2[str(_mint)] = _now2 + _sec2
+                                        print(f"[SELLFORCE] dust_cooldown mint={_mint} sec={_sec2}", flush=True)
+                                    except Exception:
+                                        pass
+                                    continue
+                                # --- /SELLFORCE_MIN_UI_GUARD_V1 ---
+
+                                out = self._sell_exec(_mint, _ui, reason='force_all')
+                                # --- SELLFORCE_FAIL_COOLDOWN_V1 ---
+                                if out == '__FAIL__':
+                                    try:
+                                        _now2 = float(__import__('time').time())
+                                        _sec = int(float(os.getenv('SELLFORCE_FAIL_COOLDOWN_SEC','600')))
+                                        d = getattr(self, '_mint_sell_cooldown_until', None)
+                                        if not isinstance(d, dict):
+                                            d = {}
+                                            setattr(self, '_mint_sell_cooldown_until', d)
+                                        d[str(_mint)] = _now2 + _sec
+                                        print(f"[SELLFORCE] fail_cooldown mint={_mint} sec={_sec}", flush=True)
+                                    except Exception:
+                                        pass
+                                # --- /SELLFORCE_FAIL_COOLDOWN_V1 ---
+
+                                print(f"[SELLFORCE] mint={_mint} ui={_ui:.6f} out={repr(out)[:200]}", flush=True)
+                                _sellforce_done += 1
+                                if _sellforce_done >= _sellforce_max:
+                                    break
+                except StopIteration:
+                    pass
+                except Exception as _e:
+                    try:
+                        print(f"[SELLFORCE_ERR] mint={locals().get('_mint','')} err={_e}", flush=True)
+                    except Exception:
+                        pass
+                continue
+            # --- /FORCE_SELL_ALL_V1_AUTOPATCH (loop) ---
 
             try:
 
@@ -666,6 +848,27 @@ class SellEngine:
         mint = str(pos.get("mint") or "")
         entry = self._entry(pos)
         qty_total = self._ui_qty(pos)
+        # --- SKIP_ZERO_QTY_POS_V1 ---
+        try:
+            _q = float(qty_total or 0.0)
+        except Exception:
+            _q = 0.0
+        if _q <= 0.0:
+            # évite price fetch + spam 429 sur positions fantômes
+            # --- SKIP_ZERO_QTY_LOGONCE_V1 ---
+            try:
+                _seen = getattr(self, '_skip_qty0_seen', None)
+                if not isinstance(_seen, set):
+                    _seen = set()
+                    setattr(self, '_skip_qty0_seen', _seen)
+                if mint not in _seen:
+                    print(f"[DBG] skip_pos_qty0 mint={mint} qty={_q}", flush=True)
+                    _seen.add(mint)
+            except Exception:
+                print(f"[DBG] skip_pos_qty0 mint={mint} qty={_q}", flush=True)
+            # --- /SKIP_ZERO_QTY_LOGONCE_V1 ---
+            return
+        # --- /SKIP_ZERO_QTY_POS_V1 ---
         entry_ts = float(pos.get("entry_ts") or pos.get("opened_ts") or 0.0)
 
         price = self._get_price_cached(mint)
@@ -788,14 +991,22 @@ class SellEngine:
             if txsig == "__JUP_HTTP_429__":
                 print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=429", flush=True)
                 try:
-                    self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    _force_all = os.getenv('SELL_FORCE_ALL','0').strip().lower() in ('1','true','yes','on')
+                    if not _force_all:
+                        self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    else:
+                        pass  # NO_GLOBAL_COOLDOWN_FORCE_V1
                 except Exception:
                     pass
                 return
             if txsig == "__INSUFFICIENT__":
                 print(f"[SELL] global cooldown {int(self.SELL_429_COOLDOWN_SEC)}s reason=insufficient_funds", flush=True)
                 try:
-                    self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    _force_all = os.getenv('SELL_FORCE_ALL','0').strip().lower() in ('1','true','yes','on')
+                    if not _force_all:
+                        self._global_block_until = float(time.time()) + float(self.SELL_429_COOLDOWN_SEC)
+                    else:
+                        pass  # NO_GLOBAL_COOLDOWN_FORCE_V1
                 except Exception:
                     pass
                 return
@@ -872,28 +1083,34 @@ class SellEngine:
                 pass
             return
 
-        # TIME STOP (sell ALL)  (condition: age > TIME_STOP_SEC AND pnl < TIME_STOP_MIN_PNL)
-        if entry_ts > 0 and (now - entry_ts) > self.TIME_STOP_SEC and pnl < self.TIME_STOP_MIN_PNL:
+        # TIME STOP (sell ALL)  [TIME_STOP_FIX_V2]
+        # Déclenchement: position trop vieille
+        # Garde: on ne vend que si pnl >= min pnl (avec epsilon float)
+        if entry_ts > 0 and (now - entry_ts) > self.TIME_STOP_SEC:
             print(f"⏱️ TIME_STOP mint={mint} pnl={pnl:.2%}", flush=True)
             if os.getenv("SELL_DRY_RUN", "0") == "1":
                 print("🧪 SELL_DRY_RUN=1 -> skip TIME_STOP sell", flush=True)
                 return
             sell_qty = qty_total
-            # TIME_STOP_GUARD: only sell if pnl >= min pnl
-            if pnl < self.TIME_STOP_MIN_PNL:
-                print(f"⏱️ TIME_STOP skip: pnl {pnl:.2%} < min {self.TIME_STOP_MIN_PNL:.2%}")
+            TIME_STOP_EPS = 1e-9
+            if (pnl + TIME_STOP_EPS) < self.TIME_STOP_MIN_PNL:
+                print(f"⏱️ TIME_STOP skip: pnl {pnl:.2%} < min {self.TIME_STOP_MIN_PNL:.2%} [TIME_STOP_FIX_V2]", flush=True)
                 return
             txsig = self._sell_exec(mint, sell_qty, "time_stop")
             if txsig == '__DUST__':
-                # mark closed in DB and continue
+                print(f"ℹ️ TIME_STOP dust_untradeable mint={mint} [TIME_STOP_ROUTEFIX_V1]", flush=True)
                 try:
                     self.db.close_position(mint, now, 'dust_untradeable', 0.0)
                 except Exception as e:
                     print(f"❌ close dust failed mint={mint} err={e}")
                 return
-            if not txsig:
+            if txsig == '__ROUTE_FAIL__':
+                print(f"⚠️ TIME_STOP route_fail mint={mint} [TIME_STOP_ROUTEFIX_V1]", flush=True)
                 return
-            print(f"✅ SOLD TIME_STOP txsig={txsig}", flush=True)
+            if not txsig:
+                print(f"⚠️ TIME_STOP no_txsig mint={mint} [TIME_STOP_ROUTEFIX_V1]", flush=True)
+                return
+            print(f"✅ SOLD TIME_STOP txsig={txsig} [TIME_STOP_ROUTEFIX_V1]", flush=True)
             try:
                 self.db.close_position(mint, close_reason="time_stop", close_price=price)
             except Exception:
@@ -981,7 +1198,12 @@ class SellEngine:
                 return
             if not txsig:
                 return
-            print(f"✅ SOLD TRAIL txsig={txsig}", flush=True)
+            # --- SOLD_TRAIL_LOG_FIX_V1 ---
+            if txsig and txsig not in ("__FAIL__", "__ROUTE_FAIL__", "__FAIL__429__", "__SKIP_QTY0__", "__SKIP_DUST__"):
+                print(f"✅ SOLD TRAIL txsig={txsig}", flush=True)
+            else:
+                print(f"❌ SELL TRAIL FAIL out={txsig}", flush=True)
+            # --- /SOLD_TRAIL_LOG_FIX_V1 ---
             try:
                 self.db.close_position(mint, close_reason="trailing_stop", close_price=price)
             except Exception:

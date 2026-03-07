@@ -1,0 +1,4 @@
+executable : /home/tng25/lino_FINAL_20260203_182626/.venv/bin/python
+prefix     : /home/tng25/lino_FINAL_20260203_182626/.venv
+base_prefix: /usr
+Use exit() or Ctrl-D (i.e. EOF) to exit

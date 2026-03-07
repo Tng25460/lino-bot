@@ -145,8 +145,27 @@ def _parse_cli():
     return ap.parse_args()
 async def trader_loop():
     sleep_s = float(os.getenv("LOOP_SLEEP_S", os.getenv("SCAN_INTERVAL_SECONDS", "12")))
-    max_trades_per_hour = int(os.getenv("LOOP_MAX_TRADES_PER_HOUR", "6"))
-    cooldown_s = int(os.getenv("LOOP_COOLDOWN_MINT_S", "1800"))
+
+    max_trades_per_hour = int(
+        os.getenv(
+            "TRADER_MAX_TRADES_PER_HOUR",
+            os.getenv(
+                "MAX_TRADES_PER_HOUR",
+                os.getenv("LOOP_MAX_TRADES_PER_HOUR", "6")
+            )
+        )
+    )
+
+    cooldown_s = int(
+        os.getenv(
+            "TRADER_COOLDOWN_S",
+            os.getenv(
+                "BUY_COOLDOWN_S",
+                os.getenv("LOOP_COOLDOWN_MINT_S", "1800")
+            )
+        )
+    )
+
     one_shot = (os.getenv("TRADER_ONE_SHOT","").strip().lower() in ("1","true","yes","on")) or (os.getenv("ONE_SHOT","").strip().lower() in ("1","true","yes","on"))  # ONE_SHOT_RC2_ONLY_V1
 
     print("🧠 trader_loop (universe_builder -> exec -> sign -> send)", flush=True)
@@ -156,7 +175,15 @@ async def trader_loop():
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH","")
 
-    while True:
+    while True:        # --- SELL_ONLY_GUARD_V2 ---
+        _mth = int(os.getenv('TRADER_MAX_TRADES_PER_HOUR', os.getenv('MAX_TRADES_PER_HOUR', os.getenv('LOOP_MAX_TRADES_PER_HOUR','6'))))
+        if _mth <= 0:
+            import time as _t
+            _t.sleep(float(os.getenv('SELL_ONLY_SLEEP_S','2')))
+            continue
+        # --- /SELL_ONLY_GUARD_V2 ---
+
+
         try:
             print(f"TRADER_LOOP_PYTHON={sys.executable}")
             rc = subprocess.run(

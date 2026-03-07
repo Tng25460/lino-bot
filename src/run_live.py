@@ -1,3 +1,25 @@
+# === CLI SAFETY PATCH (prepend) ===
+import os
+import sys
+
+def _cli_safety_precheck():
+    # Hard-stop help so run_live never starts anything on --help
+    if any(a in sys.argv for a in ("-h", "--help")):
+        print("run_live help:\n  --check   Validate env and exit (NO TRADES)\n", flush=True)
+        sys.exit(0)
+
+    if "--check" in sys.argv:
+        required = ["MODE","TRADER_DRY_RUN","SELL_DRY_RUN","READY_FILE","WALLET_PUBKEY","TRADER_USER_PUBLIC_KEY"]
+        missing = [k for k in required if not os.getenv(k)]
+        if missing:
+            print("❌ missing env: " + ", ".join(missing), flush=True)
+            sys.exit(2)
+        print("✅ CHECK OK (env present). No trades executed.", flush=True)
+        sys.exit(0)
+
+_cli_safety_precheck()
+# === END CLI SAFETY PATCH ===
+
 import os
 
 import signal
@@ -35,6 +57,9 @@ async def _maybe_await(x):
 
 
 async def main():
+    if "--help" in __import__("sys").argv or "-h" in __import__("sys").argv:
+        return
+
     print("🚀 run_live: starting sell_engine + trader_loop", flush=True)
 
     # Optional: reclaim SOL rent by closing empty token accounts
@@ -58,50 +83,45 @@ async def main():
         sell_engine = SellEngine(db=db, price_feed=price_feed, trader=None)
     print("✅ sell_engine: using step loop SellEngine.run_once()", flush=True)
 
-    sleep_s = float(os.getenv("LOOP_SLEEP_S", "10"))
-    # --- SELL_ONLY mode (skip trader_loop) ---
-    if os.getenv("SELL_ONLY","0") == "1":
-        print("🛑 SELL_ONLY=1 -> sell_engine ONLY (skip trader_loop)", flush=True)
+    # SEPARATE_SELL_LOOP_V1: run sell_engine in its own loop so it keeps selling even when trader_loop is slow
+    sell_sleep_s = float(os.getenv("SELL_ONLY_SLEEP_S", os.getenv("SELL_LOOP_SLEEP_S", "2")))
+    trader_sleep_s = float(os.getenv("TRADER_LOOP_SLEEP_S", os.getenv("LOOP_SLEEP_S", "10")))
+    
+    async def _sell_loop():
         while True:
-            print("💰 SELL_TICK: running sell_engine.run_once()", flush=True)
             try:
+                print('💰 SELL_TICK (loop)', flush=True)
                 sell_engine.run_once()
-                if os.getenv("ONE_SHOT","0")=="1" or os.getenv("SELL_ONE_SHOT","0")=="1":
-                    print("🧪 ONE_SHOT=1 -> stop after 1 SELL_TICK", flush=True)
-                    return
-            except Exception as err:
-                print("❌ sell_engine tick error: " + str(err), flush=True)
-            await asyncio.sleep(sleep_s)
-    # --- end SELL_ONLY ---
-    one_shot = os.getenv("ONE_SHOT", "0") in ("1", "true", "True")
-
-    while True:
-        print("💰 SELL_TICK: running sell_engine.run_once()", flush=True)
-        try:
-            # SellEngine est sync -> pas besoin d'await
-            sell_engine.run_once()
-        except Exception as err:
-            print("❌ sell_engine tick error: " + str(err), flush=True)
-
-        print("🧠 trader_loop (universe_builder -> exec -> sign -> send)", flush=True)
-        try:
-            # trader_loop peut être sync ou async -> safe
-            if _SELL_ONLY:
-                print('🛑 MODE=SELL_ONLY -> skip trader_loop', flush=True)
-            else:
+            except Exception as e:
+                import traceback
+                print('❌ sell_engine tick error:', repr(e), flush=True)
+                traceback.print_exc()
+            # ONE_SHOT: stop after 1 tick if requested
+            if os.getenv('ONE_SHOT','0') in ('1','true','True') or os.getenv('SELL_ONE_SHOT','0') in ('1','true','True'):
+                print('🧪 ONE_SHOT=1 -> stop after 1 SELL_TICK', flush=True)
+                return
+            await asyncio.sleep(sell_sleep_s)
+    
+    async def _trader_loop_runner():
+        if _SELL_ONLY or os.getenv('SELL_ONLY','0') == '1':
+            print('🛑 SELL_ONLY -> skip trader_loop', flush=True)
+            while True:
+                await asyncio.sleep(trader_sleep_s)
+        while True:
+            print('🧠 trader_loop (universe_builder -> exec -> sign -> send)', flush=True)
+            try:
                 rc = await _maybe_await(trader_loop())
                 if isinstance(rc, int) and rc != 0:
                     raise SystemExit(rc)
-        except Exception as err:
-            print("❌ trader_loop error: " + str(err), flush=True)
-
-        # NOTE: trader_loop a son propre TRADER_ONE_SHOT.
-        # ONE_SHOT ici ne sert que si tu utilises run_live comme loop unique.
-        if one_shot:
-            break
-
-        await asyncio.sleep(sleep_s)
-
-
+            except Exception as e:
+                import traceback
+                print('❌ trader_loop error:', repr(e), flush=True)
+                traceback.print_exc()
+            if os.getenv('ONE_SHOT','0') in ('1','true','True'):
+                return
+            await asyncio.sleep(trader_sleep_s)
+    
+    # run both loops concurrently
+    await asyncio.gather(_sell_loop(), _trader_loop_runner())
 if __name__ == "__main__":
     asyncio.run(main())
