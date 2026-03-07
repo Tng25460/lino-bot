@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IN="state/ready_scored_tradable.jsonl"
+OUT="state/ready_final.jsonl"
+
+: > "$OUT"
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+
+  echo "$line" \
+  | python scripts/anti_rug_check.py \
+  | python scripts/liquidity_volume_filter.py \
+  | python scripts/jup_tradable_guard.py \
+  >> "$OUT" || true
+
+done < "$IN"

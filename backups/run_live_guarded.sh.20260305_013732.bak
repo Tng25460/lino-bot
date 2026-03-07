@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# --- AUTO_BLACKHOLE_HOLDINGS_V1 --------------------------------------------
+# Goal: avoid wasting BUY ticks on already-held mints.
+# We derive current holdings from trades.sqlite and merge them into
+# TRADER_SKIP_MINTS_FILE (blackhole) at every start.
+#
+# Toggle with: export AUTO_BLACKHOLE_HOLDINGS=0
+AUTO_BLACKHOLE_HOLDINGS="${AUTO_BLACKHOLE_HOLDINGS:-1}"
+if [[ "${AUTO_BLACKHOLE_HOLDINGS}" == "1" ]]; then
+  DB="state/trades.sqlite"
+  BH="${TRADER_SKIP_MINTS_FILE:-state/skip_mints_trader.blackhole.txt}"
+  TMP_H="/tmp/holdings_blackhole_mints.txt"
+  if [[ -f "$DB" ]]; then
+    echo "🧱 AUTO_BLACKHOLE_HOLDINGS=1 db=$DB -> $BH"
+    python - "$DB" "$TMP_H" <<'PY'
+import sys, sqlite3
+
+db, out = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+cur = con.cursor()
+
+def table_exists(name: str) -> bool:
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cur.fetchone() is not None
+
+mints = set()
+
+# Preferred: positions table (positions-first; do NOT fallback to trades if positions exists)
+if table_exists("positions"):
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()]
+
+    where = None
+
+    # Most common in this repo: status column
+    if "status" in cols:
+        where = """UPPER(CAST(status AS TEXT)) IN ('OPEN','OPENED','ACTIVE')"""
+
+    # If no status, use close_ts semantics (allow 0 / '' / NULL)
+    elif "close_ts" in cols:
+        where = """(close_ts IS NULL OR CAST(close_ts AS TEXT) IN ('0',''))"""
+
+    # Legacy boolean
+    elif "is_open" in cols:
+        where = "is_open=1"
+
+    if where:
+        q = f"SELECT DISTINCT mint FROM positions WHERE {where}"
+        rows = cur.execute(q).fetchall()
+        mints |= {r[0] for r in rows if r and r[0]}
+
+# Fallback: derive net qty from trades (ONLY if positions table is missing)
+# Fallback: derive net qty from trades
+if (not table_exists("positions")) and (not mints) and table_exists("trades"):
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+    side_col = "side" if "side" in cols else None
+    qty_col  = "qty"  if "qty"  in cols else ("qty_ui" if "qty_ui" in cols else None)
+    mint_col = "mint" if "mint" in cols else None
+    if side_col and qty_col and mint_col:
+        rows = cur.execute(f"SELECT {mint_col}, {side_col}, {qty_col} FROM trades").fetchall()
+        bal = {}
+        for mint, side, qty in rows:
+            if not mint:
+                continue
+            try:
+                q = float(qty or 0)
+            except Exception:
+                q = 0.0
+            s = str(side or "").upper()
+            if s == "BUY":
+                bal[mint] = bal.get(mint, 0.0) + q
+            elif s == "SELL":
+                bal[mint] = bal.get(mint, 0.0) - q
+        for mint, q in bal.items():
+            if q > 0:
+                mints.add(mint)
+
+con.close()
+
+with open(out, "w", encoding="utf-8") as f:
+    for m in sorted(mints):
+        f.write(m + "\n")
+
+print(f"holdings_mints={len(mints)} wrote={out}")
+PY
+
+    if [[ -f "$TMP_H" ]]; then
+      touch "$BH"
+      cat "$TMP_H" >> "$BH"
+      sort -u "$BH" -o "$BH"
+      echo "🧱 blackhole_lines=$(wc -l < "$BH")"
+    fi
+  else
+    echo "🧱 AUTO_BLACKHOLE_HOLDINGS=1 but missing db=$DB (skip)"
+  fi
+fi
+# --- /AUTO_BLACKHOLE_HOLDINGS_V1 -------------------------------------------
+
+# --- HARD GUARD: prevent multiple instances ---
+if pgrep -f "src/run_live.py" >/dev/null; then
+  echo "[FATAL] run_live already running. Refusing to start another instance." >&2
+  pgrep -af "src/run_live.py" >&2 || true
+  exit 1
+fi
+# --- END HARD GUARD ---
+cd "$(dirname "$0")/.."
+
+LOCK_FILE="${LOCK_FILE:-state/run_live.lock}"
+ENV_FILE="${ENV_FILE:-state/live.env}"
+LOG_DIR="${LOG_DIR:-logs}"
+LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-7}"
+
+mkdir -p "$LOG_DIR" state
+find "$LOG_DIR" -type f -name "run_live_*.log" -mtime +"$LOG_KEEP_DAYS" -delete 2>/dev/null || true
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "⛔ run_live déjà en cours (lock=$LOCK_FILE)"
+  exit 23
+fi
+
+set -a
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+set +a
+
+export PYTHONPATH="src:${PYTHONPATH:-}"
+
+# FORCE CANONICAL
+# READY_FILE comes from state/live.env (if set) else fallback to canonical
+export READY_FILE="${READY_FILE:-state/READY_CANONICAL.jsonl}"
+export TRADER_READY_FILE="$READY_FILE"
+
+# force skip file safe (jamais /dev/null)
+export SKIP_MINTS_FILE="${SKIP_MINTS_FILE:-state/skip_mints_trader.txt}"
+export TRADER_SKIP_MINTS_FILE="${TRADER_SKIP_MINTS_FILE:-state/skip_mints_trader.txt}"
+if [ "$SKIP_MINTS_FILE" = "/dev/null" ]; then export SKIP_MINTS_FILE="state/skip_mints_trader.txt"; fi
+if [ "$TRADER_SKIP_MINTS_FILE" = "/dev/null" ]; then export TRADER_SKIP_MINTS_FILE="state/skip_mints_trader.txt"; fi
+
+LOG="$LOG_DIR/run_live_$(date +%Y%m%d_%H%M%S).log"
+echo "▶️ START run_live @ $(date +%Y%m%d_%H%M%S) READY_FILE=$READY_FILE SKIP_MINTS_FILE=$SKIP_MINTS_FILE TRADER_SKIP_MINTS_FILE=$TRADER_SKIP_MINTS_FILE" | tee -a "$LOG"
+
+# Backoff si "no candidates" (évite spam CPU/logs)
+NO_CAND_BACKOFF_S="${NO_CAND_BACKOFF_S:-60}"
+(
+  ./.venv/bin/python -u src/run_live.py 2>&1 || true
+) | tee -a "$LOG" | awk -v b="$NO_CAND_BACKOFF_S" '
+  { print; fflush(); }
+  /no candidates after ready filter/ { system("sleep " b); }
+'

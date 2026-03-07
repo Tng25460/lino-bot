@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+import json, sqlite3, time
+from pathlib import Path
+
+READY_IN = Path("state/ready_tradable.jsonl")
+READY_OUT = Path("state/ready_tradable_plus_histgood.jsonl")
+DB = "state/brain.sqlite"
+MAX_ADD = 8
+REENTRY_RL_SKIP_SEC = 6*3600
+RL_SKIP_PATH = Path('state/rl_skip_mints.json')
+
+
+def _rlskip_add(mint: str, sec: int, reason: str = "reentry_histgood"):
+    try:
+        now = int(time.time())
+        path = RL_SKIP_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8", errors="ignore") or "{}")
+            except Exception:
+                data = {}
+        data[mint] = {"until": now + int(sec), "reason": reason, "ts": now}
+        path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# load existing ready mints
+ready_lines = READY_IN.read_text(encoding="utf-8", errors="ignore").splitlines()
+ready_mints = set()
+for ln in ready_lines:
+    ln = ln.strip()
+    if not ln:
+        continue
+    try:
+        o = json.loads(ln)
+    except Exception:
+        continue
+    m = (o.get("mint") or o.get("output_mint") or o.get("outputMint") or o.get("address") or "").strip()
+    if m:
+        ready_mints.add(m)
+
+con = sqlite3.connect(DB)
+cur = con.cursor()
+
+# pick "good" from mint_hist (n_closed>=1 & avg_pnl>=0.05)
+good = [r[0] for r in cur.execute("""
+SELECT mint, n_closed, avg_pnl, last_close_ts
+FROM mint_hist
+WHERE n_closed>=1 AND avg_pnl>=0.05
+ORDER BY avg_pnl DESC, last_close_ts DESC
+LIMIT ?
+""", (MAX_ADD,)).fetchall()]
+
+added = 0
+out_lines = list(ready_lines)
+for m in good:
+    if m not in ready_mints:
+        out_lines.append(json.dumps({"mint": m, "tag": "hist_good_reentry"}, separators=(",",":")))
+        ready_mints.add(m)
+        _rlskip_add(m, REENTRY_RL_SKIP_SEC, "reentry_histgood")
+        added += 1
+READY_OUT.write_text("\n".join([ln for ln in out_lines if ln.strip()]) + "\n", encoding="utf-8")
+print(f"[OK] wrote {READY_OUT} lines={len(out_lines)} added_histgood={added}")

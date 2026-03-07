@@ -1,0 +1,156 @@
+import os, json, time, sqlite3
+from pathlib import Path
+
+DB  = Path(os.getenv("BRAIN_DB", "state/brain.sqlite"))
+INP = Path(os.getenv("BRAIN_READY_IN", "state/ready_tradable.jsonl"))
+OUT = Path(os.getenv("BRAIN_READY_OUT", "state/ready_scored.jsonl"))
+
+BRAIN_SKIP = Path(os.getenv("BRAIN_SKIP_MINTS_FILE", os.getenv("SKIP_MINTS_FILE", "state/skip_mints_brain.txt")))
+
+def load_skip(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    out=set()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        t=line.strip()
+        if not t or t.startswith("#"): continue
+        out.add(t)
+    return out
+
+def pick(d: dict, keys: list[str], default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+def to_f(x, default=0.0):
+    try:
+        if x is None: return default
+        return float(x)
+    except Exception:
+        return default
+
+def to_i(x, default=0):
+    try:
+        if x is None: return default
+        return int(float(x))
+    except Exception:
+        return default
+
+def detect_profile(obj: dict) -> str:
+    if obj.get("profile") in ("pump","multi"):
+        return obj["profile"]
+    if obj.get("is_pump") or obj.get("pumpfun") or obj.get("source") == "pump":
+        return "pump"
+    liq = to_f(pick(obj, ["liq_usd","liquidity_usd","liquidityUsd","liquidity","liq"]))
+    tx5 = to_i(pick(obj, ["txns_5m","txns5m","tx5m","txns_5min"]))
+    if liq > 0 and liq < 20000 and tx5 >= 50:
+        return "pump"
+    return "multi"
+
+def extract_metrics(obj: dict):
+    liq = to_f(pick(obj, ["liq_usd","liquidity_usd","liquidityUsd","liquidity","liq"]))
+    v5  = to_f(pick(obj, ["vol_5m","volume_5m","volume5m","vol5m","volume5mUsd"]))
+    tx5 = pick(obj, ["txns_5m","txns5m","tx5m","txns_5min"])
+    if tx5 is None:
+        # some payloads have buys/sells
+        b = to_i(pick(obj, ["buys_5m","buys5m"]))
+        s = to_i(pick(obj, ["sells_5m","sells5m"]))
+        tx5 = b + s
+    tx5 = to_i(tx5)
+    chg = to_f(pick(obj, ["chg_5m","price_change_5m","priceChange5m","change_5m","pct_5m"]), 0.0)
+    dex = pick(obj, ["dex","dex_id","dexId","dexIdStr"])
+    return liq, v5, tx5, chg, dex
+
+def score(obj: dict, profile: str) -> tuple[float, str, dict]:
+    liq, v5, tx5, chg, dex = extract_metrics(obj)
+
+    # soft scoring: if fields missing, do not hard-gate to 0
+    # but still require "some signal": at least one of liq/vol/tx non-zero
+    if liq <= 0 and v5 <= 0 and tx5 <= 0:
+        return (0.0, "gate:no_metrics", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+
+    if profile == "pump":
+        # light gates (very permissive)
+        if liq > 0 and liq < 800: return (0.0, "gate:liq<800", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+        if tx5 > 0 and tx5 < 8:   return (0.0, "gate:tx5m<8", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+        s = 1.0
+        if tx5: s += min(2.2, tx5/40.0)
+        if v5:  s += min(2.2, v5/12000.0)
+        if liq: s += min(1.2, liq/25000.0)
+        if chg: s += max(0.0, min(1.0, chg/10.0))
+        return (s, "pump:soft", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+
+    # multi
+    if liq > 0 and liq < 2500: return (0.0, "gate:liq<2.5k", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+    s = 1.0
+    if liq: s += min(1.8, liq/60000.0)
+    if v5:  s += min(2.0, v5/18000.0)
+    if tx5: s += min(1.3, tx5/30.0)
+    if chg: s += max(0.0, min(0.8, chg/10.0))
+    return (s, "multi:soft", {"liq_usd":liq,"vol_5m":v5,"txns_5m":tx5,"chg_5m":chg,"dex":dex})
+
+def main():
+    assert DB.exists(), f"missing DB: {DB}"
+    if not INP.exists():
+        raise SystemExit(f"missing input jsonl: {INP}")
+
+    skip = load_skip(BRAIN_SKIP)
+    now = int(time.time())
+
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("BEGIN;")
+
+    out_lines=[]
+    kept=0
+    seen=0
+
+    for line in INP.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line=line.strip()
+        if not line: continue
+        seen += 1
+        try:
+            obj=json.loads(line)
+        except Exception:
+            continue
+
+        mint=(obj.get("mint") or obj.get("address") or obj.get("tokenAddress") or "").strip()
+        if not mint or mint in skip:
+            continue
+
+        profile = detect_profile(obj)
+        sc, reason, obs = score(obj, profile)
+        if sc <= 0:
+            continue
+
+        kept += 1
+        rec = {
+            "ts": now,
+            "mint": mint,
+            "profile": profile,
+            "score": float(sc),
+            "reason": reason,
+            "obs": obs,
+        }
+        out_lines.append(json.dumps(rec, separators=(",",":")))
+
+        con.execute(
+            "INSERT INTO token_scores(ts,mint,profile,score,reason,payload_json) VALUES(?,?,?,?,?,?)",
+            (now, mint, profile, float(sc), reason, json.dumps(obs, separators=(",",":")))
+        )
+
+    con.commit()
+    con.close()
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+
+    print(f"✅ brain_export_v4: in={seen} kept={kept} out={OUT}")
+    if kept:
+        rows = sorted((json.loads(x) for x in out_lines), key=lambda r: r["score"], reverse=True)[:10]
+        for r in rows:
+            print(f"  {r['score']:.3f}  {r['profile']:5}  {r['mint']}  {r['reason']}  obs={r['obs']}")
+
+if __name__ == "__main__":
+    main()

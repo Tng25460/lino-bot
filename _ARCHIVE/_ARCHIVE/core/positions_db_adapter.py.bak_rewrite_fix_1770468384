@@ -1,0 +1,215 @@
+import sqlite3
+import time
+from typing import Any, Dict, List, Optional
+
+
+class PositionsDBAdapter:
+    """
+    Adapter minimal SQLite pour SellEngine.
+
+    Méthodes attendues par core/sell_engine.py :
+      - get_open_positions()
+      - update_position(mint, **fields)
+      - mark_tp1(mint)
+      - mark_tp2(mint)
+      - close_position(mint, reason)
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def _con(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+
+    def _price_cols(self, cols):
+        """Schema compat: old uses entry_price/close_price; new uses *_usd."""
+        entry_col = 'entry_price_usd' if 'entry_price_usd' in cols else ('entry_price' if 'entry_price' in cols else None)
+        close_col = 'close_price_usd' if 'close_price_usd' in cols else ('close_price' if 'close_price' in cols else None)
+        return entry_col, close_col
+
+    def get_open_positions(self):
+        con = self._con()
+        try:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()]
+            entry_col, close_col = self._price_cols(cols)
+            sel = [
+                "mint","symbol","status","qty_token","entry_ts",
+                "tp1_done","tp2_done","max_price","stop_price",
+                "close_ts","close_reason"
+            ]
+            if entry_col:
+                sel.append(entry_col + " AS entry_price_usd")
+            else:
+                sel.append("NULL AS entry_price_usd")
+            if close_col:
+                sel.append(close_col + " AS close_price_usd")
+            else:
+                sel.append("NULL AS close_price_usd")
+            if "wallet" in cols:
+                sel.append("wallet")
+            else:
+                sel.append("'' AS wallet")
+            sql = "SELECT " + ", ".join(sel) + " FROM positions WHERE status='OPEN'"
+            rows = cur.execute(sql).fetchall()
+        # schema compat: add alias keys expected by sell_engine
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()]
+        except Exception:
+            cols = []
+        entry_col, close_col = self._price_cols(cols)
+        out = []
+        for r in rows:
+            d = dict(r)
+            if "qty_token" not in d and "qty" in d:
+                d["qty_token"] = d.get("qty")
+            if entry_col and "entry_price_usd" not in d:
+                d["entry_price_usd"] = d.get(entry_col)
+            if close_col and "close_price_usd" not in d:
+                d["close_price_usd"] = d.get(close_col)
+            if "high_water" not in d and "max_price" in d:
+                d["high_water"] = d.get("max_price")
+            if "trailing_stop" not in d and "stop_price" in d:
+                d["trailing_stop"] = d.get("stop_price")
+            if "wallet" not in d:
+                d["wallet"] = ""
+            out.append(d)
+        return out
+    def update_position(self, mint: str, **fields) -> None:
+        if not fields:
+            return
+        # schema compat mapping (sell_engine expects new names)
+        # map fields to existing cols when DB is old schema
+    con0 = self._con()
+    cur0 = con0.cursor()
+    cols0 = [r[1] for r in cur0.execute("PRAGMA table_info(positions)").fetchall()]
+    con0.close()
+        entry_col, close_col = self._price_cols(cols0)
+        mapped = {}
+        for k,v in fields.items():
+            kk = k
+            if kk in ("entry_price_usd","entry_price") and entry_col:
+                kk = entry_col
+            elif kk in ("close_price_usd","close_price") and close_col:
+                kk = close_col
+            elif kk == "high_water" and "max_price" in cols0:
+                kk = "max_price"
+            elif kk == "trailing_stop" and "stop_price" in cols0:
+                kk = "stop_price"
+            elif kk == "wallet" and "wallet" not in cols0:
+                continue
+            mapped[kk] = v
+        fields = mapped
+        cols = []
+        vals = []
+        for k, v in fields.items():
+            cols.append(f"{k}=?")
+            vals.append(v)
+        vals.append(mint)
+
+        con = self._con()
+        try:
+            cur = con.cursor()
+            cur.execute(f"UPDATE positions SET {', '.join(cols)} WHERE mint=?", vals)
+            con.commit()
+        finally:
+            con.close()
+
+    def mark_tp1(self, mint: str) -> None:
+        con = self._con()
+        try:
+            cur = con.cursor()
+            cur.execute("UPDATE positions SET tp1_done=1 WHERE mint=?", (mint,))
+            con.commit()
+        finally:
+            con.close()
+
+    def mark_tp2(self, mint: str) -> None:
+        con = self._con()
+        try:
+            cur = con.cursor()
+            cur.execute("UPDATE positions SET tp2_done=1 WHERE mint=?", (mint,))
+            con.commit()
+        finally:
+            con.close()
+
+    def close_position(self, mint: str, *args, **kwargs) -> None:
+        """
+        Close a position row in positions table.
+    
+        Compatible call styles:
+          - close_position(mint, reason="hard_sl")
+          - close_position(mint, close_reason="dust", close_ts=..., close_price_usd=...)
+          - close_position(mint, now, "dust_untradeable", 0.0)   # legacy positional
+        """
+    
+        reason = kwargs.get("reason") or kwargs.get("close_reason") or "closed"
+        close_ts = kwargs.get("ts") or kwargs.get("close_ts")
+        close_price_usd = kwargs.get("close_price_usd") if "close_price_usd" in kwargs else kwargs.get("close_price")
+    
+        # legacy positional support:
+        #   (mint, reason)
+        #   (mint, now, reason, close_price_usd)
+        if args:
+            if len(args) == 1:
+                a0 = args[0]
+                if isinstance(a0, (int, float)) and float(a0) > 0:
+                    close_ts = int(a0)
+                else:
+                    reason = str(a0)
+            else:
+                a0, a1 = args[0], args[1]
+                if isinstance(a0, (int, float)) and float(a0) > 0:
+                    close_ts = int(a0)
+                    reason = str(a1)
+                    if len(args) >= 3:
+                        try:
+                            close_price_usd = float(args[2])
+                        except Exception:
+                            pass
+                else:
+                    reason = str(a0)
+                    try:
+                        close_price_usd = float(a1)
+                    except Exception:
+                        pass
+    
+        if close_ts is None:
+            close_ts = int(time.time())
+        else:
+            close_ts = int(close_ts)
+    
+        con = self._con()
+        try:
+            cur = con.cursor()
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()]
+            entry_col, close_col = self._price_cols(cols)
+    
+            sets = ["status='CLOSED'", "close_ts=?", "close_reason=?"]
+            vals = [close_ts, str(reason)]
+    
+            # write close price into whichever schema exists
+            if close_col:
+                sets.insert(1, close_col + "=?")
+                if close_price_usd is None:
+                    vals.insert(0, None)
+                else:
+                    try:
+                        vals.insert(0, float(close_price_usd))
+                    except Exception:
+                        vals.insert(0, None)
+    
+            where = "WHERE mint=?"
+            if "status" in cols:
+                where += " AND status='OPEN'"
+    
+            sql = "UPDATE positions SET " + ", ".join(sets) + " " + where
+            vals.append(mint)
+            cur.execute(sql, vals)
+            con.commit()
+        finally:
+            con.close()

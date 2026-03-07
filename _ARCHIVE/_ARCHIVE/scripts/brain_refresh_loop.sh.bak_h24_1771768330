@@ -1,0 +1,142 @@
+TOP_N="${TOP_N:-200}"
+export TOP_N
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /home/tng25/lino_FINAL_20260203_182626
+source .venv/bin/activate
+
+SLEEP_SEC="${SLEEP_SEC:-120}"
+
+BRAIN_SCORE_MIN="${BRAIN_SCORE_MIN:-0.03}"
+BRAIN_TOPN="${BRAIN_TOPN:-60}"
+
+FILTER_TRADABLE_MIN_INTERVAL_SEC="${FILTER_TRADABLE_MIN_INTERVAL_SEC:-0.9}"
+FILTER_TRADABLE_RETRIES="${FILTER_TRADABLE_RETRIES:-12}"
+FILTER_TRADABLE_ON429_KEEP="${FILTER_TRADABLE_ON429_KEEP:-1}"
+FILTER_TRADABLE_AMOUNT="${FILTER_TRADABLE_AMOUNT:-5000000}"
+FILTER_TRADABLE_SLIP_BPS="${FILTER_TRADABLE_SLIP_BPS:-250}"
+FILTER_TRADABLE_MAX_NEG_PNL_PCT="${FILTER_TRADABLE_MAX_NEG_PNL_PCT:-5}"
+
+mkdir -p state
+
+while true; do
+  echo "[brain_refresh] cycle start $(date -Is)" | tee -a state/brain_refresh_loop.log
+
+  # 1) brain -> state/ready_scored.jsonl
+  python -u src/brain/brain_loop.py >> state/brain_loop.log 2>&1 || true
+
+  # 2) tradable -> state/ready_scored_tradable.jsonl
+  BRAIN_SCORE_MIN="$BRAIN_SCORE_MIN" \
+  BRAIN_TOPN="$BRAIN_TOPN" \
+  FILTER_TRADABLE_MIN_INTERVAL_SEC="$FILTER_TRADABLE_MIN_INTERVAL_SEC" \
+  FILTER_TRADABLE_RETRIES="$FILTER_TRADABLE_RETRIES" \
+  FILTER_TRADABLE_ON429_KEEP="$FILTER_TRADABLE_ON429_KEEP" \
+  FILTER_TRADABLE_AMOUNT="$FILTER_TRADABLE_AMOUNT" \
+  FILTER_TRADABLE_SLIP_BPS="$FILTER_TRADABLE_SLIP_BPS" \
+  FILTER_TRADABLE_MAX_NEG_PNL_PCT="$FILTER_TRADABLE_MAX_NEG_PNL_PCT" \
+  python -u scripts/filter_ready_tradable.py \
+    --in  state/ready_scored.jsonl \
+    --out state/ready_scored_tradable.jsonl \
+    >> state/brain_refresh_loop.log 2>&1 || true
+
+  sleep "$SLEEP_SEC"
+done
+
+
+# --- FALLBACK: never block trading on Jupiter rate limits ---
+if [ ! -s state/ready_scored_tradable.jsonl ]; then
+  echo "[brain_refresh] WARN tradable empty -> fallback to ready_scored.jsonl" >&2
+  cp -f state/ready_scored.jsonl state/ready_scored_tradable.jsonl 2>/dev/null || true
+fi
+
+
+
+# --- H24 GUARDS: LASTGOOD + NOHELD ---
+# Goal:
+# - never overwrite ready_scored_tradable.jsonl with an empty/too-small file (rate-limit / partial write)
+# - remove wallet-held mints from tradable file (prevents rebuy)
+MIN_READY_LINES="${MIN_READY_LINES:-20}"
+LASTGOOD="state/ready_scored_tradable.lastgood.jsonl"
+
+if [ -f state/ready_scored_tradable.jsonl ]; then
+  cur_lines="$(wc -l < state/ready_scored_tradable.jsonl 2>/dev/null || echo 0)"
+else
+  cur_lines="0"
+fi
+
+# Build held mints (best effort; don't break cycle if RPC/DNS hiccups)
+HELD="state/wallet_held_mints.txt"
+{
+  spl-token accounts --url "${RPC_HTTP:-https://api.mainnet-beta.solana.com}" \
+  | awk 'NR>2 && $2!="0" {print $1}' \
+  | grep -aE '^[1-9A-HJ-NP-Za-km-z]{32,44}$' \
+  | sort -u > "$HELD"
+} 2>/dev/null || true
+
+# Apply NOHELD filter (only if we have a held list)
+if [ -s "$HELD" ] && [ -s state/ready_scored_tradable.jsonl ]; then
+  tmpf="state/.ready_scored_tradable.noheld.$$"
+  grep -avFf "$HELD" state/ready_scored_tradable.jsonl > "$tmpf" || true
+  mv -f "$tmpf" state/ready_scored_tradable.jsonl
+  cur_lines="$(wc -l < state/ready_scored_tradable.jsonl 2>/dev/null || echo 0)"
+fi
+
+# LASTGOOD guard: if too small -> restore lastgood
+if [ "${cur_lines:-0}" -lt "${MIN_READY_LINES:-20}" ]; then
+  if [ -s "$LASTGOOD" ]; then
+    echo "[brain_refresh] WARN tradable lines=${cur_lines} < ${MIN_READY_LINES} -> restore LASTGOOD (${LASTGOOD})" >&2
+    cp -f "$LASTGOOD" state/ready_scored_tradable.jsonl 2>/dev/null || true
+  else
+    echo "[brain_refresh] WARN tradable lines=${cur_lines} and no LASTGOOD yet" >&2
+  fi
+else
+  cp -f state/ready_scored_tradable.jsonl "$LASTGOOD" 2>/dev/null || true
+fi
+
+# Fallback: never block trading entirely (only if still empty)
+if [ ! -s state/ready_scored_tradable.jsonl ] && [ -s state/ready_scored.jsonl ]; then
+  echo "[brain_refresh] WARN tradable empty -> fallback to ready_scored.jsonl" >&2
+  cp -f state/ready_scored.jsonl state/ready_scored_tradable.jsonl 2>/dev/null || true
+fi
+
+
+# --- H24 SAFETY: keep last-good tradable list (avoid empty/tiny lists) ---
+MIN_TRADABLE_LINES="${MIN_TRADABLE_LINES:-30}"
+TRADABLE="state/ready_scored_tradable.jsonl"
+LASTGOOD="state/ready_scored_tradable.lastgood.jsonl"
+
+# 1) if tradable exists and is "good enough", refresh lastgood (atomic)
+if [ -s "$TRADABLE" ]; then
+  n="$(wc -l < "$TRADABLE" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -ge "${MIN_TRADABLE_LINES}" ]; then
+    tmp="${LASTGOOD}.tmp.$$"
+    cp -f "$TRADABLE" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$LASTGOOD" 2>/dev/null || true
+    echo "[brain_refresh] lastgood updated lines=${n}" >&2
+  else
+    echo "[brain_refresh] WARN tradable too small lines=${n} < MIN_TRADABLE_LINES=${MIN_TRADABLE_LINES}" >&2
+  fi
+else
+  echo "[brain_refresh] WARN tradable missing/empty" >&2
+fi
+
+# 2) if tradable missing/empty OR too small -> fallback to lastgood, else to ready_scored
+need_fallback=0
+n_now="$(wc -l < "$TRADABLE" 2>/dev/null || echo 0)"
+if [ "${n_now:-0}" -lt "${MIN_TRADABLE_LINES}" ]; then
+  need_fallback=1
+fi
+
+if [ "$need_fallback" = "1" ]; then
+  if [ -s "$LASTGOOD" ]; then
+    echo "[brain_refresh] FALLBACK -> using lastgood" >&2
+    cp -f "$LASTGOOD" "$TRADABLE" 2>/dev/null || true
+  else
+    echo "[brain_refresh] FALLBACK -> lastgood missing, using ready_scored.jsonl" >&2
+    cp -f state/ready_scored.jsonl "$TRADABLE" 2>/dev/null || true
+  fi
+fi
+# --- END H24 SAFETY ---
+

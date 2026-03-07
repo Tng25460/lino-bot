@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+source .venv/bin/activate
+
+# ---- choose profile pack: pump|multi (default: pump)
+PROFILE="${1:-pump}"
+if [[ "$PROFILE" == "pump" ]]; then
+  set -a; source configs/profile_pump.env; set +a
+else
+  set -a; source configs/profile_multi.env; set +a
+fi
+
+# ---- split skip files (hard)
+export TRADER_SKIP_MINTS_FILE="${TRADER_SKIP_MINTS_FILE:-state/skip_mints_trader.txt}"
+export BRAIN_SKIP_MINTS_FILE="${BRAIN_SKIP_MINTS_FILE:-state/skip_mints_brain.txt}"
+
+# ---- pipeline files
+export READY_IN="${READY_IN:-state/ready_scored.jsonl}"
+export READY_TRADABLE="${READY_TRADABLE:-state/ready_tradable.jsonl}"
+export READY_TRADABLE_IN="${READY_TRADABLE_IN:-}"
+export READY_TRADABLE_OUT="${READY_TRADABLE_OUT:-$READY_TRADABLE}"
+export READY_FILE="${READY_FILE:-state/ready_scored.jsonl}"
+
+# ---- brain export I/O
+export BRAIN_DB="${BRAIN_DB:-state/brain.sqlite}"
+export BRAIN_READY_IN="${BRAIN_READY_IN:-$READY_TRADABLE}"
+export BRAIN_READY_OUT="${BRAIN_READY_OUT:-state/ready_scored.jsonl}"
+
+mkdir -p state
+
+
+# PROFILE-based READY_TRADABLE_IN (input to filter_ready_tradable)
+if [[ -z "${READY_TRADABLE_IN:-}" ]]; then
+  if [[ "$PROFILE" == "pump" ]]; then
+    export READY_TRADABLE_IN="state/ready_pump_early.jsonl"
+  else
+    export READY_TRADABLE_IN="state/ready_ranked.jsonl"
+  fi
+fi
+export READY_TRADABLE_OUT="$READY_TRADABLE"
+
+echo "=== CFG ==="
+echo "PROFILE=$PROFILE"
+echo "TRADER_SKIP_MINTS_FILE=$TRADER_SKIP_MINTS_FILE"
+echo "BRAIN_SKIP_MINTS_FILE=$BRAIN_SKIP_MINTS_FILE"
+echo "BRAIN_DB=$BRAIN_DB"
+echo "BRAIN_READY_IN=$BRAIN_READY_IN"
+echo "READY_TRADABLE_IN=$READY_TRADABLE_IN"
+echo "READY_TRADABLE_OUT=$READY_TRADABLE_OUT"
+echo "READY_FILE=$READY_FILE"
+echo "============"
+
+# 1) filter tradable (optional)
+if [[ -f scripts/filter_ready_tradable.py ]]; then
+  echo "[1/3] filter_ready_tradable.py"
+echo "   READY_TRADABLE_IN=$READY_TRADABLE_IN"
+echo "   READY_TRADABLE_OUT=$READY_TRADABLE_OUT"
+export READY_TRADABLE_IN
+export READY_TRADABLE_OUT
+python -u scripts/filter_ready_tradable.py || true
+else
+  echo "[1/3] filter_ready_tradable.py missing -> skip"
+fi
+
+# 2) brain export v4
+echo "[2/3] brain_export_v4"
+python -u src/brain/brain_export_v4.py
+
+# 3) run live
+echo "[3/3] run_live"
+LOG="state/run_live_${PROFILE}_$(date +%Y%m%d_%H%M%S).log"
+python -u src/run_live.py 2>&1 | tee "$LOG"

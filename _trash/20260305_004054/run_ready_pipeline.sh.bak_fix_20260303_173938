@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+mkdir -p state
+
+# 1) produce tradable scored list
+bash scripts/filter_tradable.sh
+
+# 2) build canonical READY file (what run_live_guarded likes)
+bash scripts/build_ready_canonical.sh

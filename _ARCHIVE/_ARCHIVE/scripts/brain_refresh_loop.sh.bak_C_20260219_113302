@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+LOCK_FILE="state/brain_refresh_loop.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "brain_refresh_loop: already running (lock=$LOCK_FILE)"; exit 0
+fi
+
+
+LOCK_FILE="state/brain_refresh_loop.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "brain_refresh_loop: already running (lock=$LOCK_FILE)"; exit 0
+fi
+
+set -euo pipefail
+cd /home/tng25/lino_FINAL_20260203_182626
+source .venv/bin/activate
+
+SLEEP_SEC="${SLEEP_SEC:-120}"
+
+while true; do
+  echo "[brain_refresh] $(date -Is) sync trades -> brain"
+  python -u src/brain/sync_from_trades_db.py --trades-db state/trades.sqlite --brain-db state/brain.sqlite || true
+
+  echo "[brain_refresh] $(date -Is) run brain_loop one-pass"
+  python -u src/brain/brain_loop.py || true
+
+  echo "[brain_refresh] $(date -Is) filter tradable from ready_scored"
+  if [ -s state/ready_scored.jsonl ]; then
+    python -u scripts/filter_ready_tradable.py --in state/ready_scored.jsonl --out state/ready_scored_tradable.jsonl || true
+  fi
+
+  echo "[brain_refresh] $(date -Is) sleep ${SLEEP_SEC}s"
+  sleep "${SLEEP_SEC}"
+done

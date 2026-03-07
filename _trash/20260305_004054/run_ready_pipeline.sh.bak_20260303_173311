@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p state
+
+IN="state/ready_scored_tradable.jsonl"
+MID="state/ready_enriched.jsonl"
+OUT="state/ready_final.jsonl"
+
+# 1) produire IN (tradable) avant de le consommer
+bash scripts/filter_tradable.sh
+
+# 2) garde-fou
+if [ ! -s "$IN" ]; then
+  echo "[READY] ERROR: $IN missing or empty after filter_tradable.sh" >&2
+  ls -la state | sed -n '1,200p' >&2
+  exit 1
+fi
+
+: > "$MID"
+: > "$OUT"
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  echo "$line" | python scripts/enrich_stub.py >> "$MID"
+done < "$IN"
+
+# OUT: pour l'instant on copie (ou tu peux y mettre un post-filter)
+cp -f "$MID" "$OUT"
+
+echo "[READY] OK: $(wc -l < "$OUT") lines -> $OUT"

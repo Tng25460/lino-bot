@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/tng25/lino_FINAL_20260203_182626
+source .venv/bin/activate
+
+mkdir -p state
+echo "🚀 FULL LIVE WITH BRAIN"
+
+# brain refresh loop (background)
+nohup bash -lc 'SLEEP_SEC="${SLEEP_SEC:-60}" ./scripts/brain_refresh_loop.sh' \
+  > state/brain_refresh_loop.log 2>&1 &
+
+sleep 1
+echo "brain_refresh_loop pid(s):"
+pgrep -af "scripts/brain_refresh_loop.sh" || true
+
+# trader lit TOUJOURS le fichier tradable
+export READY_FILE="state/ready_scored_tradable.jsonl"
+python -u src/run_live.py

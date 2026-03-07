@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/tng25/lino_FINAL_20260203_182626 || exit 1
+source .venv/bin/activate || exit 1
+source scripts/env_perf.sh
+
+# trader: plus rapide
+export JUP_MIN_QUOTE_INTERVAL_S="${JUP_MIN_QUOTE_INTERVAL_S_TRADER:-3.0}"
+export JUP_MIN_QUOTE_INTERVAL_MIN_S="${JUP_MIN_QUOTE_INTERVAL_MIN_S_TRADER:-2.0}"
+export JUP_MIN_QUOTE_INTERVAL_MAX_S="${JUP_MIN_QUOTE_INTERVAL_MAX_S_TRADER:-10.0}"
+
+python -u src/run_live.py

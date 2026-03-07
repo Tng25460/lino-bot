@@ -1,48 +1,11 @@
 .venv/
+state/
+logs/
+*.sqlite
+*.db
+*.env
+keypair.json
+last_swap_tx.b64
+audit_out/
 __pycache__/
 *.pyc
-state/*.log
-state/*.sqlite
-state/*.db
-state/*.jsonl
-state/skip_mints_*.txt
-state/*.b64
-state/jup.env
-keypair.json
-/tmp/
-
-# local/auto backups
-*.bak_*
-*.bak
-*~
-
-# --- Bot Lino runtime artifacts ---
-state/
-last_swap_*.b64
-last_swap_*.json
-last_swap_*.log
-*.BROKEN_*
-
-# --- runtime artifacts ---
-state/
-tmp/
-*.log
-*.b64
-*.flag
-*.pid
-*.sqlite
-*.sqlite3
-
-# generated ready files
-ready_*.jsonl
-ready*.jsonl
-ready_to_trade*.jsonl
-*_combined*.jsonl
-*_scored*.jsonl
-*_tradable*.jsonl
-
-# accidental literal env var filenames
-\$\{*\}
-
-# local scratch
-scripts/_run.sh

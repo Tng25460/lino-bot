@@ -1,0 +1,101 @@
+import os
+import time
+
+READY_TRADABLE_IN = os.getenv('READY_TRADABLE_IN', 'state/ready_pump_early.jsonl')
+READY_TRADABLE_OUT = os.getenv('READY_TRADABLE_OUT', 'state/ready_tradable.jsonl')
+#!/usr/bin/env python3
+import json, os, time
+import requests
+INP = os.getenv('READY_TRADABLE_IN', 'state/ready_pump_early.jsonl')
+OUT = os.getenv('READY_TRADABLE_OUT', 'state/ready_tradable.jsonl')
+FILTER_QUOTE_RETRIES = int(os.getenv('FILTER_QUOTE_RETRIES', '6'))
+FILTER_QUOTE_DELAY_S = float(os.getenv('FILTER_QUOTE_DELAY_S', '0.6'))
+FILTER_QUOTE_MAX_DELAY_S = float(os.getenv('FILTER_QUOTE_MAX_DELAY_S', '6.0'))
+FILTER_ON_429_KEEP = os.getenv('FILTER_ON_429_KEEP', '1') == '1'
+
+print(f"[filter_ready_tradable] INP={INP} OUT={OUT}")
+
+def _quote_ok(out_mint: str) -> tuple[bool, int, str]:
+    """return (ok, http_code, body_head). ok means tradable."""
+    delay = FILTER_QUOTE_DELAY_S
+    for i in range(FILTER_QUOTE_RETRIES):
+        try:
+            r = requests.get(
+                f"{os.getenv('JUP_BASE_URL', 'https://lite-api.jup.ag')}/swap/v1/quote",
+                params={
+                    "inputMint": os.getenv("INPUT_MINT", "So11111111111111111111111111111111111111112"),
+                    "outputMint": out_mint,
+                    "amount": str(int(os.getenv("FILTER_AMOUNT_LAMPORTS", "1000000"))),
+                    "slippageBps": int(os.getenv("SLIPPAGE_BPS", "120")),
+                },
+                timeout=10,
+            )
+            code = getattr(r, "status_code", 0)
+            head = (r.text or "")[:140].replace("\n"," ")
+            if code == 200:
+                return True, code, head
+            if code == 429:
+                # rate limit: retry with backoff
+                time.sleep(delay)
+                delay = min(FILTER_QUOTE_MAX_DELAY_S, delay * 1.7)
+                continue
+            return False, code, head
+        except Exception as e:
+            # transient: retry
+            time.sleep(delay)
+            delay = min(FILTER_QUOTE_MAX_DELAY_S, delay * 1.7)
+    # after retries: treat 429 as "unknown"
+    return (True if FILTER_ON_429_KEEP else False), 429, "rate_limited"
+
+JUP = os.getenv("JUP_BASE_URL", "https://lite-api.jup.ag")
+AMOUNT = str(int(float(os.getenv("BUY_AMOUNT_SOL","0.003")) * 1e9))
+SLIPPAGE = os.getenv("SLIPPAGE_BPS", "120")
+
+def ok_quote(mint: str) -> tuple[bool,str]:
+    params = {
+        "inputMint":"So11111111111111111111111111111111111111112",
+        "outputMint": mint,
+        "amount": AMOUNT,
+        "slippageBps": SLIPPAGE,
+    }
+    try:
+        r = requests.get(f"{JUP}/swap/v1/quote", params=params, timeout=12)
+        if r.status_code == 200:
+            return True, ""
+        txt = (r.text or "")[:200]
+        return False, f"http={r.status_code} body={txt}"
+    except Exception as e:
+        return False, f"exc={e}"
+
+rows = []
+with open(INP,"r",encoding="utf-8") as f:
+    for ln in f:
+        ln = ln.strip()
+        if not ln: 
+            continue
+        try:
+            rows.append(json.loads(ln))
+        except Exception:
+            pass
+
+kept = 0
+bad = 0
+with open(OUT,"w",encoding="utf-8") as w:
+    for i, o in enumerate(rows, 1):
+        mint = (o.get("mint") or o.get("outputMint") or o.get("address") or "").strip()
+        if not mint:
+    # bad += 1  # patched: handled per-http below
+
+            continue
+        ok, why = ok_quote(mint)
+        if ok:
+            w.write(json.dumps(o, ensure_ascii=False) + "\n")
+            kept += 1
+        else:
+    # bad += 1  # patched: handled per-http below
+
+        if i % 10 == 0:
+            print(f"[{i}/{len(rows)}] kept={kept} bad={bad}")
+        time.sleep(0.12)
+
+print("DONE kept=", kept, "bad=", bad, "OUT=", OUT)
