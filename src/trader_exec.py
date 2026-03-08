@@ -8,6 +8,13 @@ try:
 except Exception:
     def _dtrace(*a, **kw): pass  # fallback silencieux si module absent
 
+# PHASE4_P4.4: import regime detector (fail-open)
+_current_regime = "UNKNOWN"
+try:
+    from core.regime_detector import detect_regime as _detect_regime
+except Exception:
+    def _detect_regime(**kw): return {"regime": "UNKNOWN", "regime_score": 0.0, "confidence": 0.0}
+
 # --- TRADER_RLSKIP_FILTER_V4 ---
 # marker: TRADER_RLSKIP_FILTER_V4
 def _rl_skip_is_active(mint: str) -> bool:
@@ -852,7 +859,18 @@ def main() -> int:
 
     print("   one_shot=", ONE_SHOT, "dry_run=", DRY_RUN)
 
-
+    # PHASE4_P4.4: detection regime marche (informatif, fail-open)
+    global _current_regime
+    try:
+        _regime_result = _detect_regime()
+        _current_regime = str(_regime_result.get("regime", "UNKNOWN"))
+        print(f"   regime={_current_regime} score={_regime_result.get('regime_score', 0):.3f} conf={_regime_result.get('confidence', 0):.2f}", flush=True)
+    except Exception as _re:
+        _current_regime = "UNKNOWN"
+        try:
+            print(f"⚠️ regime detection failed (fail-open): {_re}", flush=True)
+        except Exception:
+            pass
 
     ready = _load_ready()
     # HOLDINGS_FILTER_V1: remove held mints from ready early (before pick)
@@ -1331,11 +1349,11 @@ def main() -> int:
     from core.security_gate import check_max_positions, check_antirug
     _gate_ok, _gate_msg = check_max_positions()
     if not _gate_ok:
-        _dtrace("REJECT", str(output_mint), reason="max_open_positions", symbol=str(locals().get('output_symbol', '')))
+        _dtrace("REJECT", str(output_mint), reason="max_open_positions", symbol=str(locals().get('output_symbol', '')), regime=_current_regime)
         return 0
     _ar_ok, _ar_msg, _ar_skip = check_antirug(str(output_mint))
     if not _ar_ok:
-        _dtrace("REJECT", str(output_mint), reason=f"antirug:{_ar_skip or 'block'}", symbol=str(locals().get('output_symbol', '')))
+        _dtrace("REJECT", str(output_mint), reason=f"antirug:{_ar_skip or 'block'}", symbol=str(locals().get('output_symbol', '')), regime=_current_regime)
         if _ar_skip:
             try:
                 _rl_skip_add(str(output_mint), reason=_ar_skip)
@@ -1350,7 +1368,7 @@ def main() -> int:
         _cb_ok, _cb_reason = check_circuit_breaker()
         if not _cb_ok:
             print(f"🛑 CIRCUIT_BREAKER → BUY bloqué: {_cb_reason}", flush=True)
-            _dtrace("REJECT", str(output_mint), reason=f"circuit_breaker:{_cb_reason[:80]}", symbol=str(locals().get('output_symbol', '')))
+            _dtrace("REJECT", str(output_mint), reason=f"circuit_breaker:{_cb_reason[:80]}", symbol=str(locals().get('output_symbol', '')), regime=_current_regime)
             return 0
     except Exception as _cb_e:
         # Fail-open: si risk_engine indisponible, on continue
@@ -1571,7 +1589,7 @@ def main() -> int:
                 _buy_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
                 _buy_score = float(locals().get('_cand_score') or locals().get('cand_score') or 0.0)
                 _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym, score_total=_buy_score, sizing_sol=_buy_sol,
-                        details={"txsig": str(txsig)[:16]})
+                        regime=_current_regime, details={"txsig": str(txsig)[:16]})
             except Exception:
                 pass
             # --- DB record BUY (schema-safe) ---
