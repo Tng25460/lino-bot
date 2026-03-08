@@ -116,17 +116,7 @@ def _fake_swap429_should_exit():
 # --- /FAKE_SWAP429_N_V1 ---
 
 
-def _exit_rc42_on_429_v1(msg: str) -> None:
-    try:
-        if not msg:
-            return
-        if 'http= 429' in msg or 'http=429' in msg:
-            print('🧊 BUY_429_DETECTED -> exit(42)', flush=True)
-            raise SystemExit(42)
-    except SystemExit:
-        raise
-    except Exception:
-        return
+# PHASE3_P3.6: supprimé _exit_rc42_on_429_v1 (code mort, jamais appelée)
 
 TRADER_QUOTE_ONLY = int(os.getenv("TRADER_QUOTE_ONLY", "0"))
 # --- RL_SKIP (top-level) ---
@@ -146,43 +136,8 @@ except Exception as _e:
 # --- /RL_SKIP ---
 
 
-def _rl_skip_filter_ready(ready):
-    """
-    Filters a ready(list[dict|str]) using state/rl_skip_mints.json.
-    Robust mint extraction: supports keys: address | token | mint, or raw string lines.
-    """
-    try:
-        rl = _rl_skip_load()
-    except Exception:
-        rl = {}
-
-    if not rl:
-        return ready
-
-    now = int(_time.time())
-    out = []
-
-    def _get_mint(x):
-        if isinstance(x, str):
-            return x.strip()
-        if isinstance(x, dict):
-            v = x.get("address") or x.get("token") or x.get("mint")
-            if isinstance(v, str):
-                return v.strip()
-        return None
-
-    for x in (ready or []):
-        mint = _get_mint(x)
-        if not mint:
-            out.append(x)
-            continue
-        until = rl.get(mint)
-        if until and int(until) > now:
-            continue
-        out.append(x)
-
-    return out
-
+# PHASE3_P3.6: supprimé _rl_skip_filter_ready (code mort, jamais appelée — le filtrage RL_SKIP
+# est fait en inline dans main() via TRADER_RLSKIP_APPLY_V4)
 # PHASE2_P2.6: supprimé 1ère _rl_skip_load (L.185, écrasée par L.304)
 # PHASE2_P2.6: supprimé 1ère _rl_skip_save (L.195, écrasée par L.313)
 
@@ -269,19 +224,7 @@ def _rl_skip_save(d: dict) -> None:
     except Exception as _e:
         print("⚠️ rl_skip save failed:", _e)
 
-def _rl_skip_has(mint: str) -> bool:
-    m = (mint or "").strip()
-    if not m:
-        return False
-    now = int(time.time())
-    d = _rl_skip_load()
-    exp = int(d.get(m, 0) or 0)
-    if exp <= now:
-        if m in d:
-            d.pop(m, None)
-            _rl_skip_save(d)
-        return False
-    return True
+# PHASE3_P3.6: supprimé _rl_skip_has (code mort, jamais appelée — _rl_skip_is utilisée à la place)
 # --- END RL skip ---
 
 
@@ -539,27 +482,8 @@ BYPASS_COOLDOWN = os.getenv("BYPASS_COOLDOWN","0") == "1"
 LAST_BUYS_FILE = os.getenv("LAST_BUYS_FILE", "state/last_buys.json")
 
 
-def _load_last_buys() -> dict:
-    from pathlib import Path
-    import json
-    try:
-        fp = Path(LAST_BUYS_FILE)
-        if not fp.exists():
-            return {}
-        return json.loads(fp.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _save_last_buys(d: dict) -> None:
-    from pathlib import Path
-    import json
-    try:
-        fp = Path(LAST_BUYS_FILE)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        pass
-
+# PHASE3_P3.6: supprimé _load_last_buys + _save_last_buys (code mort, jamais appelées —
+# _last_buy_set/_last_buy_get utilisent LAST_BUY_FILE singulier, pas LAST_BUYS_FILE)
 
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
@@ -628,25 +552,8 @@ def _score_candidate(c: dict) -> (float, dict):
     dbg = {"liq": liq, "v5": v5, "v1h": v1h, "ch5": ch5, "ch1": ch1, "mc": mc, "score": score}
     return float(score), dbg
 
-def _pick_best_ready(ready: list) -> dict:
-    best = None
-    best_score = -1e9
-    best_dbg = {}
-    for c in ready:
-        if not isinstance(c, dict):
-            continue
-        sc, dbg = _score_candidate(c)
-        if sc > best_score:
-            best_score = sc
-            best = c
-            best_dbg = dbg
-    if best is None:
-        return {}
-    # log minimal
-    mint = (best.get("outputMint") or best.get("mint") or best.get("address") or "").strip()
-    sym  = (best.get("symbol") or "").strip()
-    print(f"[DECISION] PICK mint={mint} sym={sym} score={best_score:.2f} dbg={best_dbg}")
-    return best
+# PHASE3_P3.6: supprimé _pick_best_ready (code mort, jamais appelée —
+# _pick_best_scored_ready est utilisée à la place)
 ### SOL_BALANCE_GUARD_V1 ###
 MIN_SOL_BUFFER_LAMPORTS = int(float(os.getenv('MIN_SOL_BUFFER_SOL','0.003')) * 1_000_000_000)  # fees/ATA buffer
 
@@ -845,29 +752,8 @@ def _load_skip_set(path: str) -> set:
         out.add(line)
     return out
 
-def _load_rlskip_set(path: str, now: int) -> set:
-    try:
-        import json
-        obj = json.loads(Path(path).read_text(encoding="utf-8", errors="ignore") or "{}")
-    except Exception:
-        return set()
-    out = set()
-    # format attendu: {mint: {"until": <ts>, ...}, ...}
-    if isinstance(obj, dict):
-        for mint, meta in obj.items():
-            if not isinstance(mint, str) or not mint:
-                continue
-            until = None
-            if isinstance(meta, dict):
-                until = meta.get("until") or meta.get("until_ts")
-            try:
-                until = int(until) if until is not None else None
-            except Exception:
-                until = None
-            if until is None or until > now:
-                out.add(mint)
-    return out
-
+# PHASE3_P3.6: supprimé _load_rlskip_set (code mort, jamais appelée —
+# _rl_skip_purge_and_save est utilisée à la place pour charger+purger en un pas)
 
 def _rl_skip_purge_and_save(path: str, now: int, cap: int = 5000) -> dict:
     """Load rl_skip JSON, remove expired entries, clamp to cap most-recent, save if changed.
