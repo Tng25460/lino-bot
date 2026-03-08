@@ -1404,6 +1404,33 @@ def main() -> int:
             pass
     # --- /PHASE4_P4.3 ---
 
+    # PHASE4_P4.6: sizing advisor (ajustement dynamique du montant)
+    _sizing_result = {}
+    try:
+        _sizing_enabled = os.getenv("SIZING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        if _sizing_enabled:
+            from core.sizing_advisor import compute_sizing
+            _score_for_sizing = float(_elite_score.get("score_total", 0)) if _elite_score else 0.0
+            _base_sol = float(amount_lamports) / 1_000_000_000 if amount_lamports else 0.0
+            _sizing_result = compute_sizing(
+                score_total=_score_for_sizing,
+                regime=_current_regime,
+                base_sol=_base_sol,
+            )
+            # Appliquer le sizing recommande
+            _new_lamports = int(_sizing_result.get("recommended_lamports", amount_lamports))
+            if _new_lamports > 0:
+                amount_lamports = _new_lamports
+                print(f"   sizing_applied: {amount_lamports} lamports ({_sizing_result.get('recommended_sol', 0):.4f} SOL)", flush=True)
+        else:
+            print("   sizing=OFF (set SIZING_ENABLED=1 to activate)", flush=True)
+    except Exception as _sz_e:
+        try:
+            print(f"⚠️ sizing_advisor failed (fail-open, using base amount): {_sz_e}", flush=True)
+        except Exception:
+            pass
+    # --- /PHASE4_P4.6 ---
+
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
@@ -1612,7 +1639,7 @@ def main() -> int:
             # PHASE4_P4.2+P4.5: trace BUY réussi avec score elite breakdown
             try:
                 _buy_sym = str(locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or '')
-                _buy_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
+                _buy_sol = float(_sizing_result.get("recommended_sol", 0)) if _sizing_result else float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
                 _comp = _elite_score.get("components", {}) if _elite_score else {}
                 _buy_score = float(_elite_score.get("score_total", 0)) if _elite_score else float(locals().get('_cand_score') or 0.0)
                 _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym,
