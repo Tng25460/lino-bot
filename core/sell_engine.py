@@ -6,6 +6,13 @@ import traceback
 import time
 import re
 
+# PHASE4_P4.7: Adaptive sell — regime-aware trailing (fail-open)
+try:
+    from core.regime_detector import get_current_regime as _get_regime
+except Exception:
+    def _get_regime():
+        return {"regime": "UNKNOWN", "regime_score": 0.0, "confidence": 0.0}
+
 def _env_float(name: str, default: float) -> float:
     v = os.environ.get(name)
     if v is None or v == "":
@@ -79,6 +86,16 @@ class SellEngine:
         self._price_429_log_ts = {}  # mint -> ts of last [COOLDOWN] log (anti-spam)
         self.PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "30"))
         self.PRICE_429_COOLDOWN_S = int(os.getenv("PRICE_429_COOLDOWN_S", "90"))
+
+        # PHASE4_P4.7: Adaptive Sell Engine (activé par ADAPTIVE_SELL_ENABLED=1)
+        self.ADAPTIVE_SELL_ENABLED = _env_int("ADAPTIVE_SELL_ENABLED", 0)
+        self.BREAKEVEN_TRIGGER_PCT = _env_float("SELL_BREAKEVEN_TRIGGER_PCT", 0.15)   # peak +15% → breakeven actif
+        self.BREAKEVEN_PROTECT_PCT = _env_float("SELL_BREAKEVEN_PROTECT_PCT", 0.005)   # sell si redescend a +0.5%
+        self.MOMENTUM_EXIT_PCT = _env_float("SELL_MOMENTUM_EXIT_PCT", 0.25)            # 25% drop from hw → sell
+        self.TRAIL_HOT = _env_float("SELL_TRAIL_HOT", 0.25)                            # wide trail en HOT
+        self.TRAIL_COLD = _env_float("SELL_TRAIL_COLD", 0.08)                          # tight trail en COLD
+        self.DUST_VALUE_USD = _env_float("SELL_DUST_VALUE_USD", 0.001)                  # skip sell si < $0.001
+
     def _ui_qty(self, pos) -> float:
         # --- UI_QTY_ONCHAIN_FALLBACK_V1 ---
         # DB qty_token/qty peut être 0 (positions fantômes / DB désync).
@@ -956,6 +973,32 @@ class SellEngine:
                     pass
             return
 
+        # PHASE4_P4.7: Dust value check — skip sell attempts on near-zero positions
+        if self.ADAPTIVE_SELL_ENABLED:
+            try:
+                _pos_value_usd = price * qty_total
+                if 0 < _pos_value_usd < self.DUST_VALUE_USD:
+                    print(
+                        f"🧹 DUST_VALUE mint={mint} value=${_pos_value_usd:.6f}"
+                        f" < ${self.DUST_VALUE_USD} → close",
+                        flush=True,
+                    )
+                    try:
+                        self.db.close_position(mint, close_reason="dust_value", close_price=price)
+                    except Exception:
+                        try:
+                            self.db.close_position(mint, reason="dust_value")
+                        except Exception:
+                            pass
+                    try:
+                        from core.risk_engine import register_trade_result
+                        register_trade_result(pnl_pct=pnl, close_reason="dust_value", mint=mint)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
         if pnl <= self.HARD_SL_PCT:
             print(f"🔴 HARD_SL mint={mint} pnl={pnl:.2%}", flush=True)
             if os.getenv("SELL_DRY_RUN", "0") == "1":
@@ -1058,6 +1101,94 @@ class SellEngine:
             except Exception:
                 pass
             return
+
+        # PHASE4_P4.7: BREAKEVEN PROTECTION
+        # Si la position a atteint +BREAKEVEN_TRIGGER_PCT puis redescend au prix d'entrée
+        # → vendre pour protéger le capital (ne pas transformer un gain en perte)
+        if self.ADAPTIVE_SELL_ENABLED:
+            try:
+                _be_trigger = entry * (1.0 + self.BREAKEVEN_TRIGGER_PCT)
+                _be_floor = entry * (1.0 + self.BREAKEVEN_PROTECT_PCT)
+                if hw >= _be_trigger and price <= _be_floor:
+                    print(
+                        f"🛡️ BREAKEVEN mint={mint} pnl={pnl:.2%} hw={hw:.8f} entry={entry:.8f}",
+                        flush=True,
+                    )
+                    if os.getenv("SELL_DRY_RUN", "0") == "1":
+                        print("🧪 SELL_DRY_RUN=1 -> skip BREAKEVEN sell", flush=True)
+                        return
+                    txsig = self._sell_exec(mint, qty_total, "breakeven")
+                    if txsig == "__DUST__":
+                        try:
+                            self.db.close_position(mint, close_reason="dust_untradeable")
+                        except Exception:
+                            pass
+                        return
+                    if not txsig or txsig in (
+                        "__FAIL__", "__ROUTE_FAIL__", "__JUP_HTTP_429__",
+                        "__INSUFFICIENT__", "__SKIP_QTY0__", "__SKIP_DUST__",
+                    ):
+                        return
+                    print(f"✅ SOLD BREAKEVEN txsig={txsig}", flush=True)
+                    try:
+                        self.db.close_position(mint, close_reason="breakeven", close_price=price)
+                    except Exception:
+                        pass
+                    try:
+                        from core.risk_engine import register_trade_result
+                        register_trade_result(pnl_pct=pnl, close_reason="breakeven", mint=mint)
+                    except Exception:
+                        pass
+                    return
+            except Exception as _e:
+                try:
+                    print(f"⚠️ breakeven check failed (fail-open): {_e}", flush=True)
+                except Exception:
+                    pass
+
+        # PHASE4_P4.7: MOMENTUM EXIT
+        # Si le prix chute de >MOMENTUM_EXIT_PCT depuis le high_water → sortie crash
+        # Protège les gains: entry=1, hw=3, prix actuel=2.2 → drop 27% depuis hw → sell
+        if self.ADAPTIVE_SELL_ENABLED:
+            try:
+                if hw > 0 and hw > entry and price <= hw * (1.0 - self.MOMENTUM_EXIT_PCT):
+                    _drop_pct = (hw - price) / hw
+                    print(
+                        f"📉 MOMENTUM_EXIT mint={mint} drop={_drop_pct:.1%}"
+                        f" price={price:.8f} hw={hw:.8f}",
+                        flush=True,
+                    )
+                    if os.getenv("SELL_DRY_RUN", "0") == "1":
+                        print("🧪 SELL_DRY_RUN=1 -> skip MOMENTUM_EXIT sell", flush=True)
+                        return
+                    txsig = self._sell_exec(mint, qty_total, "momentum_exit")
+                    if txsig == "__DUST__":
+                        try:
+                            self.db.close_position(mint, close_reason="dust_untradeable")
+                        except Exception:
+                            pass
+                        return
+                    if not txsig or txsig in (
+                        "__FAIL__", "__ROUTE_FAIL__", "__JUP_HTTP_429__",
+                        "__INSUFFICIENT__", "__SKIP_QTY0__", "__SKIP_DUST__",
+                    ):
+                        return
+                    print(f"✅ SOLD MOMENTUM_EXIT txsig={txsig}", flush=True)
+                    try:
+                        self.db.close_position(mint, close_reason="momentum_exit", close_price=price)
+                    except Exception:
+                        pass
+                    try:
+                        from core.risk_engine import register_trade_result
+                        register_trade_result(pnl_pct=pnl, close_reason="momentum_exit", mint=mint)
+                    except Exception:
+                        pass
+                    return
+            except Exception as _e:
+                try:
+                    print(f"⚠️ momentum_exit check failed (fail-open): {_e}", flush=True)
+                except Exception:
+                    pass
 
         # TIME STOP (sell ALL)  [TIME_STOP_FIX_V2]
         # Déclenchement: position trop vieille
@@ -1162,10 +1293,28 @@ class SellEngine:
             return
 
         # TRAIL (sell ALL)
-        trail = self.TRAIL_WIDE if tp2 else self.TRAIL_TIGHT
+        # PHASE4_P4.7: Regime-aware trailing
+        if self.ADAPTIVE_SELL_ENABLED:
+            try:
+                _regime_info = _get_regime()
+                _regime_name = str(_regime_info.get("regime", "UNKNOWN")).upper()
+                if _regime_name == "HOT":
+                    trail = self.TRAIL_HOT     # wide en HOT → laisser courir les gagnants
+                elif _regime_name in ("COLD", "DEGRADED_EXEC", "RUG_ENV"):
+                    trail = self.TRAIL_COLD    # tight en conditions adverses
+                else:
+                    trail = self.TRAIL_WIDE if tp2 else self.TRAIL_TIGHT  # default CHOP/UNKNOWN
+                print(
+                    f"🔄 TRAIL_ADAPTIVE regime={_regime_name} trail={trail:.2f} mint={mint}",
+                    flush=True,
+                )
+            except Exception:
+                trail = self.TRAIL_WIDE if tp2 else self.TRAIL_TIGHT
+        else:
+            trail = self.TRAIL_WIDE if tp2 else self.TRAIL_TIGHT
         stop_price = hw * (1 - trail)
         if hw > 0 and price <= stop_price:
-            print(f"🟠 TRAIL_STOP mint={mint} price={price} stop={stop_price} hw={hw}", flush=True)
+            print(f"🟠 TRAIL_STOP mint={mint} price={price} stop={stop_price} hw={hw} trail={trail:.2f}", flush=True)
             if os.getenv("SELL_DRY_RUN", "0") == "1":
                 print("🧪 SELL_DRY_RUN=1 -> skip TRAIL sell", flush=True)
                 return
