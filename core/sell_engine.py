@@ -132,7 +132,7 @@ class SellEngine:
                 pub = str(kp.pubkey())
             except Exception:
                 return 0.0
-        rpc = os.getenv("SOLANA_RPC_URL", os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com"))
+        rpc = os.getenv("RPC_HTTP", os.getenv("SOLANA_RPC_HTTP", os.getenv("SOLANA_RPC_URL", os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com"))))
         payload = {
             "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
             "params":[pub, {"mint": mint}, {"encoding":"jsonParsed"}]
@@ -298,17 +298,7 @@ class SellEngine:
         # --- /SELL_EXEC_GUARD_QTY0_V1 ---
         """Run src/sell_exec_wrap.py and return a marker or txsig."""
 
-        # throttle swaps (best-effort)
-        try:
-            now = time.time()
-            last = float(getattr(self, "_last_swap_ts", 0.0) or 0.0)
-            min_iv = float(getattr(self, "SELL_SWAP_MIN_INTERVAL_SEC", 0) or 0)
-            if min_iv > 0 and now - last < min_iv:
-                time.sleep(max(0.0, min_iv - (now - last)))
-            self._last_swap_ts = time.time()
-        except Exception:
-            pass
-
+        # PHASE2_P2.2: supprimé premier bloc throttle silencieux (doublon du bloc ci-dessous).
         # --- SELL_SWAP_MIN_INTERVAL throttle ---
         try:
             _min_iv = float(getattr(self, "SELL_SWAP_MIN_INTERVAL_SEC", 0.0) or 0.0)
@@ -462,20 +452,13 @@ class SellEngine:
             try:
                 if hasattr(self.db, "get_open_positions"):
                     _positions = self.db.get_open_positions()
-                    # SELL_FILTER_QTY0_SAFE_V4: drop zero-qty positions early (reduces price fetch spam)
+                    # SELL_FILTER_QTY0_SAFE (PHASE2_P2.5: unifié V3+V4, 1 seul passage)
                     def _sf_qty(x, default=0.0):
                         try:
                             return float(x)
                         except Exception:
                             return float(default)
                     _positions = [pp for pp in _positions if (isinstance(pp, dict) and _sf_qty(pp.get('qty', pp.get('qty_token', 0)), 0) > 0)]
-                    # SELL_FILTER_QTY0_SAFE_V3: drop zero-qty positions early (reduces price fetch spam)
-                    def _sf_qty(x, default=0.0):
-                        try:
-                            return float(x)
-                        except Exception:
-                            return float(default)
-                    _positions = [pp for pp in _positions if _sf_qty((pp.get('qty', pp.get('qty_token', 0)) if isinstance(pp, dict) else 0), 0) > 0]
                 elif hasattr(self.db, "open_positions"):
                     _positions = self.db.open_positions()
                 elif hasattr(self.db, "list_open_positions"):
@@ -491,24 +474,20 @@ class SellEngine:
             except Exception:
                 _n = -1
             print(f"[SELL] simulate-bypass: open_positions={_n}", flush=True)
-    
+
+            # PHASE2_P2.1: _cap et _i déplacés AVANT le for (étaient DANS le loop → _i toujours 1)
+            _cap = _env_int('SELL_MAX_POSITIONS_PER_TICK', 8)
+            _i = 0
+
             for _pos in (_positions or []):
-    
+
                 # SELL_CAP_POSITIONS_V1: cap price fetches per tick to reduce 429
-    
-                _cap = _env_int('SELL_MAX_POSITIONS_PER_TICK', 8)
-    
-                _i = 0
-    
-                
-    
-                    
                 _i += 1
-    
+
                 if _i > _cap:
-    
-                    print(f'🧯 SELL_CAP: positions per tick cap={_cap} (stop loop)', flush=True)
-    
+
+                    print(f'🧯 SELL_CAP: positions per tick cap={_cap} reached at i={_i} (stop loop)', flush=True)
+
                     break
                 try:
                     if hasattr(_pos, "get"):
@@ -658,10 +637,7 @@ class SellEngine:
                         if _mint and _ui_db > 0:
                             _sellforce_eligible += 1
                         # --- /SELLFORCE_SCANDBG_V2 (incr) ---
-
-                        _sellforce_scanned += 1
-                        if _mint and _ui_db > 0:
-                            _sellforce_eligible += 1
+                        # PHASE2_P2.3: supprimé doublon _sellforce_scanned/eligible (comptait 2x)
 
                         if _ui_db > 0:
                             _ui = float(self._clamp_sell_ui(_mint, _ui_db) or 0.0)
@@ -1060,13 +1036,7 @@ class SellEngine:
                     except Exception:
                         pass
                 return
-            if txsig == '__DUST__':
-                # mark closed in DB and continue
-                try:
-                    self.db.close_position(mint, now, 'dust_untradeable', 0.0)
-                except Exception as e:
-                    print(f"❌ close dust failed mint={mint} err={e}")
-                return
+            # PHASE2_P2.4: supprimé 2ème check __DUST__ identique (dead code après return ci-dessus)
             if _sell_cooldown_active():
                 try:
                     print("[SELL] cooldown active after sell attempt -> stop run_once", flush=True)

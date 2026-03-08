@@ -182,23 +182,9 @@ def _rl_skip_filter_ready(ready):
         out.append(x)
 
     return out
-def _rl_skip_load():
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        if not fp.exists():
-            return {}
-        d = _json.loads(fp.read_text(encoding='utf-8', errors='ignore') or '{}')
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
 
-def _rl_skip_save(d: dict):
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(_json.dumps(d, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    except Exception as e:
-        print('⚠️ RL_SKIP save failed:', e, flush=True)
+# PHASE2_P2.6: supprimé 1ère _rl_skip_load (L.185, écrasée par L.304)
+# PHASE2_P2.6: supprimé 1ère _rl_skip_save (L.195, écrasée par L.313)
 
 def _rl_skip_add(mint: str, sec: int | None = None, reason: str = ''):
     """Add mint to RL skip map until now+sec.
@@ -247,31 +233,8 @@ def _rl_skip_add(mint: str, sec: int | None = None, reason: str = ''):
     else:
         print(f"🧊 RL_SKIP add mint={mint} sec={sec} until={until}")
 
-def _rl_skip_is(mint: str) -> bool:
-    m = (mint or '').strip()
-    if not m:
-        return False
-    d = _rl_skip_load()
-    now = int(_time.time())
-    until = int(d.get(m, 0) or 0)
-    if until <= now:
-        # lazy cleanup
-        if until != 0 and m in d:
-            try:
-                del d[m]
-                _rl_skip_save(d)
-            except Exception:
-                pass
-        return False
-    # FORCE_PERSIST_RL_SKIP (auto)
-    try:
-        # persist RL_SKIP map so next trader_exec process can repick
-        _path = os.getenv('RL_SKIP_FILE','state/rl_skip_mints.json')
-        Path(_path).write_text(json.dumps(_rl_skip, sort_keys=True))
-    except Exception as _e:
-        print('rl_skip persist failed:', _e, flush=True)
-    return True
-
+# PHASE2_P2.6: supprimé 1ère _rl_skip_is (buggée: utilisait _rl_skip undefined, écrasée par L.282)
+# PHASE2_P2.6: supprimé 2ème _rl_skip_load (écrasée par 3ème à L.290)
 
 # === RL_SKIP_HELPERS ===
 import json as _json
@@ -279,19 +242,7 @@ from pathlib import Path as _Path
 RL_SKIP_FILE = os.getenv('RL_SKIP_FILE', 'state/rl_skip_mints.json')
 RL_SKIP_SEC = int(os.getenv('RL_SKIP_SEC', '180'))
 
-
-
-
 QUOTE_429_SLEEP_S = float(os.getenv('QUOTE_429_SLEEP_S', '1.5'))
-
-def _rl_skip_load():
-    try:
-        fp = _Path(RL_SKIP_FILE)
-        if not fp.exists():
-            return {}
-        return _json.loads(fp.read_text(encoding='utf-8', errors='ignore') or '{}')
-    except Exception:
-        return {}
 
 def _rl_skip_is(mint: str) -> bool:
     m = (mint or '').strip()
@@ -334,30 +285,9 @@ def _rl_skip_has(mint: str) -> bool:
 # --- END RL skip ---
 
 
-def _jup_quote_with_retry(jup, *, input_mint, output_mint, amount_lamports, slippage_bps, max_price_impact_pct, dexes=None, retries=6):
-    import time as _time
-    delay = 0.6
-    last_err = None
-    for i in range(retries):
-        try:
-            return _jup_quote_with_retry(jup, 
-                input_mint=input_mint,
-                output_mint=output_mint,
-                amount_lamports=amount_lamports,
-                slippage_bps=slippage_bps,
-                max_price_impact_pct=max_price_impact_pct,
-                dexes=dexes,
-            )
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            # many codepaths raise Exception("quote failed http= 429 ...")
-            if (" 429" in msg) or ("Rate limit" in msg) or ("http= 429" in msg) or ("Too Many" in msg) or ("503" in msg) or ("504" in msg):
-                _time.sleep(delay)
-                delay = min(8.0, delay * 1.7)
-                continue
-            raise
-    raise last_err
+# PHASE1_P1.2: _jup_quote_with_retry SUPPRIMÉE (code mort + bug récursif infini).
+# Le vrai appel Jupiter quote se fait directement via requests.get() dans main().
+# Un helper retry partagé (buy+sell) sera ajouté en Phase 3 (modularisation).
 
 # skip_mints split (trader vs brain)
 TRADER_SKIP_MINTS_FILE = os.getenv('TRADER_SKIP_MINTS_FILE') or os.getenv('SKIP_MINTS_FILE') or 'state/skip_mints_trader.txt'
@@ -366,277 +296,20 @@ if str(TRADER_AUTOSKIP_FILE).endswith("skip_mints_trader.merged.txt"):
     print("⚠️ AUTOSKIP target merged interdit -> fallback state/skip_mints_trader.txt")
     TRADER_AUTOSKIP_FILE = "state/skip_mints_trader.txt"
 
-# === POSTBUY_RESYNC_DB (autofill trades.qty_token + create/update positions) ===
-def _db_cols(con, table: str):
-    cur = con.cursor()
-    return [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+# === POSTBUY_RESYNC_DB ===
+# PHASE1_P1.3: supprimé _db_cols (doublon, écrasé par la def ligne ~412)
+# PHASE1_P1.3: supprimé _pick_col (code mort, jamais appelée)
 
-def _pick_col(cols, *names):
-    for n in names:
-        if n in cols:
-            return n
-    return None
-
-def _onchain_ui_balance_stable(mint: str, tries: int = 3, sleep_s: float = 0.6, timeout_s: float = 4.0) -> float:
-    import os, time, json
-    import requests
-    from solders.keypair import Keypair
-
-    rpc = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-    keypath = os.getenv("KEYPAIR_PATH", "keypair.json")
-
-    try:
-        secret = json.load(open(keypath, "r", encoding="utf-8"))
-        kp = Keypair.from_bytes(bytes(secret))
-        owner = str(kp.pubkey())
-    except Exception:
-        return 0.0
-
-    payload = {"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-               "params":[owner, {"mint": mint}, {"encoding":"jsonParsed"}]}
-
-    t0 = time.time()
-    prev = None
-    for _ in range(max(1, tries)):
-        if time.time() - t0 > timeout_s:
-            break
-        try:
-            j = requests.post(rpc, json=payload, timeout=25).json()
-        except Exception:
-            j = {}
-        total = 0.0
-        for a in j.get("result",{}).get("value",[]) or []:
-            try:
-                ui = a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0
-                total += float(ui)
-            except Exception:
-                pass
-        v = float(total)
-        if prev is not None and abs(v - prev) <= max(1e-12, abs(prev)*0.005):
-            return v
-        prev = v
-        time.sleep(max(0.0, sleep_s))
-    return float(prev or 0.0)
+# PHASE3_P3.2: _onchain_ui_balance_stable extrait vers core/qty_resync.py
+from core.qty_resync import _onchain_ui_balance_stable, resync_buy_inline
 
 
-def _postbuy_resync_db(mint: str, symbol: str, price_usd: float, route: str, txsig: str, ts: int):
-    """
-    Robust post-buy resync:
-    - read on-chain ui balance (stable sampler w/ timeout)
-    - update trades.qty_token by tx_sig
-    - ensure OPEN position exists and qty_token matches
-    - if on-chain=0 -> tag trade err=sold_out_or_missing_balance
-    Returns qty_token (float) or 0.0
-    """
-    import os, time, json, sqlite3
+# PHASE1_P1.3: supprimé _postbuy_resync_db (fonction vide, jamais appelée).
+# Le resync post-buy est fait par scripts/resync_buy_qty.py (appelé par trader_loop.py).
 
-def _db_cols(cur, table: str):
-    return [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
-
-def _db_insert(cur, table: str, data: dict):
-    cols=_db_cols(cur, table)
-    if not cols:
-        return False
-    use={k:v for k,v in data.items() if k in cols}
-    if not use:
-        return False
-    keys=list(use.keys())
-    q=f"INSERT INTO {table} ({','.join(keys)}) VALUES ({','.join(['?']*len(keys))})"
-    cur.execute(q, [use[k] for k in keys])
-    return True
-
-def _db_record_buy_schema_safe(db_path: str, mint: str, txsig: str, symbol: str="", qty_token: float=0.0, price: float=0.0, qty_sol: float=0.0):
-    """
-    Schema-safe DB write for BUY:
-      - trades(ts, side, mint, symbol, qty_token, price, txsig, qty)
-      - positions(mint, symbol, qty_token, entry_price, entry_ts, max_price, stop_price, status)
-    Avoids pnl_usd mismatch completely.
-    """
-    import sqlite3, time
-    if not db_path:
-        db_path="state/trades.sqlite"
-
-    con=sqlite3.connect(db_path, timeout=30)
-    cur=con.cursor()
-
-    # if already open position for this mint, do not duplicate
-    try:
-        cur.execute("SELECT COUNT(*) FROM positions WHERE mint=? AND (status LIKE 'OPEN%')", (mint,))
-        if cur.fetchone()[0] > 0:
-            # still record trade
-            _db_insert(cur, "trades", {
-                "ts": int(time.time()),
-                "side": "BUY",
-                "mint": mint,
-                "symbol": symbol,
-                "qty_token": float(qty_token or 0.0),
-                "price": float(price or 0.0),
-                "txsig": txsig,
-                "qty": float(qty_sol or 0.0),
-            })
-            con.commit()
-            con.close()
-            return True
-    except Exception:
-        pass
-
-    now=int(time.time())
-
-    _db_insert(cur, "trades", {
-        "ts": now,
-        "side": "BUY",
-        "mint": mint,
-        "symbol": symbol,
-        "qty_token": float(qty_token or 0.0),
-        "price": float(price or 0.0),
-        "txsig": txsig,
-        "qty": float(qty_sol or 0.0),
-    })
-
-    _db_insert(cur, "positions", {
-        "mint": mint,
-        "symbol": symbol,
-        "qty_token": float(qty_token or 0.0),
-        "entry_price": float(price or 0.0),
-        "entry_ts": now,
-        "max_price": float(price or 0.0),
-        "stop_price": 0.0,
-        "status": "OPEN",
-        "tp1_done": 0,
-        "tp2_done": 0,
-    })
-
-    con.commit()
-    con.close()
-    return True
-
-    import requests
-    from solders.keypair import Keypair
-
-    dbp = os.getenv("TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite"))
-    rpc = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-    keypath = os.getenv("KEYPAIR_PATH", "keypair.json")
-
-    # knobs
-    try:
-        tries = int(os.getenv("STABLE_ONCHAIN_UI_TRIES", "6") or 6)
-    except Exception:
-        tries = 6
-    try:
-        sleep_s = float(os.getenv("STABLE_ONCHAIN_UI_SLEEP_S", "0.8") or 0.8)
-    except Exception:
-        sleep_s = 0.8
-    try:
-        tol = float(os.getenv("STABLE_ONCHAIN_UI_TOL", "0.005") or 0.005)
-    except Exception:
-        tol = 0.005
-    try:
-        timeout_s = float(os.getenv("STABLE_ONCHAIN_UI_TIMEOUT_S", "7.0") or 7.0)
-    except Exception:
-        timeout_s = 7.0
-
-    try:
-        secret = json.load(open(keypath, "r", encoding="utf-8"))
-        kp = Keypair.from_bytes(bytes(secret))
-        owner = str(kp.pubkey())
-    except Exception as e:
-        print(f"⚠️ POSTBUY_RESYNC_DB keypair load failed err={e}", flush=True)
-        return 0.0
-
-    def onchain_ui_once() -> float:
-        payload = {"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-                   "params":[owner, {"mint": mint}, {"encoding":"jsonParsed"}]}
-        try:
-            j = requests.post(rpc, json=payload, timeout=25).json()
-        except Exception:
-            return 0.0
-        total = 0.0
-        for a in j.get("result",{}).get("value",[]) or []:
-            try:
-                ui = a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0
-                total += float(ui)
-            except Exception:
-                pass
-        return float(total)
-
-    def stable_onchain_ui() -> float:
-        t0 = time.time()
-        prev = None
-        for _ in range(max(1, tries)):
-            if time.time() - t0 > timeout_s:
-                break
-            v = onchain_ui_once()
-            if prev is not None:
-                if abs(v - prev) <= max(1e-12, abs(prev) * tol):
-                    return float(v)
-            prev = float(v)
-            time.sleep(max(0.0, sleep_s))
-        return float(prev or 0.0)
-
-    q = stable_onchain_ui()
-
-    con = sqlite3.connect(dbp, timeout=30)
-    cur = con.cursor()
-
-    # detect columns
-    tcols = {r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()}
-    pcols = {r[1] for r in cur.execute("PRAGMA table_info(positions)").fetchall()}
-    tx_col = "tx_sig" if "tx_sig" in tcols else ("txsig" if "txsig" in tcols else None)
-    if not tx_col:
-        print("⚠️ POSTBUY_RESYNC_DB: trades missing tx_sig/txsig column", flush=True)
-        con.close()
-        return float(q or 0.0)
-
-    if q <= 0.0:
-        # tag trade as missing balance
-        cur.execute(f"UPDATE trades SET err=COALESCE(NULLIF(err,''), ?) WHERE {tx_col}=?", ("sold_out_or_missing_balance", txsig))
-        con.commit()
-        con.close()
-        return 0.0
-
-    # update trade qty_token if empty
-    if "qty_token" in tcols:
-        cur.execute(f"UPDATE trades SET qty_token=? WHERE {tx_col}=? AND (qty_token IS NULL OR qty_token=0)", (float(q), txsig))
-
-    # ensure OPEN position exists
-    pos = cur.execute("SELECT rowid FROM positions WHERE mint=? ORDER BY rowid DESC LIMIT 1", (mint,)).fetchone()
-    if pos is None:
-        cols = ["mint","symbol","status","qty_token","entry_ts"]
-        vals = [mint, symbol or "", "OPEN", float(q), int(ts or int(time.time()))]
-        if "wallet" in pcols:
-            try:
-                from solders.keypair import Keypair as _KP
-                vals.append("")  # wallet optional
-            except Exception:
-                pass
-        if "entry_price_usd" in pcols:
-            cols.append("entry_price_usd"); vals.append(float(price_usd or 0.0))
-        if "entry_price" in pcols:
-            cols.append("entry_price"); vals.append(float(price_usd or 0.0))
-        if "high_water" in pcols:
-            cols.append("high_water"); vals.append(float(price_usd or 0.0))
-        cur.execute(f"INSERT INTO positions({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals)
-    else:
-        cur.execute("UPDATE positions SET qty_token=?, status='open' WHERE rowid=?", (float(q), pos[0]))
-        # also set entry/high_water if missing and we have a price
-        if float(price_usd or 0.0) > 0.0:
-            sets = []
-            vals = []
-            if "entry_price_usd" in pcols:
-                sets.append("entry_price_usd=COALESCE(NULLIF(entry_price_usd,0), ?)"); vals.append(float(price_usd))
-            if "entry_price" in pcols:
-                sets.append("entry_price=COALESCE(NULLIF(entry_price,0), ?)"); vals.append(float(price_usd))
-            if "high_water" in pcols:
-                sets.append("high_water=CASE WHEN COALESCE(high_water,0)>0 THEN high_water ELSE ? END"); vals.append(float(price_usd))
-            if sets:
-                vals.append(pos[0])
-                cur.execute(f"UPDATE positions SET {', '.join(sets)} WHERE rowid=?", vals)
-
-    con.commit()
-    con.close()
-    return float(q)
-
-# === END POSTBUY_RESYNC_DB ===
+# PHASE3_P3.1: _db_cols, _db_insert, _db_record_buy_schema_safe extraits vers core/db_write.py
+# Import centralisé — comportement 100% identique, zéro changement de logique.
+from core.db_write import _db_record_buy_schema_safe
 
 def _skip_file_path() -> str:
     try:
@@ -1382,127 +1055,9 @@ def main() -> int:
     # --- end READY runtime filter ---
     
     
-    # STABLE_FILTER_READY_V1
-    try:
-        _stable_before = len(ready)
-        _stable_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
-        _stable_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
-        _stable_name_hits = ("STABLE", "USDC", "USDT", "DAI", "USDE", "USD1", "PYUSD", "FDUSD", "USDS", "EURC")
-        _stable_sym_hits  = ("USD", "USDT", "USDC", "DAI", "EURC", "USDE", "PYUSD", "FDUSD", "USDS")
-        _tmp_ready = []
-        for _r in ready:
-            try:
-                _mint = str((_r.get("mint") or _r.get("output_mint") or _r.get("address") or "")).strip()
-                _sym  = str((_r.get("symbol") or _r.get("ticker") or "")).strip().upper()
-                _name = str((_r.get("name") or _r.get("token_name") or "")).strip().upper()
-                _deny = False
-                if _mint and _mint in _stable_mints:
-                    _deny = True
-                if _sym and _sym in _stable_syms:
-                    _deny = True
-                if not _deny and _sym and any(hit in _sym for hit in _stable_sym_hits):
-                    _deny = True
-                if not _deny and _name and any(hit in _name for hit in _stable_name_hits):
-                    _deny = True
-                if _deny:
-                    print(f"🚫 STABLE_FILTER drop mint={_mint or '?'} sym={_sym or '?'} name={_name or '?'}")
-                    continue
-                _tmp_ready.append(_r)
-            except Exception:
-                _tmp_ready.append(_r)
-        ready = _tmp_ready
-        if len(ready) != _stable_before:
-            print(f"🚫 STABLE_FILTER ready: {_stable_before}->{len(ready)}")
-    except Exception as e:
-        print(f"⚠️ STABLE_FILTER error: {e}")
-    
-    # STABLE_FILTER_READY_V2
-    try:
-        _stable_before = len(ready)
-        _stable_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
-        _stable_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
-        _stable_name_hits = ("STABLE", "USDC", "USDT", "DAI", "USDE", "USD1", "PYUSD", "FDUSD", "USDS", "EURC")
-        _filtered = []
-        for _r in ready:
-            try:
-                _mint = str((_r.get("mint") or _r.get("output_mint") or "")).strip()
-                _sym  = str((_r.get("symbol") or "")).upper().strip()
-                _name = str((_r.get("name") or "")).upper().strip()
-                if _mint in _stable_mints:
-                    continue
-                if _sym in _stable_syms:
-                    continue
-                if any(x in _name for x in _stable_name_hits):
-                    continue
-                _filtered.append(_r)
-            except Exception:
-                _filtered.append(_r)
-        if len(_filtered) != _stable_before:
-            print(f"🪙 STABLE_FILTER_READY_V2 filtered: {_stable_before}->{len(_filtered)}")
-        ready = _filtered
-    except Exception as _e:
-        print(f"⚠️ STABLE_FILTER_READY_V2 error: {_e}")
-    
-    # FINAL_TOKEN_ONLY_GUARD_V2
-    try:
-        _before_token_only = len(ready)
-        _deny_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
-        _deny_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
-        _deny_words = ("STABLE","USDC","USDT","DAI","USDE","USD1","PYUSD","FDUSD","USDS","EURC")
-        _tmp = []
-        for _r in ready:
-            _mint = str((_r or {}).get("mint") or (_r or {}).get("output_mint") or "").strip()
-            _sym = str((_r or {}).get("symbol") or "").strip().upper()
-            _name = str((_r or {}).get("name") or "").strip().upper()
-            _txt = f"{_sym} {_name}"
-            if _mint in _deny_mints:
-                continue
-            if _sym in _deny_syms:
-                continue
-            if any(_w in _txt for _w in _deny_words):
-                continue
-            _tmp.append(_r)
-        ready = _tmp
-        if len(ready) != _before_token_only:
-            print(f"🪙 TOKEN_ONLY filtered ready: {_before_token_only}->{len(ready)}")
-    except Exception as e:
-        print(f"⚠️ TOKEN_ONLY filter error: {e}")
-    
-    # NO_ACTIONS_TOKEN_ONLY_FILTER_V3
-    try:
-        _before_asset_filter = len(ready)
-        _deny_syms = {x.strip().upper() for x in os.getenv("STABLE_DENY_SYMBOLS", "USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip()}
-        _deny_mints = {x.strip() for x in os.getenv("STABLE_DENY_MINTS", "").split(",") if x.strip()}
-        _deny_stock_syms = {x.strip().upper() for x in os.getenv("ACTION_DENY_SYMBOLS", "SPYX,AMZNX,TSLAX,NVDAX,AAPLX,METAX,GOOGLX,NFLXX,COINX,MSTRX").split(",") if x.strip()}
-        _deny_words = tuple(x.strip().upper() for x in os.getenv("ACTION_DENY_WORDS", "STOCK,SHARE,EQUITY,ETF,NASDAQ,S&P,SP500,NVIDIA,AMAZON,TESLA,APPLE,MICROSOFT,GOOGLE,META,NETFLIX,COINBASE,MICROSTRATEGY,USDC,USDT,DAI,USDE,USD1,PYUSD,FDUSD,USDS,EURC").split(",") if x.strip())
-        _tmp = []
-        for _r in ready:
-            _mint = str((_r or {}).get("mint") or (_r or {}).get("output_mint") or "").strip()
-            _sym = str((_r or {}).get("symbol") or "").strip().upper()
-            _name = str((_r or {}).get("name") or "").strip().upper()
-            _txt = f"{_sym} {_name}"
-
-            _deny = False
-            if _mint in _deny_mints:
-                _deny = True
-            if _sym in _deny_syms:
-                _deny = True
-            if _sym in _deny_stock_syms:
-                _deny = True
-            if _sym.endswith("X") and len(_sym) >= 4:
-                _deny = True
-            if any(_w in _txt for _w in _deny_words):
-                _deny = True
-
-            if _deny:
-                continue
-            _tmp.append(_r)
-
-        ready = _tmp
-        if len(ready) != _before_asset_filter:
-            print(f"🚫 ASSET_FILTER ready: {_before_asset_filter}->{len(ready)}")
-    except Exception as e:
-        print(f"⚠️ ASSET_FILTER error: {e}")
+    # PHASE3_P3.3: ASSET_FILTER extrait vers core/asset_filter.filter_assets()
+    from core.asset_filter import filter_assets as _filter_assets
+    ready = _filter_assets(ready)
     print("   ready_count=", len(ready))
 
     if not ready:
@@ -1872,6 +1427,22 @@ def main() -> int:
           print(f"🧪 quote_only quote ERR {type(_e).__name__} {str(_e)[:140]}", flush=True)
 
         return 0
+
+    # PHASE3_P3.4: security gate extrait vers core/security_gate.py
+    from core.security_gate import check_max_positions, check_antirug
+    _gate_ok, _gate_msg = check_max_positions()
+    if not _gate_ok:
+        return 0
+    _ar_ok, _ar_msg, _ar_skip = check_antirug(str(output_mint))
+    if not _ar_ok:
+        if _ar_skip:
+            try:
+                _rl_skip_add(str(output_mint), reason=_ar_skip)
+            except Exception:
+                pass
+        return 0
+    # --- /PHASE3_P3.4 ---
+
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
@@ -1910,82 +1481,24 @@ def main() -> int:
                 import time as _time
                 _time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','0.3')))
                 raise SystemExit(42)
-            try:
-                _http = int(http)
-            except Exception:
-                _http = -1
-            if _http == 429:
-                _rl_skip_add(str(output_mint))
-                print(f'⏳ quote 429 -> RL_SKIP {output_mint} for {RL_SKIP_SEC}s (no autoskip)', flush=True)
-                time.sleep(float(os.getenv('QUOTE_429_SLEEP_S','1.5')))
-                return 0
-            # AUTO_SKIP_QUOTE_HTTP_FAIL_V2
+            # PHASE3_P3.5: 3 blocs AUTO_SKIP quasi-identiques fusionnés en 1 seul
+            # (AUTO_SKIP_QUOTE_HTTP_FAIL_V2, AUTO_SKIP_QUOTE_HTTP_400_V1, AUTO_SKIP_NO_ROUTE)
+            # 429 est déjà géré ci-dessus par SystemExit(42) → ici on ne traite que les erreurs non-429
             try:
                 _body = (qr.text or '')
-                _head = _body[:500]
-                # logs utiles
-                print('   quote_body_head=', _head)
-   # 429/rate-limit is not a token issue -> do not autoskip
-                _u = str(output_mint)
-                _b = _body.lower()
-                # TOKEN_NOT_TRADABLE / no route => autoskip
-                if ('token_not_tradable' in _b) or ('not tradable' in _b) or ('could not find any route' in _b) or ('no route' in _b):
-                    try:
-                        _append_skip_mint(_u)
-                        print(f'⛔ AUTO_SKIP_QUOTE_FAIL mint={_u} -> {SKIP_MINTS_FILE}')
-                    except Exception as _e:
-                        print('autoskip quote-fail failed:', _e)
-            except Exception as _e:
-                print('quote-fail inspect error:', _e)
-
-            # AUTO_SKIP_QUOTE_HTTP_400_V1
-            try:
-                _body = (qr.text or '')
-                print('   quote_body_head=', _body[:600])
                 _low = _body.lower()
-                if ('token_not_tradable' in _low) or ('not tradable' in _low):
+                print('   quote_body_head=', _body[:500])
+                # TOKEN_NOT_TRADABLE / no route => autoskip (éviter de boucler sur ce mint)
+                if ('token_not_tradable' in _low) or ('not tradable' in _low) or ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
                     try:
                         _append_skip_mint(str(output_mint))
-                        print(f"⛔ AUTO_SKIP TOKEN_NOT_TRADABLE mint={output_mint} -> {SKIP_MINTS_FILE}")
+                        print(f'⛔ AUTO_SKIP_QUOTE_FAIL mint={output_mint} -> {SKIP_MINTS_FILE}', flush=True)
                     except Exception as _e:
-                        print('autoskip TOKEN_NOT_TRADABLE failed:', _e)
-                if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
-                    try:
-                        _append_skip_mint(str(output_mint))
-                        print(f"⛔ AUTO_SKIP NO_ROUTE mint={output_mint} -> {SKIP_MINTS_FILE}")
-                    except Exception as _e:
-                        print('autoskip NO_ROUTE failed:', _e)
-            except Exception as _e:
-                print('quote error parse failed:', _e)
-
-            # --- AUTO_SKIP_NO_ROUTE: avoid looping on mints with no Jupiter route ---
-            try:
-                try:
-                    _http = int(http)
-                except Exception:
-                    _http = -1
-            
-                # NEVER autoskip on rate limit
-                if _http == 429:
-                    print('⏳ quote 429 rate-limit -> NOT autoskipping mint', flush=True)
+                        print(f'autoskip quote-fail failed: {_e}', flush=True)
                 else:
-                    _body = (qr.text or '')
-                    _low = _body.lower()
-            
-                    # Only autoskip if we are confident it's really no route (not transient)
-                    if ('could not find any route' in _low) or ('no_route' in _low) or ('no route' in _low):
-                        _sk = os.getenv('TRADER_SKIP_MINTS_FILE','state/skip_mints_trader.txt')
-                        Path(_sk).parent.mkdir(parents=True, exist_ok=True)
-                        with open(_sk, 'a', encoding='utf-8') as f:
-                            f.write(str(output_mint).strip() + '\n')
-                        print(f"⛔ AUTO_SKIP_NO_ROUTE added mint={output_mint} to SKIP_MINTS_FILE={_sk}", flush=True)
-                    else:
-                        print('ℹ️ quote failed but not NO_ROUTE -> no autoskip', flush=True)
-                        # --- QUOTE_429_RAISE_V1 ---
-                        raise Exception("quote failed http= 429")
-                        # --- /QUOTE_429_RAISE_V1 ---
+                    print('ℹ️ quote failed but not NO_ROUTE/NOT_TRADABLE -> no autoskip', flush=True)
             except Exception as _e:
-                print(f"⚠️ AUTO_SKIP_NO_ROUTE handler error mint={output_mint} err={repr(_e)}", flush=True)
+                print(f'⚠️ AUTO_SKIP handler error mint={output_mint} err={repr(_e)}', flush=True)
             return 0
         quote = qr.json()
     except Exception as e:
@@ -2145,17 +1658,16 @@ def main() -> int:
                     print(f"✅ DB: recorded BUY mint={output_mint} txsig={txsig[:8]}… db={_dbp}", flush=True)
                 except Exception as _e:
                     print(f"⚠️ DB record BUY failed: {_e}", flush=True)
+
+            # PHASE3_P3.2: resync inline extrait vers core/qty_resync.resync_buy_inline()
+            # Couche 1: resync_buy_inline (ici), Couche 2: scripts/resync_buy_qty.py, Couche 3: sell_engine
+            resync_buy_inline(str(output_mint), txsig)
+
             # ANTI_REBUY_AFTER_SEND_V1
             try:
                 _last_buy_set(output_mint)
             except Exception:
                 pass
-            if 0:
-                pass  # disabled legacy DB hook (schema mismatch)
-                        # --- DB HOOK (legacy) DISABLED: old schema mismatch (wallet/meta_json/price_usd/etc.) ---
-            pass
-            # --- end DB HOOK ---
-
 
             # autoskip: éviter rebuy du même mint après BUY OK
             try:
@@ -2165,14 +1677,7 @@ def main() -> int:
                 print('⚠️ autoskip failed:', e)
             # EXIT2_AFTER_SEND_V1: signal parent loop that a swap was sent
             raise SystemExit(2)
-            # record_last_buy
-            try:
-                import time as _time
-                last=_load_last_buys()
-                last[output_mint]=int(_time.time())
-                _save_last_buys(last)
-            except Exception:
-                pass
+            # PHASE1_P1.3: supprimé code mort après raise SystemExit(2) (record_last_buy inaccessible)
 
 
         except Exception as e:

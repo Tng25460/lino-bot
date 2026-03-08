@@ -86,9 +86,33 @@ async def main():
     # SEPARATE_SELL_LOOP_V1: run sell_engine in its own loop so it keeps selling even when trader_loop is slow
     sell_sleep_s = float(os.getenv("SELL_ONLY_SLEEP_S", os.getenv("SELL_LOOP_SLEEP_S", "2")))
     trader_sleep_s = float(os.getenv("TRADER_LOOP_SLEEP_S", os.getenv("LOOP_SLEEP_S", "10")))
-    
+
+    # PHASE2_P2.8: kill switch — fichier state/KILL_SWITCH → arrêt propre des loops
+    _KILL_SWITCH_FILE = _Path(os.getenv("KILL_SWITCH_FILE", "state/KILL_SWITCH"))
+
+    def _kill_switch_active() -> bool:
+        try:
+            return _KILL_SWITCH_FILE.exists()
+        except Exception:
+            return False
+
+    # PHASE2_P2.9: heartbeat — écrit un timestamp à chaque tick pour monitoring externe
+    _HB_DIR = _Path(os.getenv("HEARTBEAT_DIR", "state"))
+    def _heartbeat(name: str):
+        try:
+            import time as _hbt
+            _HB_DIR.mkdir(parents=True, exist_ok=True)
+            (_HB_DIR / f"heartbeat_{name}.txt").write_text(str(int(_hbt.time())), encoding="utf-8")
+        except Exception:
+            pass
+
     async def _sell_loop():
         while True:
+            # PHASE2_P2.8: kill switch check
+            if _kill_switch_active():
+                print("🛑 KILL_SWITCH detected -> sell_loop stopping gracefully", flush=True)
+                return
+            _heartbeat("sell")  # PHASE2_P2.9
             try:
                 print('💰 SELL_TICK (loop)', flush=True)
                 sell_engine.run_once()
@@ -101,13 +125,21 @@ async def main():
                 print('🧪 ONE_SHOT=1 -> stop after 1 SELL_TICK', flush=True)
                 return
             await asyncio.sleep(sell_sleep_s)
-    
+
     async def _trader_loop_runner():
         if _SELL_ONLY or os.getenv('SELL_ONLY','0') == '1':
             print('🛑 SELL_ONLY -> skip trader_loop', flush=True)
             while True:
+                if _kill_switch_active():
+                    print("🛑 KILL_SWITCH detected -> trader_loop stopping gracefully", flush=True)
+                    return
                 await asyncio.sleep(trader_sleep_s)
         while True:
+            # PHASE2_P2.8: kill switch check
+            if _kill_switch_active():
+                print("🛑 KILL_SWITCH detected -> trader_loop stopping gracefully", flush=True)
+                return
+            _heartbeat("buy")  # PHASE2_P2.9
             print('🧠 trader_loop (universe_builder -> exec -> sign -> send)', flush=True)
             try:
                 rc = await _maybe_await(trader_loop())
