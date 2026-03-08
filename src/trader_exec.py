@@ -8,6 +8,16 @@ try:
 except Exception:
     def _dtrace(*a, **kw): pass  # fallback silencieux si module absent
 
+# PHASE4_P4.2_FIX: garantir le flush des traces avant exit subprocess
+# Sans cela, les daemon threads sont tues et les INSERT jamais commites
+# atexit couvre TOUS les return 0 de main() sans modifier le flux
+try:
+    from core.decision_trace import flush_pending as _flush_traces
+    import atexit as _atexit
+    _atexit.register(_flush_traces, timeout=2.0)
+except Exception:
+    pass
+
 # PHASE4_P4.4: import regime detector (fail-open)
 _current_regime = "UNKNOWN"
 try:

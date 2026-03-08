@@ -15,7 +15,11 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+# PHASE4_P4.2_FIX: tracking des threads pour flush avant exit subprocess
+_pending_threads: List[threading.Thread] = []
+_pending_lock = threading.Lock()
 
 
 def trace(
@@ -62,6 +66,10 @@ def trace(
         }
         t = threading.Thread(target=_insert, args=(payload,), daemon=True)
         t.start()
+        # PHASE4_P4.2_FIX: tracker pour flush_pending()
+        with _pending_lock:
+            _pending_threads[:] = [th for th in _pending_threads if th.is_alive()]
+            _pending_threads.append(t)
     except Exception as e:
         # Fail-open: ne jamais bloquer le pipeline
         try:
@@ -138,3 +146,33 @@ def trace_sync(
             print(f"⚠️ decision_trace.trace_sync failed (non-fatal): {e}", flush=True)
         except Exception:
             pass
+
+
+def flush_pending(timeout: float = 2.0) -> int:
+    """
+    PHASE4_P4.2_FIX: Attend la fin des threads de trace en attente.
+
+    Doit etre appele avant la sortie d'un subprocess (trader_exec.py)
+    pour garantir que toutes les traces sont ecrites dans brain.sqlite.
+
+    Sans cet appel, les daemon threads sont tues a la sortie du process
+    et les INSERT ne sont jamais commites.
+
+    Args:
+        timeout: secondes max d'attente par thread (defaut 2s)
+
+    Returns:
+        nombre de traces effectivement flushees
+    """
+    with _pending_lock:
+        threads = list(_pending_threads)
+        _pending_threads.clear()
+    flushed = 0
+    for th in threads:
+        try:
+            th.join(timeout=timeout)
+            if not th.is_alive():
+                flushed += 1
+        except Exception:
+            pass
+    return flushed
