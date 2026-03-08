@@ -2,6 +2,12 @@ from __future__ import annotations
 import os as _os
 import sqlite3
 
+# PHASE4_P4.2: import trace non-bloquante pour decision_log
+try:
+    from core.decision_trace import trace as _dtrace
+except Exception:
+    def _dtrace(*a, **kw): pass  # fallback silencieux si module absent
+
 # --- TRADER_RLSKIP_FILTER_V4 ---
 # marker: TRADER_RLSKIP_FILTER_V4
 def _rl_skip_is_active(mint: str) -> bool:
@@ -951,6 +957,7 @@ def main() -> int:
         _write_err("no_ready_candidates", {"ready_file": READY_FILE})
 
         print("⚠️ ready_to_trade vide")
+        _dtrace("SKIP", "", reason="no_ready_candidates")
 
         return 0
 
@@ -1017,6 +1024,7 @@ def main() -> int:
         skip = _load_skip_mints()
         if output_mint in skip:
             print(f"⚠️ skip BUY: mint in SKIP_MINTS_FILE mint={output_mint}")
+            _dtrace("SKIP", str(output_mint), reason="skip_mints_file", symbol=str(locals().get('output_symbol', '')))
             try:
                 _sec = int(os.getenv('SKIPFILE_RLSKIP_SEC','600'))
             except Exception:
@@ -1062,6 +1070,7 @@ def main() -> int:
 
         if ui > 0.0:
             print(f"⚠️ skip BUY: already holding mint={output_mint} ui={ui}")
+            _dtrace("SKIP", str(output_mint), reason="already_holding", symbol=str(locals().get('output_symbol', '')), details={"ui_balance": ui})
             _rl_skip_add(output_mint, int(os.getenv('HOLDING_SKIP_SEC','900')), reason='already_holding')
             if ui >= BAG_MIN_UI:
                 print(f"🧷 autoskip already-holding DISABLED: RL_SKIP only mint={output_mint}", flush=True)
@@ -1115,6 +1124,7 @@ def main() -> int:
                 wait = BUY_COOLDOWN_S - age
                 print(f"   [COOLDOWN] selected mint={output_mint}")
                 print(f"⚠️ skip BUY: rebuy cooldown mint={output_mint} age_s={age} wait_s={wait}")
+                _dtrace("SKIP", str(output_mint), reason="rebuy_cooldown", details={"age_s": age, "wait_s": wait})
                 # rebuy_cooldown_rl_skip
                 try:
                     # 'wait' is computed just above: wait = BUY_COOLDOWN_S - age
@@ -1185,6 +1195,7 @@ def main() -> int:
     
     if not amount_lamports or int(amount_lamports) <= 0:
         print(f"⛔ amount_lamports invalid: {amount_lamports} (set BUY_AMOUNT_SOL or BUY_AMOUNT_LAMPORTS)")
+        _dtrace("REJECT", str(output_mint), reason="amount_lamports_invalid")
         return 0
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
@@ -1193,6 +1204,7 @@ def main() -> int:
         _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
         if _hs:
             print(_hmsg, flush=True)
+            _dtrace("SKIP", str(output_mint), reason="hist_bad", details={"n_closed": _hn, "avg_pnl": _havg, "skip_sec": _hsec})
             # Prefer RL_SKIP if available, else fallback to SKIP_MINTS_FILE
             try:
                 _rl_skip_add(output_mint, int(_hsec), reason='hist_bad')
@@ -1261,6 +1273,7 @@ def main() -> int:
 
     if _sol is not None and _sol < _need:
         print(f"LOW_SOL_GUARD SKIP sol={_sol:.6f} need>={_need:.6f}", flush=True)
+        _dtrace("SKIP", str(output_mint), reason="low_sol_guard", details={"sol_balance": _sol, "sol_needed": _need})
         try:
             _rl_skip_add(output_mint, 600, reason="low_sol_guard")
         except Exception:
@@ -1318,9 +1331,11 @@ def main() -> int:
     from core.security_gate import check_max_positions, check_antirug
     _gate_ok, _gate_msg = check_max_positions()
     if not _gate_ok:
+        _dtrace("REJECT", str(output_mint), reason="max_open_positions", symbol=str(locals().get('output_symbol', '')))
         return 0
     _ar_ok, _ar_msg, _ar_skip = check_antirug(str(output_mint))
     if not _ar_ok:
+        _dtrace("REJECT", str(output_mint), reason=f"antirug:{_ar_skip or 'block'}", symbol=str(locals().get('output_symbol', '')))
         if _ar_skip:
             try:
                 _rl_skip_add(str(output_mint), reason=_ar_skip)
@@ -1345,6 +1360,7 @@ def main() -> int:
         if qr.status_code != 200:
             _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
             print("❌ quote failed http=", qr.status_code)
+            _dtrace("REJECT", str(output_mint), reason=f"quote_http_{qr.status_code}", symbol=str(locals().get('output_symbol', '')), details={"http_status": qr.status_code})
             # --- RL_SKIP_ON_429 ---
             try:
                 _h = int(qr.status_code)
@@ -1390,6 +1406,7 @@ def main() -> int:
     except Exception as e:
         _write_err("quote_exc", {"error": str(e)})
         print("❌ quote exception:", e)
+        _dtrace("REJECT", str(output_mint), reason="quote_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
         return 0
 
     # SWAP build
@@ -1403,6 +1420,7 @@ def main() -> int:
         if sr.status_code != 200:
             _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
             print("❌ swap build failed http=", sr.status_code)
+            _dtrace("REJECT", str(output_mint), reason=f"swap_http_{sr.status_code}", symbol=str(locals().get('output_symbol', '')), details={"http_status": sr.status_code})
             try:
                 _raw = sr
                 _code = getattr(_raw, 'status_code', _raw)
@@ -1420,6 +1438,7 @@ def main() -> int:
         if not txb64:
             _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
             print("⚠️ swap response sans swapTransaction")
+            _dtrace("REJECT", str(output_mint), reason="swap_no_tx", symbol=str(locals().get('output_symbol', '')))
             return 0
 
         OUT_TX_B64.write_text(txb64, encoding="utf-8")
@@ -1530,6 +1549,15 @@ def main() -> int:
             txsig = _send_signed_b64(txb64, RPC_HTTP)
             OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
             print("✅ sent txsig=", txsig)
+            # PHASE4_P4.2: trace BUY réussi
+            try:
+                _buy_sym = str(locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or '')
+                _buy_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
+                _buy_score = float(locals().get('_cand_score') or locals().get('cand_score') or 0.0)
+                _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym, score_total=_buy_score, sizing_sol=_buy_sol,
+                        details={"txsig": str(txsig)[:16]})
+            except Exception:
+                pass
             # --- DB record BUY (schema-safe) ---
             # DB_GUARD_DRY_V1: avoid polluting DB in DRY_RUN / STOP_AFTER_BUILD_TX
             if os.getenv('TRADER_DRY_RUN','0').strip().lower() in ('1','true','yes','on') or os.getenv('STOP_AFTER_BUILD_TX','0').strip().lower() in ('1','true','yes','on'):
@@ -1569,12 +1597,14 @@ def main() -> int:
         except Exception as e:
             _write_err("send_exc", {"error": str(e)})
             print("❌ send exception:", e)
+            _dtrace("REJECT", str(output_mint), reason="send_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
 
         return 0
 
     except Exception as e:
         _write_err("swap_exc", {"error": str(e)})
         print("❌ swap exception:", e)
+        _dtrace("REJECT", str(output_mint), reason="swap_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
         return 0
 
 
