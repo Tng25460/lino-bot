@@ -1051,6 +1051,12 @@ class SellEngine:
                 self.db.close_position(mint, close_reason="hard_sl", close_price=price)
             except Exception:
                 pass
+            # PHASE4_P4.3: register trade result in risk engine
+            try:
+                from core.risk_engine import register_trade_result
+                register_trade_result(pnl_pct=pnl, close_reason="hard_sl", mint=mint)
+            except Exception:
+                pass
             return
 
         # TIME STOP (sell ALL)  [TIME_STOP_FIX_V2]
@@ -1083,6 +1089,12 @@ class SellEngine:
             print(f"✅ SOLD TIME_STOP txsig={txsig} [TIME_STOP_ROUTEFIX_V1]", flush=True)
             try:
                 self.db.close_position(mint, close_reason="time_stop", close_price=price)
+            except Exception:
+                pass
+            # PHASE4_P4.3: register trade result in risk engine
+            try:
+                from core.risk_engine import register_trade_result
+                register_trade_result(pnl_pct=pnl, close_reason="time_stop", mint=mint)
             except Exception:
                 pass
             return
@@ -1176,6 +1188,12 @@ class SellEngine:
             # --- /SOLD_TRAIL_LOG_FIX_V1 ---
             try:
                 self.db.close_position(mint, close_reason="trailing_stop", close_price=price)
+            except Exception:
+                pass
+            # PHASE4_P4.3: register trade result in risk engine
+            try:
+                from core.risk_engine import register_trade_result
+                register_trade_result(pnl_pct=pnl, close_reason="trailing_stop", mint=mint)
             except Exception:
                 pass
             return

@@ -1344,6 +1344,22 @@ def main() -> int:
         return 0
     # --- /PHASE3_P3.4 ---
 
+    # PHASE4_P4.3: risk engine circuit breaker (avant QUOTE)
+    try:
+        from core.risk_engine import check_circuit_breaker
+        _cb_ok, _cb_reason = check_circuit_breaker()
+        if not _cb_ok:
+            print(f"🛑 CIRCUIT_BREAKER → BUY bloqué: {_cb_reason}", flush=True)
+            _dtrace("REJECT", str(output_mint), reason=f"circuit_breaker:{_cb_reason[:80]}", symbol=str(locals().get('output_symbol', '')))
+            return 0
+    except Exception as _cb_e:
+        # Fail-open: si risk_engine indisponible, on continue
+        try:
+            print(f"⚠️ risk_engine.check_circuit_breaker import/call failed (fail-open): {_cb_e}", flush=True)
+        except Exception:
+            pass
+    # --- /PHASE4_P4.3 ---
+
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
