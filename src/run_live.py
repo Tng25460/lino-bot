@@ -153,7 +153,24 @@ async def main():
                 return
             await asyncio.sleep(trader_sleep_s)
     
-    # run both loops concurrently
-    await asyncio.gather(_sell_loop(), _trader_loop_runner())
+    # PHASE4_P4.8: health monitor loop (non-bloquant, fail-open)
+    async def _health_loop():
+        _health_interval = float(os.getenv("HEALTH_INTERVAL_SEC", "60"))
+        while True:
+            if _kill_switch_active():
+                return
+            try:
+                from core.health_monitor import collect_health, write_health_json
+                _h = collect_health()
+                write_health_json(_h)
+            except Exception as _he:
+                try:
+                    print(f"⚠️ health_monitor tick error: {_he}", flush=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(_health_interval)
+
+    # run all loops concurrently (sell + buy + health)
+    await asyncio.gather(_sell_loop(), _trader_loop_runner(), _health_loop())
 if __name__ == "__main__":
     asyncio.run(main())
