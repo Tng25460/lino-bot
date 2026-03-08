@@ -1345,6 +1345,32 @@ def main() -> int:
 
         return 0
 
+    # PHASE4_P4.5: scoring elite multi-composantes (0-100, explicable)
+    _elite_score = {}
+    try:
+        from core.scoring_elite import score_candidate_elite
+        _elite_score = score_candidate_elite(cand, str(output_mint), regime=_current_regime)
+        # Gate optionnel (SCORE_MIN_BUY=0 par defaut = desactive)
+        if not _elite_score.get("gate_pass", True):
+            _sc = _elite_score.get("score_total", 0)
+            _dtrace("REJECT", str(output_mint), reason=f"score_too_low:{_sc:.0f}",
+                    symbol=str(locals().get('output_symbol', '')),
+                    score_total=_sc,
+                    score_market=_elite_score.get("components", {}).get("market", 0),
+                    score_flow=_elite_score.get("components", {}).get("flow", 0),
+                    score_history=_elite_score.get("components", {}).get("history", 0),
+                    score_dev=_elite_score.get("components", {}).get("dev", 0),
+                    score_risk=_elite_score.get("components", {}).get("risk", 0),
+                    score_execution=_elite_score.get("components", {}).get("execution", 0),
+                    regime=_current_regime)
+            return 0
+    except Exception as _se:
+        try:
+            print(f"⚠️ scoring_elite failed (fail-open): {_se}", flush=True)
+        except Exception:
+            pass
+    # --- /PHASE4_P4.5 ---
+
     # PHASE3_P3.4: security gate extrait vers core/security_gate.py
     from core.security_gate import check_max_positions, check_antirug
     _gate_ok, _gate_msg = check_max_positions()
@@ -1583,13 +1609,22 @@ def main() -> int:
             txsig = _send_signed_b64(txb64, RPC_HTTP)
             OUT_SENT.write_text(json.dumps({"ts": int(_time.time()), "txsig": txsig}, ensure_ascii=False, indent=2), encoding="utf-8")
             print("✅ sent txsig=", txsig)
-            # PHASE4_P4.2: trace BUY réussi
+            # PHASE4_P4.2+P4.5: trace BUY réussi avec score elite breakdown
             try:
                 _buy_sym = str(locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or '')
                 _buy_sol = float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
-                _buy_score = float(locals().get('_cand_score') or locals().get('cand_score') or 0.0)
-                _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym, score_total=_buy_score, sizing_sol=_buy_sol,
-                        regime=_current_regime, details={"txsig": str(txsig)[:16]})
+                _comp = _elite_score.get("components", {}) if _elite_score else {}
+                _buy_score = float(_elite_score.get("score_total", 0)) if _elite_score else float(locals().get('_cand_score') or 0.0)
+                _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym,
+                        score_total=_buy_score, sizing_sol=_buy_sol,
+                        score_market=float(_comp.get("market", 0)),
+                        score_flow=float(_comp.get("flow", 0)),
+                        score_history=float(_comp.get("history", 0)),
+                        score_dev=float(_comp.get("dev", 0)),
+                        score_risk=float(_comp.get("risk", 0)),
+                        score_execution=float(_comp.get("execution", 0)),
+                        regime=_current_regime,
+                        details={"txsig": str(txsig)[:16], "explain": str(_elite_score.get("explain", ""))[:100]})
             except Exception:
                 pass
             # --- DB record BUY (schema-safe) ---
