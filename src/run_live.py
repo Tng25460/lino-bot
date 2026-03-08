@@ -170,7 +170,23 @@ async def main():
                     pass
             await asyncio.sleep(_health_interval)
 
-    # run all loops concurrently (sell + buy + health)
-    await asyncio.gather(_sell_loop(), _trader_loop_runner(), _health_loop())
+    # PHASE5_P5.0: onchain detector shadow loop (OFF par defaut)
+    async def _onchain_loop():
+        try:
+            from core.onchain_detector import onchain_detector_loop
+            await onchain_detector_loop()
+        except Exception as _oe:
+            try:
+                print(f"⚠️ onchain_detector loop error: {_oe}", flush=True)
+            except Exception:
+                pass
+
+    # run all loops concurrently (sell + buy + health + onchain shadow)
+    await asyncio.gather(
+        _sell_loop(),
+        _trader_loop_runner(),
+        _health_loop(),
+        _onchain_loop(),
+    )
 if __name__ == "__main__":
     asyncio.run(main())
