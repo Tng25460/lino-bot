@@ -144,10 +144,13 @@ def build_candidate(
         "source": str(source),
         "event_type": str(event_type),
         "liq_sol": 0.0,
+        "liquidity_usd": 0.0,        # AXE3: liquidite en USD (DexScreener)
         "market_cap_usd": 0.0,
         "volume_5m_usd": 0.0,
         "holder_count": 0,
         "dev_address": str(dev_address),
+        "pair_created_at": 0,         # AXE3: timestamp creation paire
+        "age_seconds": 0,             # AXE3: age depuis creation
         "fast_score": 0.0,
         "fast_explain": "",
         "in_ready_file": 0,
@@ -186,10 +189,19 @@ def fast_enrich(candidate: Dict[str, Any]) -> Dict[str, Any]:
             if pairs:
                 best = pairs[0]
                 candidate["liq_sol"] = float(best.get("liquidity", {}).get("base", 0) or 0)
+                candidate["liquidity_usd"] = float(best.get("liquidity", {}).get("usd", 0) or 0)  # AXE3
                 candidate["market_cap_usd"] = float(best.get("marketCap", 0) or 0)
                 vol = best.get("volume", {})
                 candidate["volume_5m_usd"] = float(vol.get("m5", 0) or 0)
                 candidate["symbol"] = str(best.get("baseToken", {}).get("symbol", "") or "")
+                # AXE3: age de la paire
+                try:
+                    pca = int(best.get("pairCreatedAt", 0) or 0)
+                    if pca > 0:
+                        candidate["pair_created_at"] = pca // 1000  # ms -> s
+                        candidate["age_seconds"] = max(0, int(time.time()) - candidate["pair_created_at"])
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -343,9 +355,11 @@ def fast_score(candidate: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 6. Timing (fraicheur)
+    # 6. Timing (fraicheur) — AXE3: prefere age_seconds (pair creation) si dispo
     try:
-        age = int(time.time()) - int(candidate.get("block_time", 0) or candidate.get("ts", 0))
+        age = int(candidate.get("age_seconds", 0) or 0)
+        if age <= 0:
+            age = int(time.time()) - int(candidate.get("block_time", 0) or candidate.get("ts", 0))
         if age < 10:
             s = 15.0  # ultra early
         elif age < 30:
@@ -431,6 +445,9 @@ def log_candidate(candidate: Dict[str, Any]) -> None:
 
         # Prepend (plus recent en premier)
         safe_candidate = {k: v for k, v in candidate.items() if k != "details"}
+        # AXE3: inclure les champs enrichis dans le buffer JSON
+        safe_candidate["liquidity_usd"] = candidate.get("liquidity_usd", 0.0)
+        safe_candidate["age_seconds"] = candidate.get("age_seconds", 0)
         safe_candidate["details"] = str(candidate.get("details", {}))[:500]
         existing.insert(0, safe_candidate)
         existing = existing[:MAX_CANDIDATES_BUFFER]
