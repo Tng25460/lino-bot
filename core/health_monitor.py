@@ -366,7 +366,7 @@ def _probe_kill_switch() -> Dict[str, Any]:
 
 def _probe_wallet_balance() -> Dict[str, Any]:
     """AXE2: solde SOL du wallet (via RPC getBalance, timeout 3s)."""
-    result = {"wallet_sol": -1.0}
+    result = {"wallet_sol": -1.0, "wallet_pubkey": ""}
     try:
         import requests
         rpc = os.getenv(
@@ -375,21 +375,45 @@ def _probe_wallet_balance() -> Dict[str, Any]:
             os.getenv("SOLANA_RPC_URL",
             os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")))
         )
-        pubkey = os.getenv("WALLET_PUBKEY", "")
+        # Fallback chain: WALLET_PUBKEY > TRADER_USER_PUBLIC_KEY > extract from keypair
+        pubkey = (
+            os.getenv("WALLET_PUBKEY", "").strip()
+            or os.getenv("TRADER_USER_PUBLIC_KEY", "").strip()
+        )
         if not pubkey:
+            # Dernier recours: extraire du keypair si disponible
+            try:
+                kp_path = os.getenv("SOLANA_KEYPAIR", "") or os.getenv("KEYPAIR_PATH", "")
+                if kp_path:
+                    import json as _j
+                    _arr = _j.loads(Path(kp_path).expanduser().read_text(encoding="utf-8"))
+                    if isinstance(_arr, list) and len(_arr) >= 64:
+                        from solders.keypair import Keypair as _Kp  # type: ignore
+                        _kp = _Kp.from_bytes(bytes(int(x) & 0xFF for x in _arr[:64]))
+                        pubkey = str(_kp.pubkey())
+            except Exception:
+                pass
+        if not pubkey:
+            result["_wallet_error"] = "no WALLET_PUBKEY/TRADER_USER_PUBLIC_KEY/SOLANA_KEYPAIR"
             return result
+        result["wallet_pubkey"] = pubkey[:8] + "…"
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getBalance",
-            "params": [pubkey],
+            "params": [pubkey, {"commitment": "processed"}],
         }
         r = requests.post(rpc, json=payload, timeout=3.0)
         if r.status_code == 200:
             data = r.json()
-            lamports = int(data.get("result", {}).get("value", 0))
-            result["wallet_sol"] = round(lamports / 1_000_000_000, 6)
-    except Exception:
-        pass
+            if "error" in data:
+                result["_wallet_error"] = str(data["error"])[:100]
+            else:
+                lamports = int(data.get("result", {}).get("value", 0))
+                result["wallet_sol"] = round(lamports / 1_000_000_000, 6)
+        else:
+            result["_wallet_error"] = f"http_{r.status_code}"
+    except Exception as e:
+        result["_wallet_error"] = str(e)[:100]
     return result
 
 

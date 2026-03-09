@@ -996,7 +996,34 @@ def main() -> int:
         _write_err("no_ready_candidates", {"ready_file": READY_FILE})
 
         print("⚠️ ready_to_trade vide")
-        _dtrace("SKIP", "", reason="no_ready_candidates")
+        # FIX5: diagnostic détaillé dans decision_log quand ready=0
+        _ready_diag = {
+            "ready_file": str(READY_FILE),
+            "ready_file_exists": READY_FILE.exists() if hasattr(READY_FILE, 'exists') else False,
+        }
+        try:
+            if READY_FILE.exists():
+                _ready_diag["ready_file_size"] = READY_FILE.stat().st_size
+                _ready_diag["ready_file_age_sec"] = int(time.time() - READY_FILE.stat().st_mtime)
+                _ready_diag["ready_file_lines"] = sum(1 for _ in open(str(READY_FILE), "r", encoding="utf-8", errors="ignore"))
+            else:
+                _ready_diag["ready_file_size"] = 0
+                _ready_diag["ready_file_age_sec"] = -1
+                _ready_diag["ready_file_lines"] = 0
+        except Exception as _e:
+            _ready_diag["diag_error"] = str(_e)[:100]
+        try:
+            # Vérifier si d'autres ready files existent
+            from pathlib import Path as _P
+            _state = _P("state")
+            if _state.exists():
+                _candidates = [f.name for f in _state.iterdir()
+                              if f.name.startswith("ready") and f.stat().st_size > 0]
+                _ready_diag["other_ready_files"] = _candidates[:10]
+        except Exception:
+            pass
+        _dtrace("SKIP", "", reason="no_ready_candidates", details=_ready_diag)
+        print(f"   ready_diag={_ready_diag}", flush=True)
 
         return 0
 
