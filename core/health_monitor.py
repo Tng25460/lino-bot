@@ -341,6 +341,58 @@ def _probe_db_integrity() -> Dict[str, Any]:
     return result
 
 
+def _probe_onchain_stats() -> Dict[str, Any]:
+    """AXE2: stats du detecteur onchain (shadow mode)."""
+    try:
+        from core.onchain_detector import get_onchain_stats
+        return get_onchain_stats()
+    except Exception:
+        return {
+            "onchain_candidates_5m": 0,
+            "onchain_avg_score": 0.0,
+            "onchain_max_score": 0.0,
+            "onchain_in_ready": 0,
+        }
+
+
+def _probe_kill_switch() -> Dict[str, Any]:
+    """AXE2: etat du kill switch."""
+    try:
+        ks = Path(os.getenv("KILL_SWITCH_FILE", "state/KILL_SWITCH"))
+        return {"kill_switch_active": ks.exists()}
+    except Exception:
+        return {"kill_switch_active": False}
+
+
+def _probe_wallet_balance() -> Dict[str, Any]:
+    """AXE2: solde SOL du wallet (via RPC getBalance, timeout 3s)."""
+    result = {"wallet_sol": -1.0}
+    try:
+        import requests
+        rpc = os.getenv(
+            "RPC_HTTP",
+            os.getenv("SOLANA_RPC_HTTP",
+            os.getenv("SOLANA_RPC_URL",
+            os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")))
+        )
+        pubkey = os.getenv("WALLET_PUBKEY", "")
+        if not pubkey:
+            return result
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getBalance",
+            "params": [pubkey],
+        }
+        r = requests.post(rpc, json=payload, timeout=3.0)
+        if r.status_code == 200:
+            data = r.json()
+            lamports = int(data.get("result", {}).get("value", 0))
+            result["wallet_sol"] = round(lamports / 1_000_000_000, 6)
+    except Exception:
+        pass
+    return result
+
+
 # ============================================================
 # Collecteur principal
 # ============================================================
@@ -365,6 +417,9 @@ def collect_health() -> Dict[str, Any]:
         _probe_rpc_health,
         _probe_jupiter_health,
         _probe_db_integrity,
+        _probe_onchain_stats,       # AXE2: shadow detector stats
+        _probe_kill_switch,         # AXE2: kill switch state
+        _probe_wallet_balance,      # AXE2: SOL balance
     ]
 
     for probe in probes:
@@ -387,6 +442,7 @@ def collect_health() -> Dict[str, Any]:
             and health.get("buy_loop_alive", False)
             and health.get("sell_loop_alive", False)
             and not health.get("open_positions_warn", False)
+            and not health.get("kill_switch_active", False)
         )
     except Exception:
         health["overall_ok"] = False
