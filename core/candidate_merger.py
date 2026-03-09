@@ -73,17 +73,21 @@ MIN_LIQ_USD = float(os.getenv("MERGER_MIN_LIQ_USD", "2000"))
 MAX_CANDIDATES = int(os.getenv("MERGER_MAX_CANDIDATES", "100"))
 ONCHAIN_WINDOW = int(os.getenv("MERGER_ONCHAIN_WINDOW", "900"))
 
-# Mints systeme a ignorer
+# P8: prix SOL estimé (configurable) pour conversion liq_sol → USD
+ESTIMATED_SOL_USD = float(os.getenv("MERGER_SOL_PRICE_USD", "150.0"))
+
+# Mints systeme a ignorer (stables, LSTs, wrapped assets)
 IGNORE_MINTS: Set[str] = {
     "So11111111111111111111111111111111111111112",      # WSOL
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",    # USDT
+    "EchesyfXePKdLtoiZSL9pMFENMHUBkPucZostcXY69sSL",  # DAI (Wormhole)
     "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
     "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",   # stSOL
     "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",   # bSOL
     "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # JitoSOL
-    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # WETH
-    "2FPyTwcZLUg1MDrwsyoP4D6s1tM6hAkTwdBySLxPMCRo",  # WBTC (placeholder)
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # WETH (Wormhole)
+    "A9mUU4qviSctJVPJdBYWbLfJ32aXvWETBGpPG2sJUAkR",  # USDY
 }
 
 
@@ -248,7 +252,7 @@ def compute_unified_score(cand: Dict[str, Any]) -> Dict[str, Any]:
             # Fallback: essayer liq_sol * prix SOL estimé
             liq_sol = float(cand.get("liq_sol", 0) or 0)
             if liq_sol > 0:
-                liq = liq_sol * 150.0  # estimation ~$150/SOL
+                liq = liq_sol * ESTIMATED_SOL_USD  # estimation ~$150/SOL
 
         if 5_000 <= liq <= 50_000:
             s = 20.0  # sweet spot
@@ -391,6 +395,10 @@ def compute_unified_score(cand: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # P8: garde NaN — si score est NaN (float corruption), forcer 0
+    if math.isnan(score) or math.isinf(score):
+        score = 0.0
+
     # Clamp 0-100
     score = max(0.0, min(100.0, score))
 
@@ -459,25 +467,51 @@ def merge_candidates(
         else:
             by_mint[mint] = scored
 
-    # Filtrage final
+    # P9: Filtrage final avec logs de rejet detailles
     result = []
+    _reject_reasons = {"low_score": 0, "low_liq": 0, "not_tradable": 0,
+                       "blacklisted": 0, "freeze": 0, "accepted": 0}
+
     for mint, cand in by_mint.items():
         score = cand.get("score_total", 0)
         liq = cand.get("_liq_usd", 0)
+        sym = cand.get("symbol", "?")[:10]
+        src = cand.get("_source", "?")
 
-        # Filtres d'exclusion
+        # Filtres d'exclusion avec log de rejet
         if score < MIN_SCORE:
+            _reject_reasons["low_score"] += 1
             continue
         if liq > 0 and liq < MIN_LIQ_USD:
+            _reject_reasons["low_liq"] += 1
             continue
         if "not_tradable" in cand.get("risk_flags", []):
+            _reject_reasons["not_tradable"] += 1
             continue
         if "dev_blacklisted" in cand.get("risk_flags", []):
+            _reject_reasons["blacklisted"] += 1
             continue
         if "freeze_auth" in cand.get("risk_flags", []):
+            _reject_reasons["freeze"] += 1
             continue
 
         result.append(cand)
+        _reject_reasons["accepted"] += 1
+
+    # P9: log diagnostic des rejets
+    _total_before = len(by_mint)
+    try:
+        print(
+            f"  🔀 merger filter: total={_total_before} accepted={_reject_reasons['accepted']}"
+            f" low_score={_reject_reasons['low_score']}"
+            f" low_liq={_reject_reasons['low_liq']}"
+            f" not_tradable={_reject_reasons['not_tradable']}"
+            f" blacklisted={_reject_reasons['blacklisted']}"
+            f" freeze={_reject_reasons['freeze']}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     # Tri par score decroissant
     result.sort(key=lambda x: float(x.get("score_total", 0)), reverse=True)

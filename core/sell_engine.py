@@ -866,23 +866,24 @@ class SellEngine:
 
         price = self._get_price_cached(mint)
 
-        # P4: PRICE SANITY CHECK — detecte les prix aberrants / fantomes
-        # Un prix aberrant peut causer un faux PnL (+10000%) ou un sell premature
+        # P4+P8: PRICE SANITY CHECK — detecte les prix aberrants / fantomes
+        # Seuil 1000x (memecoins peuvent legitement x100-x500, x1000+ est suspect)
         try:
             if price > 0 and entry > 0:
                 _price_ratio = price / entry
-                # P4.1: Prix trop haut vs entry (x100 = +9900%) → probablement un bug de prix
-                _p4_max_ratio = float(os.getenv("P4_SELL_MAX_PRICE_RATIO", "100.0"))
+                # P4.1: Prix trop haut vs entry → log warning (ne bloque PAS le sell)
+                _p4_max_ratio = float(os.getenv("P4_SELL_MAX_PRICE_RATIO", "1000.0"))
                 if _price_ratio > _p4_max_ratio:
-                    print(f"🧯 P4_PRICE_SANITY: prix aberrant ratio={_price_ratio:.1f}x "
-                          f"price={price} entry={entry} mint={mint} → SKIP SELL", flush=True)
-                    return  # ne pas vendre sur prix fantome
-                # P4.2: Prix trop bas (x0.0001 = -99.99%) avec position recente → delay sell
+                    print(f"🧯 P4_PRICE_SANITY: ratio suspect={_price_ratio:.0f}x "
+                          f"price={price} entry={entry} mint={mint} (sell continue)", flush=True)
+                    # P8: ne pas bloquer — le prix peut etre reel sur un moonshot
+                    # On log seulement, le HW_SANITY_RESET gere les cas extremes
+                # P4.2: Prix quasi-zero sur position recente → delay sell
                 _p4_min_ratio = float(os.getenv("P4_SELL_MIN_PRICE_RATIO", "0.0001"))
                 _pos_age = time.time() - float(entry_ts) if entry_ts > 0 else 9999
                 if _price_ratio < _p4_min_ratio and _pos_age < 300:
                     print(f"🧯 P4_PRICE_SANITY: prix quasi-zero ratio={_price_ratio:.6f} "
-                          f"age={_pos_age:.0f}s mint={mint} → SKIP (position trop recente)", flush=True)
+                          f"age={_pos_age:.0f}s mint={mint} → SKIP (prix pas propagé)", flush=True)
                     return  # prix probablement pas encore propagé
         except Exception:
             pass
