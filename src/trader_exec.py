@@ -894,6 +894,15 @@ def main() -> int:
             pass
 
     ready = _load_ready()
+    # P1: pipeline counter — trace chaque étape de filtrage
+    _pipeline_counts = {"loaded": len(ready), "ready_file": str(READY_FILE)}
+    try:
+        if READY_FILE.exists():
+            _pipeline_counts["ready_file_size"] = READY_FILE.stat().st_size
+            _pipeline_counts["ready_file_age_sec"] = int(time.time() - READY_FILE.stat().st_mtime)
+    except Exception:
+        pass
+    print(f"   ready_loaded={len(ready)} file={READY_FILE}", flush=True)
     # HOLDINGS_FILTER_V1: remove held mints from ready early (before pick)
     try:
         holding_mints = set()
@@ -925,6 +934,7 @@ def main() -> int:
             print(f"🧹 HOLDINGS_FILTER: ready {_before}->{_after} (held={len(holding_mints)})", flush=True)
     except Exception as _e:
         print("[WARN] HOLDINGS_FILTER failed:", _e, flush=True)
+    _pipeline_counts["after_holdings"] = len(ready) if isinstance(ready, list) else -1
     # APPLY_RL_SKIP_INLINE (safe)
 
     # --- TRADER_RLSKIP_APPLY_V4 ---
@@ -984,23 +994,26 @@ def main() -> int:
             print("⛔ no candidates after ready filter -> exit rc=0")
             return 0
     # --- end READY runtime filter ---
-    
-    
+    _pipeline_counts["after_rl_skip"] = len(ready) if isinstance(ready, list) else -1
+
     # PHASE3_P3.3: ASSET_FILTER extrait vers core/asset_filter.filter_assets()
     from core.asset_filter import filter_assets as _filter_assets
+    _before_af = len(ready) if isinstance(ready, list) else 0
     ready = _filter_assets(ready)
-    print("   ready_count=", len(ready))
+    _pipeline_counts["after_asset_filter"] = len(ready)
+    if _before_af != len(ready):
+        print(f"   asset_filter: {_before_af}->{len(ready)}", flush=True)
+    print(f"   ready_count={len(ready)} pipeline={_pipeline_counts}", flush=True)
 
     if not ready:
 
         _write_err("no_ready_candidates", {"ready_file": READY_FILE})
 
         print("⚠️ ready_to_trade vide")
-        # FIX5: diagnostic détaillé dans decision_log quand ready=0
-        _ready_diag = {
-            "ready_file": str(READY_FILE),
-            "ready_file_exists": READY_FILE.exists() if hasattr(READY_FILE, 'exists') else False,
-        }
+        # FIX5+P1: diagnostic détaillé dans decision_log quand ready=0
+        _ready_diag = dict(_pipeline_counts)  # inclut loaded, after_holdings, after_rl_skip, after_asset_filter
+        _ready_diag["ready_file"] = str(READY_FILE)
+        _ready_diag["ready_file_exists"] = READY_FILE.exists() if hasattr(READY_FILE, 'exists') else False
         try:
             if READY_FILE.exists():
                 _ready_diag["ready_file_size"] = READY_FILE.stat().st_size

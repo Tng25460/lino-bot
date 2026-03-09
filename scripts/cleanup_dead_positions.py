@@ -42,7 +42,48 @@ import sys
 import time
 
 
+def _load_env_file(path: str = "state/live.env") -> int:
+    """
+    Charge un fichier .env sans dependance externe (pas de python-dotenv).
+    Format supporte: export KEY="value" / KEY=value / KEY='value'
+    Ne surcharge PAS les variables deja definies (os.environ a priorite).
+    Retourne le nombre de variables chargees.
+    """
+    loaded = 0
+    try:
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Supprimer 'export ' prefix
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                # Supprimer quotes
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                # Ne pas surcharger
+                if key and key not in os.environ:
+                    os.environ[key] = val
+                    loaded += 1
+    except Exception:
+        pass
+    return loaded
+
+
 def main():
+    # --- Auto-load state/live.env (sans python-dotenv) ---
+    _n = _load_env_file("state/live.env")
+    if _n > 0:
+        print(f"  📄 Loaded {_n} vars from state/live.env")
+
     # --- Config ---
     DB = os.getenv("TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite"))
     RPC = os.getenv(

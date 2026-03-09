@@ -45,6 +45,36 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _load_env_file(path: str = "state/live.env") -> int:
+    """Charge un fichier .env sans python-dotenv. Ne surcharge pas l'existant."""
+    loaded = 0
+    try:
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = val
+                    loaded += 1
+    except Exception:
+        pass
+    return loaded
+
+
+_load_env_file("state/live.env")
+
 # --- Config ---
 READY_OUT = os.getenv("READY_OUT", "state/ready_scored.jsonl")
 READY_LIMIT = int(os.getenv("READY_LIMIT", "150"))

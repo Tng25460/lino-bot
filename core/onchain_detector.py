@@ -74,6 +74,10 @@ IGNORE_MINTS = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",    # USDT
 }
 
+# P2: Dedup persistant entre cycles (evite re-traitement du meme TX)
+_seen_sigs_global: set = set()
+_SEEN_SIGS_MAX = 5000  # garder les N derniers pour limiter la mémoire
+
 
 # ============================================================
 # Schema SQLite (table onchain_candidates)
@@ -226,7 +230,43 @@ def fast_enrich(candidate: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 3. Dev memory check
+    # 3. Jupiter route check (can this token be swapped?)
+    try:
+        import requests as _req
+        jup_base = os.getenv("JUP_BASE_URL", os.getenv("JUP_BASE", "https://lite-api.jup.ag")).rstrip("/")
+        _jup_url = f"{jup_base}/swap/v1/quote"
+        _jup_params = {
+            "inputMint": "So11111111111111111111111111111111111111112",
+            "outputMint": mint,
+            "amount": "10000000",  # 0.01 SOL
+            "slippageBps": "500",
+        }
+        _jr = _req.get(_jup_url, params=_jup_params, timeout=3.0)
+        if _jr.status_code == 200:
+            _jq = _jr.json()
+            candidate["details"]["jup_routable"] = True
+            candidate["details"]["jup_out_amount"] = str(_jq.get("outAmount", "0"))
+            _rp = _jq.get("routePlan") or []
+            candidate["details"]["jup_routes"] = len(_rp)
+            try:
+                _impact = float(_jq.get("priceImpactPct", 0) or 0)
+                candidate["details"]["jup_price_impact_pct"] = round(_impact, 3)
+            except Exception:
+                pass
+        else:
+            candidate["details"]["jup_routable"] = False
+            _body = (_jr.text or "").lower()[:200]
+            if "not_tradable" in _body or "token_not_tradable" in _body:
+                candidate["details"]["jup_reason"] = "not_tradable"
+            elif "no route" in _body or "no_route" in _body:
+                candidate["details"]["jup_reason"] = "no_route"
+            else:
+                candidate["details"]["jup_reason"] = f"http_{_jr.status_code}"
+    except Exception as _je:
+        candidate["details"]["jup_routable"] = None
+        candidate["details"]["jup_error"] = str(_je)[:80]
+
+    # 4. Dev memory check
     try:
         dev = candidate.get("dev_address", "")
         if dev:
@@ -257,13 +297,14 @@ def fast_score(candidate: Dict[str, Any]) -> Dict[str, Any]:
     Pas aussi precis que scoring_elite, mais utilisable pour trier
     les candidats par potentiel et filtrer le bruit.
 
-    Composantes:
+    Composantes (total max ~115 avant clamp):
       - Liquidite (0-20): sweet spot 5-50 SOL pour early
       - Market cap (0-20): sweet spot 10k-100k pour x100
       - Source (0-15): pumpfun migrate > raydium create > generic
       - Volume (0-15): volume 5min early activity
-      - Dev rep (0-15): dev_memory bonus/malus
+      - Dev rep (-10 to 15): dev_memory bonus/malus
       - Timing (0-15): plus c'est tot, mieux c'est
+      - P2: Jupiter routability (0-10): tradable via Jupiter = bonus
     """
     score = 0.0
     explain_parts = []
@@ -372,6 +413,33 @@ def fast_score(candidate: Dict[str, Any]) -> Dict[str, Any]:
             s = 1.0
         score += s
         explain_parts.append(f"age={s:.0f}")
+    except Exception:
+        pass
+
+    # 7. P2: Jupiter routability — bonus si tradable, malus si not_tradable
+    try:
+        details = candidate.get("details", {}) or {}
+        jup_routable = details.get("jup_routable")
+        if jup_routable is True:
+            s = 10.0  # confirmé tradable via Jupiter
+            # Bonus supplémentaire si faible price impact
+            _impact = float(details.get("jup_price_impact_pct", 999) or 999)
+            if _impact < 1.0:
+                s += 2.0  # excellent impact
+            elif _impact < 5.0:
+                s += 1.0  # impact acceptable
+        elif jup_routable is False:
+            jup_reason = str(details.get("jup_reason", ""))
+            if "not_tradable" in jup_reason:
+                s = -5.0  # malus: token non-tradable
+            elif "no_route" in jup_reason:
+                s = -3.0  # malus: pas de route
+            else:
+                s = -1.0  # malus léger: erreur inconnue
+        else:
+            s = 0.0  # pas de donnée Jupiter
+        score += s
+        explain_parts.append(f"jup={s:.0f}")
     except Exception:
         pass
 
@@ -648,17 +716,25 @@ def run_detection_cycle() -> int:
     """
     Execute un cycle de detection complet:
     1. Poll Pump.fun et Raydium
-    2. Parse les TX pour extraire les mints
-    3. Enrichir + scorer chaque candidat
-    4. Logger dans brain.sqlite
+    2. Dedup global (cross-cycle) pour eviter re-traitement
+    3. Parse les TX pour extraire les mints
+    4. Enrichir + scorer chaque candidat
+    5. Logger dans brain.sqlite + logs de rejet detailles
 
     Retourne le nombre de candidats loggues.
     """
+    global _seen_sigs_global
+
     if not ENABLED:
         return 0
 
-    seen_sigs = set()
     raw_candidates = []
+    # P2: compteurs de rejet pour diagnostic
+    _reject = {
+        "no_sig": 0, "dedup_local": 0, "dedup_global": 0,
+        "parse_fail": 0, "no_mint": 0, "ignore_mint": 0,
+        "enriched": 0, "logged": 0, "errors": 0,
+    }
 
     # Collecter les signatures recentes
     try:
@@ -673,22 +749,46 @@ def run_detection_cycle() -> int:
     except Exception:
         pass
 
+    _reject["raw_total"] = len(raw_candidates)
+
+    # P2: dedup local (intra-cycle) pour eviter les doublons dans le meme batch
+    seen_sigs_local = set()
     logged = 0
 
     for raw in raw_candidates:
         try:
             sig = raw.get("tx_signature", "")
-            if not sig or sig in seen_sigs:
+            if not sig:
+                _reject["no_sig"] += 1
                 continue
-            seen_sigs.add(sig)
+
+            # P2: dedup local (meme cycle)
+            if sig in seen_sigs_local:
+                _reject["dedup_local"] += 1
+                continue
+            seen_sigs_local.add(sig)
+
+            # P2: dedup global (cross-cycle) — evite re-parser le meme TX
+            if sig in _seen_sigs_global:
+                _reject["dedup_global"] += 1
+                continue
+            _seen_sigs_global.add(sig)
+
+            # P2: limiter la taille du set global
+            if len(_seen_sigs_global) > _SEEN_SIGS_MAX:
+                # Garder les plus recents: vider la moitie
+                _half = list(_seen_sigs_global)[:_SEEN_SIGS_MAX // 2]
+                _seen_sigs_global = set(_half)
 
             # Parser la TX pour extraire le mint
             parsed = _parse_tx_for_mints(sig)
             if not parsed or not parsed.get("mint"):
+                _reject["parse_fail" if not parsed else "no_mint"] += 1
                 continue
 
             mint = parsed["mint"]
             if mint in IGNORE_MINTS:
+                _reject["ignore_mint"] += 1
                 continue
 
             # Construire le candidat complet
@@ -704,6 +804,7 @@ def run_detection_cycle() -> int:
 
             # Enrichir
             candidate = fast_enrich(candidate)
+            _reject["enriched"] += 1
 
             # Scorer
             candidate = fast_score(candidate)
@@ -711,13 +812,25 @@ def run_detection_cycle() -> int:
             # Logger
             log_candidate(candidate)
             logged += 1
+            _reject["logged"] += 1
 
+            # P2: log enrichi avec Jupiter routability
             try:
+                _jup_tag = ""
+                _det = candidate.get("details", {}) or {}
+                if _det.get("jup_routable") is True:
+                    _jup_tag = "jup=✓"
+                elif _det.get("jup_routable") is False:
+                    _jup_tag = f"jup=✗({_det.get('jup_reason', '?')})"
+                else:
+                    _jup_tag = "jup=?"
+
                 print(
                     f"🔍 ONCHAIN mint={mint[:8]}… src={candidate['source']}"
                     f" score={candidate['fast_score']:.0f}"
                     f" mc=${candidate['market_cap_usd']:.0f}"
                     f" liq={candidate['liq_sol']:.1f}SOL"
+                    f" {_jup_tag}"
                     f" ready={'✓' if candidate['in_ready_file'] else '✗'}"
                     f" [{candidate['fast_explain']}]",
                     flush=True,
@@ -726,10 +839,28 @@ def run_detection_cycle() -> int:
                 pass
 
         except Exception as e:
+            _reject["errors"] += 1
             try:
                 print(f"⚠️ onchain candidate processing failed: {e}", flush=True)
             except Exception:
                 pass
+
+    # P2: log de diagnostic du cycle (visible dans health_monitor)
+    if raw_candidates:
+        try:
+            print(
+                f"🔍 ONCHAIN cycle: raw={_reject.get('raw_total', 0)}"
+                f" dedup_global={_reject['dedup_global']}"
+                f" dedup_local={_reject['dedup_local']}"
+                f" parse_fail={_reject['parse_fail']}"
+                f" ignore={_reject['ignore_mint']}"
+                f" enriched={_reject['enriched']}"
+                f" logged={logged}"
+                f" seen_global={len(_seen_sigs_global)}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
     return logged
 
