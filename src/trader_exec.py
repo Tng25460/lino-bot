@@ -4,9 +4,20 @@ import sqlite3
 
 # PHASE4_P4.2: import trace non-bloquante pour decision_log
 try:
-    from core.decision_trace import trace as _dtrace
+    from core.decision_trace import trace as _dtrace_raw
 except Exception:
-    def _dtrace(*a, **kw): pass  # fallback silencieux si module absent
+    def _dtrace_raw(*a, **kw): pass  # fallback silencieux si module absent
+
+# AXE1_FIX1: wrapper auto-inject regime=_current_regime si absent
+# Evite d'oublier regime= dans chaque appel (13 sur 18 le manquaient)
+# Note: _current_regime est un global (ligne ~30), accessible depuis ici
+def _dtrace(*args, **kwargs):
+    if 'regime' not in kwargs:
+        try:
+            kwargs['regime'] = _current_regime
+        except Exception:
+            pass
+    return _dtrace_raw(*args, **kwargs)
 
 # PHASE4_P4.2_FIX: garantir le flush des traces avant exit subprocess
 # Sans cela, les daemon threads sont tues et les INSERT jamais commites
@@ -1457,7 +1468,9 @@ def main() -> int:
         if qr.status_code != 200:
             _write_err("quote_http", {"status": qr.status_code, "text": qr.text[:2000], "url": qr.url})
             print("❌ quote failed http=", qr.status_code)
-            _dtrace("REJECT", str(output_mint), reason=f"quote_http_{qr.status_code}", symbol=str(locals().get('output_symbol', '')), details={"http_status": qr.status_code})
+            _dtrace("REJECT", str(output_mint), reason=f"quote_http_{qr.status_code}", symbol=str(locals().get('output_symbol', '')),
+                    score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                    details={"http_status": qr.status_code})
             # --- RL_SKIP_ON_429 ---
             try:
                 _h = int(qr.status_code)
@@ -1503,7 +1516,9 @@ def main() -> int:
     except Exception as e:
         _write_err("quote_exc", {"error": str(e)})
         print("❌ quote exception:", e)
-        _dtrace("REJECT", str(output_mint), reason="quote_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
+        _dtrace("REJECT", str(output_mint), reason="quote_exception", symbol=str(locals().get('output_symbol', '')),
+                score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                details={"error": str(e)[:200]})
         return 0
 
     # SWAP build
@@ -1517,7 +1532,9 @@ def main() -> int:
         if sr.status_code != 200:
             _write_err("swap_http", {"status": sr.status_code, "text": sr.text[:2000]})
             print("❌ swap build failed http=", sr.status_code)
-            _dtrace("REJECT", str(output_mint), reason=f"swap_http_{sr.status_code}", symbol=str(locals().get('output_symbol', '')), details={"http_status": sr.status_code})
+            _dtrace("REJECT", str(output_mint), reason=f"swap_http_{sr.status_code}", symbol=str(locals().get('output_symbol', '')),
+                    score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                    details={"http_status": sr.status_code})
             try:
                 _raw = sr
                 _code = getattr(_raw, 'status_code', _raw)
@@ -1535,7 +1552,8 @@ def main() -> int:
         if not txb64:
             _write_err("swap_no_tx", {"keys": list(swap.keys()), "sample": swap})
             print("⚠️ swap response sans swapTransaction")
-            _dtrace("REJECT", str(output_mint), reason="swap_no_tx", symbol=str(locals().get('output_symbol', '')))
+            _dtrace("REJECT", str(output_mint), reason="swap_no_tx", symbol=str(locals().get('output_symbol', '')),
+                    score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0)
             return 0
 
         OUT_TX_B64.write_text(txb64, encoding="utf-8")
@@ -1649,7 +1667,7 @@ def main() -> int:
             # PHASE4_P4.2+P4.5: trace BUY réussi avec score elite breakdown
             try:
                 _buy_sym = str(locals().get('output_symbol') or locals().get('out_symbol') or locals().get('symbol') or '')
-                _buy_sol = float(_sizing_result.get("recommended_sol", 0)) if _sizing_result else float(locals().get('amount_sol') or locals().get('buy_amount_sol') or 0.0)
+                _buy_sol = float(_sizing_result.get("recommended_sol", 0)) if _sizing_result else float(amount_lamports) / 1_000_000_000
                 _comp = _elite_score.get("components", {}) if _elite_score else {}
                 _buy_score = float(_elite_score.get("score_total", 0)) if _elite_score else float(locals().get('_cand_score') or 0.0)
                 _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym,
@@ -1703,14 +1721,18 @@ def main() -> int:
         except Exception as e:
             _write_err("send_exc", {"error": str(e)})
             print("❌ send exception:", e)
-            _dtrace("REJECT", str(output_mint), reason="send_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
+            _dtrace("REJECT", str(output_mint), reason="send_exception", symbol=str(locals().get('output_symbol', '')),
+                    score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                    details={"error": str(e)[:200]})
 
         return 0
 
     except Exception as e:
         _write_err("swap_exc", {"error": str(e)})
         print("❌ swap exception:", e)
-        _dtrace("REJECT", str(output_mint), reason="swap_exception", symbol=str(locals().get('output_symbol', '')), details={"error": str(e)[:200]})
+        _dtrace("REJECT", str(output_mint), reason="swap_exception", symbol=str(locals().get('output_symbol', '')),
+                score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                details={"error": str(e)[:200]})
         return 0
 
 
