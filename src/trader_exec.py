@@ -601,7 +601,18 @@ def _get_balance_lamports(rpc_http: str, pubkey: str) -> int:
 
 
 READY_FILE = Path(os.getenv("READY_FILE", "ready_to_trade.jsonl"))
-# Prefer brain-scored file if available
+# P3: Prefer READY_CANONICAL (merged onchain+ready) if available
+try:
+    _canonical = Path(os.getenv("READY_CANONICAL_FILE", "state/READY_CANONICAL.jsonl"))
+    if _canonical.exists() and _canonical.stat().st_size > 10:
+        # Only use if fresh (< 5 min old)
+        _canonical_age = int(time.time()) - int(_canonical.stat().st_mtime)
+        if _canonical_age < 300:
+            READY_FILE = _canonical
+            print(f"   ready_file= (from READY_CANONICAL) age={_canonical_age}s", flush=True)
+except Exception:
+    pass
+# Prefer brain-scored file if available (overrides canonical if explicitly set)
 try:
     _rsf = (os.getenv("READY_SCORED_FILE") or "").strip()
     if _rsf:
@@ -1492,6 +1503,103 @@ def main() -> int:
             pass
     # --- /PHASE4_P4.6 ---
 
+    # ============================================================
+    # P4: BUY QUALITY GATES (avant quote) — reject tokens de mauvaise qualité
+    # ============================================================
+    # Configurable via env vars, fail-open (si check echoue, on continue)
+    try:
+        _p4_enabled = os.getenv("P4_BUY_GATES_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        if _p4_enabled:
+            # P4.1: Reject tokens trop vieux (age en secondes depuis le fichier ready)
+            _p4_max_age = int(os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600"))
+            try:
+                _cand_ts = int(cand.get("ts", 0) or 0)
+                if _cand_ts > 0:
+                    _cand_age = int(time.time()) - _cand_ts
+                    if _cand_age > _p4_max_age:
+                        print(f"⚠️ P4_REJECT: token too old age={_cand_age}s max={_p4_max_age}s mint={output_mint}", flush=True)
+                        _dtrace("REJECT", str(output_mint), reason=f"p4_too_old:{_cand_age}s",
+                                symbol=str(locals().get('output_symbol', '')),
+                                score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                                details={"age_sec": _cand_age, "max_age": _p4_max_age, "candidate_source": str(cand.get("source", "ready"))})
+                        _rl_skip_add(str(output_mint), reason="p4_too_old")
+                        return 0
+            except Exception:
+                pass
+
+            # P4.2: Reject tokens sans route Jupiter (pre-check via champ du candidat)
+            _p4_jup_check = os.getenv("P4_REQUIRE_JUPITER_ROUTE", "0").strip().lower() in ("1", "true", "yes")
+            if _p4_jup_check:
+                try:
+                    _jup_route = cand.get("jupiter_route", cand.get("jup_routable"))
+                    if _jup_route is False:
+                        _jup_reason = str(cand.get("jup_reason", cand.get("details", {}).get("jup_reason", "no_route")))
+                        print(f"⚠️ P4_REJECT: no Jupiter route reason={_jup_reason} mint={output_mint}", flush=True)
+                        _dtrace("REJECT", str(output_mint), reason=f"p4_no_jupiter_route:{_jup_reason}",
+                                symbol=str(locals().get('output_symbol', '')),
+                                score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                                details={"jup_reason": _jup_reason, "candidate_source": str(cand.get("source", "ready"))})
+                        _rl_skip_add(str(output_mint), reason="p4_no_route")
+                        return 0
+                except Exception:
+                    pass
+
+            # P4.3: Reject tokens avec price impact trop élevé (champ du candidat)
+            _p4_max_impact = float(os.getenv("P4_MAX_PRICE_IMPACT_PCT", "10.0"))
+            try:
+                _cand_impact = float(cand.get("price_impact_estimate",
+                                cand.get("jup_price_impact_pct",
+                                cand.get("details", {}).get("jup_price_impact_pct", -1))) or -1)
+                if _cand_impact > 0 and _cand_impact > _p4_max_impact:
+                    print(f"⚠️ P4_REJECT: high price impact={_cand_impact:.1f}% max={_p4_max_impact}% mint={output_mint}", flush=True)
+                    _dtrace("REJECT", str(output_mint), reason=f"p4_high_impact:{_cand_impact:.1f}%",
+                            symbol=str(locals().get('output_symbol', '')),
+                            score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                            details={"impact_pct": _cand_impact, "max_impact": _p4_max_impact, "candidate_source": str(cand.get("source", "ready"))})
+                    _rl_skip_add(str(output_mint), reason="p4_high_impact")
+                    return 0
+            except Exception:
+                pass
+
+            # P4.4: Reject tokens avec liquidité trop faible
+            _p4_min_liq = float(os.getenv("P4_MIN_LIQUIDITY_USD", "1000"))
+            try:
+                _cand_liq = float(cand.get("liquidity_usd", cand.get("_liq_usd", 0)) or 0)
+                if _cand_liq > 0 and _cand_liq < _p4_min_liq:
+                    print(f"⚠️ P4_REJECT: low liquidity=${_cand_liq:.0f} min=${_p4_min_liq:.0f} mint={output_mint}", flush=True)
+                    _dtrace("REJECT", str(output_mint), reason=f"p4_low_liq:{_cand_liq:.0f}",
+                            symbol=str(locals().get('output_symbol', '')),
+                            score_total=float(_elite_score.get("score_total", 0)) if _elite_score else 0.0,
+                            details={"liq_usd": _cand_liq, "min_liq": _p4_min_liq, "candidate_source": str(cand.get("source", "ready"))})
+                    _rl_skip_add(str(output_mint), reason="p4_low_liq")
+                    return 0
+            except Exception:
+                pass
+
+            # P4.5: Log des raisons d'achat (reason_buy) — P5 observabilité
+            try:
+                _reason_buy_parts = []
+                _cand_src = str(cand.get("source", cand.get("_source", "ready")))
+                _cand_score = float(cand.get("score_total", cand.get("score", 0)) or 0)
+                _cand_liq_log = float(cand.get("liquidity_usd", cand.get("_liq_usd", 0)) or 0)
+                _cand_vol = float(cand.get("vol_5m", cand.get("volume_5m_usd", 0)) or 0)
+                _reason_buy_parts.append(f"src={_cand_src}")
+                _reason_buy_parts.append(f"score={_cand_score:.0f}")
+                if _cand_liq_log > 0:
+                    _reason_buy_parts.append(f"liq=${_cand_liq_log:.0f}")
+                if _cand_vol > 0:
+                    _reason_buy_parts.append(f"vol5m=${_cand_vol:.0f}")
+                print(f"   P4_BUY_REASON: {' '.join(_reason_buy_parts)} mint={output_mint}", flush=True)
+            except Exception:
+                pass
+
+    except Exception as _p4e:
+        try:
+            print(f"⚠️ P4 buy gates failed (fail-open): {_p4e}", flush=True)
+        except Exception:
+            pass
+    # --- /P4 BUY QUALITY GATES ---
+
     # QUOTE
     qurl = os.getenv("JUP_QUOTE_URL", f"{JUP_BASE}/swap/v1/quote")
     params = {
@@ -1710,6 +1818,21 @@ def main() -> int:
                 _buy_sol = float(_sizing_result.get("recommended_sol", 0)) if _sizing_result else float(amount_lamports) / 1_000_000_000
                 _comp = _elite_score.get("components", {}) if _elite_score else {}
                 _buy_score = float(_elite_score.get("score_total", 0)) if _elite_score else float(locals().get('_cand_score') or 0.0)
+                # P5: enrichissement details avec source, pipeline_counts, reason_buy
+                _p5_details = {
+                    "txsig": str(txsig)[:16],
+                    "explain": str(_elite_score.get("explain", ""))[:100],
+                }
+                try:
+                    _p5_details["candidate_source"] = str(cand.get("source", cand.get("_source", "ready")))
+                    _p5_details["pipeline_counts"] = dict(_pipeline_counts) if '_pipeline_counts' in dir() else {}
+                    _p5_details["score_components"] = dict(cand.get("score_components", {}))
+                    _p5_details["reason_buy"] = f"src={_p5_details['candidate_source']} score={_buy_score:.0f} sol={_buy_sol:.4f}"
+                    _p5_details["liquidity_usd"] = float(cand.get("liquidity_usd", cand.get("_liq_usd", 0)) or 0)
+                    _p5_details["risk_flags"] = cand.get("risk_flags", [])
+                    _p5_details["jupiter_route"] = cand.get("jupiter_route", cand.get("jup_routable"))
+                except Exception:
+                    pass
                 _dtrace("BUY", str(output_mint), reason="tx_sent", symbol=_buy_sym,
                         score_total=_buy_score, sizing_sol=_buy_sol,
                         score_market=float(_comp.get("market", 0)),
@@ -1719,7 +1842,7 @@ def main() -> int:
                         score_risk=float(_comp.get("risk", 0)),
                         score_execution=float(_comp.get("execution", 0)),
                         regime=_current_regime,
-                        details={"txsig": str(txsig)[:16], "explain": str(_elite_score.get("explain", ""))[:100]})
+                        details=_p5_details)
             except Exception:
                 pass
             # --- DB record BUY (schema-safe) ---

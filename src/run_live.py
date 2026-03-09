@@ -181,12 +181,34 @@ async def main():
             except Exception:
                 pass
 
-    # run all loops concurrently (sell + buy + health + onchain shadow)
+    # P3: candidate merger loop (fusionne READY + onchain → READY_CANONICAL)
+    async def _merger_loop():
+        _merger_interval = float(os.getenv("MERGER_INTERVAL_SEC", "30"))
+        _merger_enabled = os.getenv("MERGER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+        if not _merger_enabled:
+            print("🔇 candidate_merger: DISABLED (set MERGER_ENABLED=1)", flush=True)
+            return
+        print(f"🔀 candidate_merger: started (interval={_merger_interval}s)", flush=True)
+        while True:
+            try:
+                from core.candidate_merger import run_merge
+                _n = run_merge()
+                if _n > 0:
+                    print(f"🔀 merger: {_n} candidates → READY_CANONICAL", flush=True)
+            except Exception as _me:
+                try:
+                    print(f"⚠️ candidate_merger error: {_me}", flush=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(_merger_interval)
+
+    # run all loops concurrently (sell + buy + health + onchain shadow + merger)
     await asyncio.gather(
         _sell_loop(),
         _trader_loop_runner(),
         _health_loop(),
         _onchain_loop(),
+        _merger_loop(),
     )
 if __name__ == "__main__":
     asyncio.run(main())

@@ -865,6 +865,28 @@ class SellEngine:
         entry_ts = float(pos.get("entry_ts") or pos.get("opened_ts") or 0.0)
 
         price = self._get_price_cached(mint)
+
+        # P4: PRICE SANITY CHECK — detecte les prix aberrants / fantomes
+        # Un prix aberrant peut causer un faux PnL (+10000%) ou un sell premature
+        try:
+            if price > 0 and entry > 0:
+                _price_ratio = price / entry
+                # P4.1: Prix trop haut vs entry (x100 = +9900%) → probablement un bug de prix
+                _p4_max_ratio = float(os.getenv("P4_SELL_MAX_PRICE_RATIO", "100.0"))
+                if _price_ratio > _p4_max_ratio:
+                    print(f"🧯 P4_PRICE_SANITY: prix aberrant ratio={_price_ratio:.1f}x "
+                          f"price={price} entry={entry} mint={mint} → SKIP SELL", flush=True)
+                    return  # ne pas vendre sur prix fantome
+                # P4.2: Prix trop bas (x0.0001 = -99.99%) avec position recente → delay sell
+                _p4_min_ratio = float(os.getenv("P4_SELL_MIN_PRICE_RATIO", "0.0001"))
+                _pos_age = time.time() - float(entry_ts) if entry_ts > 0 else 9999
+                if _price_ratio < _p4_min_ratio and _pos_age < 300:
+                    print(f"🧯 P4_PRICE_SANITY: prix quasi-zero ratio={_price_ratio:.6f} "
+                          f"age={_pos_age:.0f}s mint={mint} → SKIP (position trop recente)", flush=True)
+                    return  # prix probablement pas encore propagé
+        except Exception:
+            pass
+
         # sanity: if high-water is wildly off (e.g. after pricing fix), reset it
         try:
             _hw = float(pos.get("high_water") or pos.get("max_price") or 0.0)
