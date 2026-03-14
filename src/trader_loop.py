@@ -175,7 +175,18 @@ async def trader_loop():
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH","")
 
-    while True:        # --- SELL_ONLY_GUARD_V2 ---
+    # Heartbeat : écrire à chaque tick pour que health_monitor détecte le loop vivant
+    _hb_dir = Path(os.getenv("HEARTBEAT_DIR", "state"))
+    def _heartbeat_buy():
+        try:
+            _hb_dir.mkdir(parents=True, exist_ok=True)
+            (_hb_dir / "heartbeat_buy.txt").write_text(str(int(time.time())), encoding="utf-8")
+        except Exception:
+            pass
+
+    while True:
+        _heartbeat_buy()  # MAJ heartbeat à CHAQUE tick (pas seulement dans run_live)
+        # --- SELL_ONLY_GUARD_V2 ---
         _mth = int(os.getenv('TRADER_MAX_TRADES_PER_HOUR', os.getenv('MAX_TRADES_PER_HOUR', os.getenv('LOOP_MAX_TRADES_PER_HOUR','6'))))
         if _mth <= 0:
             import time as _t

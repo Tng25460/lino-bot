@@ -494,6 +494,9 @@ def log_candidate(candidate: Dict[str, Any]) -> None:
     # 1. SQLite
     try:
         ensure_onchain_schema()
+        # Persister liquidity_usd dans details_json pour le round-trip
+        _details_save = dict(candidate.get("details", {}) or {})
+        _details_save["liquidity_usd"] = float(candidate.get("liquidity_usd", 0) or 0)
         con = sqlite3.connect(BRAIN_DB_PATH, timeout=3.0)
         con.execute("PRAGMA journal_mode=WAL")
         con.execute(
@@ -519,7 +522,7 @@ def log_candidate(candidate: Dict[str, Any]) -> None:
                 int(candidate.get("ready_delay_sec", 0)),
                 str(candidate.get("tx_signature", "")),
                 int(candidate.get("block_time", 0)),
-                json.dumps(candidate.get("details", {}), ensure_ascii=False),
+                json.dumps(_details_save, ensure_ascii=False),
             )
         )
         con.commit()
@@ -756,7 +759,7 @@ def run_detection_cycle() -> int:
     """
     global _seen_sigs_global, _seen_mints_global
 
-    if not ENABLED:
+    if not _is_onchain_enabled():
         return 0
 
     raw_candidates = []
@@ -915,21 +918,28 @@ def run_detection_cycle() -> int:
 # Loop async (pour integration dans run_live.py)
 # ============================================================
 
+def _is_onchain_enabled() -> bool:
+    """Lecture dynamique de ONCHAIN_DETECTOR_ENABLED (pas figé au import)."""
+    return os.getenv("ONCHAIN_DETECTOR_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+
+
 async def onchain_detector_loop():
     """
     Loop async pour detection continue.
     A integrer dans run_live.py avec asyncio.gather.
     S'arrete proprement si ONCHAIN_DETECTOR_ENABLED passe a 0.
     """
-    if not ENABLED:
-        print("🔇 onchain_detector: DISABLED (ONCHAIN_DETECTOR_ENABLED=0)", flush=True)
-        return
-
-    print(
-        f"🔍 onchain_detector: SHADOW MODE started"
-        f" (poll={POLL_INTERVAL_SEC}s window={RECENT_WINDOW_SEC}s)",
-        flush=True,
-    )
+    # NE PAS utiliser ENABLED (constante figée au import)
+    # Lire dynamiquement l'env var à chaque check
+    if not _is_onchain_enabled():
+        print("🔇 onchain_detector: DISABLED au démarrage, boucle en attente...", flush=True)
+        # NE PAS return ! Rester en boucle pour hot-reload
+    else:
+        print(
+            f"🔍 onchain_detector: SHADOW MODE started"
+            f" (poll={POLL_INTERVAL_SEC}s window={RECENT_WINDOW_SEC}s)",
+            flush=True,
+        )
 
     # Init schema
     try:
@@ -938,15 +948,21 @@ async def onchain_detector_loop():
         pass
 
     cycle = 0
+    _was_enabled = _is_onchain_enabled()
     while True:
         cycle += 1
         try:
-            # Re-check enabled (hot reload)
-            if os.getenv("ONCHAIN_DETECTOR_ENABLED", "0").strip() not in ("1", "true", "yes"):
+            # Re-check enabled (hot reload dynamique)
+            _now_enabled = _is_onchain_enabled()
+            if not _now_enabled:
                 if cycle % 60 == 0:  # log toutes les ~3min
                     print("🔇 onchain_detector: paused (ONCHAIN_DETECTOR_ENABLED=0)", flush=True)
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
+
+            if not _was_enabled and _now_enabled:
+                print(f"🔍 onchain_detector: HOT ENABLED — démarrage détection", flush=True)
+                _was_enabled = True
 
             n = run_detection_cycle()
             if n > 0 and cycle % 10 == 0:

@@ -169,6 +169,11 @@ def load_onchain_candidates() -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
+            # Préférer liquidity_usd depuis details_json (valeur DexScreener réelle)
+            # Fallback: liq_sol n'est PAS fiable (c'est liquidity.base, pas des SOL)
+            _liq_usd_from_details = float(details.get("liquidity_usd", 0) or 0)
+            _liq_usd = _liq_usd_from_details if _liq_usd_from_details > 0 else 0.0
+
             candidates.append({
                 "_source": "onchain",
                 "_mint": mint,
@@ -176,7 +181,7 @@ def load_onchain_candidates() -> List[Dict[str, Any]]:
                 "symbol": str(row["symbol"] or ""),
                 "source": str(row["source"] or ""),
                 "event_type": str(row["event_type"] or ""),
-                "liquidity_usd": float(row["liq_sol"] or 0) * ESTIMATED_SOL_USD,  # SOL→USD via config
+                "liquidity_usd": _liq_usd,
                 "market_cap_usd": float(row["market_cap_usd"] or 0),
                 "vol_5m": float(row["volume_5m_usd"] or 0),
                 "fast_score": float(row["fast_score"] or 0),
