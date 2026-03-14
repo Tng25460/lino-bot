@@ -1,6 +1,46 @@
-# === CLI SAFETY PATCH (prepend) ===
+# === ENV LOADING (doit être PREMIER, avant tout os.getenv) ===
 import os
 import sys
+
+def _load_env_file(path: str = "state/live.env") -> int:
+    """Charge state/live.env sans python-dotenv. Ne surcharge PAS les vars déjà définies."""
+    loaded = 0
+    try:
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = val
+                    loaded += 1
+    except Exception:
+        pass
+    return loaded
+
+_n_env = _load_env_file("state/live.env")
+if _n_env > 0:
+    print(f"📄 run_live: loaded {_n_env} vars from state/live.env", flush=True)
+# Log les vars critiques pour confirmer le chargement
+for _k in ("SHADOW_MODE", "ONCHAIN_DETECTOR_ENABLED", "MERGER_ENABLED",
+           "TRADER_DRY_RUN", "DRY_RUN"):
+    _v = os.environ.get(_k)
+    if _v is not None:
+        print(f"   {_k}={_v}", flush=True)
+# === END ENV LOADING ===
+
+# === CLI SAFETY PATCH (prepend) ===
 
 def _cli_safety_precheck():
     # Hard-stop help so run_live never starts anything on --help
