@@ -207,7 +207,47 @@ async def trader_loop():
     def _rate_limit_record():
         """Enregistre un trade réussi dans la fenêtre."""
         _trade_timestamps.append(time.time())
-    # --- /RATE_LIMITER_V1 ---
+
+    # --- EXPOSURE_TRACKER_V1: persistance fichier pour security_gate ---
+    _EXPOSURE_FILE = os.path.join(os.getenv("HEARTBEAT_DIR", "state"), "buy_exposure.json")
+
+    def _exposure_record():
+        """Persiste le timestamp d'un trade envoyé dans buy_exposure.json pour security_gate."""
+        try:
+            import json as _ej
+            import tempfile as _etf
+            # Charger les timestamps existants
+            _entries = []
+            try:
+                with open(_EXPOSURE_FILE, "r", encoding="utf-8") as _ef:
+                    _data = _ej.load(_ef)
+                    if isinstance(_data, list):
+                        _entries = _data
+            except (FileNotFoundError, ValueError):
+                pass
+            # Ajouter le nouveau trade
+            _entries.append(time.time())
+            # Purger les entrées > 48h (nettoyage)
+            _now = time.time()
+            _entries = [t for t in _entries if (_now - t) < 48 * 3600]
+            # Écriture atomique
+            _d = os.path.dirname(_EXPOSURE_FILE) or "."
+            os.makedirs(_d, exist_ok=True)
+            _fd, _tmp = _etf.mkstemp(prefix=".exposure_", suffix=".json", dir=_d)
+            try:
+                with os.fdopen(_fd, "w", encoding="utf-8") as _wf:
+                    _ej.dump(_entries, _wf)
+                os.replace(_tmp, _EXPOSURE_FILE)
+            finally:
+                try:
+                    if os.path.exists(_tmp):
+                        os.unlink(_tmp)
+                except Exception:
+                    pass
+            print(f"📊 EXPOSURE: recorded buy (total={len(_entries)} in file)", flush=True)
+        except Exception as _exp_e:
+            print(f"⚠️ EXPOSURE: write failed (non-fatal): {_exp_e}", flush=True)
+    # --- /EXPOSURE_TRACKER_V1 ---
 
     while True:
         _heartbeat_buy()  # MAJ heartbeat à CHAQUE tick (pas seulement dans run_live)
@@ -235,6 +275,7 @@ async def trader_loop():
             # RATE_LIMITER_V1: enregistrer le trade si tx envoyée (rc=2) ou succès (rc=0)
             if rc in (0, 2):
                 _rate_limit_record()
+                _exposure_record()
                 print(f"📊 RATE_LIMIT: recorded trade (total={len(_trade_timestamps)} in window)", flush=True)
             # normalize_rc2_v1
             if rc == 2:

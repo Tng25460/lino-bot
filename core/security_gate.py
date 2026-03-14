@@ -13,23 +13,53 @@ import os
 from typing import Optional, Tuple
 
 
+def _read_exposure_file() -> int:
+    """
+    Lit state/buy_exposure.json (écrit par trader_loop) et retourne
+    le nombre de trades NON FERMÉS dans la fenêtre MAX_OPEN_MAX_AGE_H.
+
+    Ce fichier contient une liste de timestamps Unix des BUY envoyés.
+    Source de vérité indépendante de la DB (pas de dépendance à qty_token).
+    Fail-safe: retourne -1 si lecture impossible.
+    """
+    import time as _t
+    _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "48"))
+    _exposure_path = os.path.join(
+        os.getenv("HEARTBEAT_DIR", "state"), "buy_exposure.json"
+    )
+    try:
+        import json as _ej
+        with open(_exposure_path, "r", encoding="utf-8") as _f:
+            _data = _ej.load(_f)
+        if not isinstance(_data, list):
+            return -1
+        _now = _t.time()
+        _cutoff = _now - (_max_age_h * 3600)
+        _count = sum(1 for ts in _data if isinstance(ts, (int, float)) and ts >= _cutoff)
+        return _count
+    except FileNotFoundError:
+        return -1
+    except Exception:
+        return -1
+
+
 def check_max_positions() -> Tuple[bool, str]:
     """
-    Verifie le nombre de positions ouvertes RECENTES.
-    Ignore les positions historiques plus vieilles que MAX_OPEN_MAX_AGE_H.
-    Retourne (True, msg) si OK, (False, msg) si trop de positions.
-    Fail-open: si erreur, retourne (True, ...).
+    Vérifie le plafond d'exposition via 2 sources (la plus haute gagne):
 
-    Schema-safe: utilise uniquement status + entry_ts + qty_token (schéma réel).
+    1. PRIMAIRE: buy_exposure.json — trades récents écrits par trader_loop
+       Fiable immédiatement après un BUY (pas de dépendance à qty_token).
 
-    Filtres combinés (AND):
-      1. status LIKE 'OPEN%'
-      2. entry_ts récent (< MAX_OPEN_MAX_AGE_H heures)
-      3. qty_token > 0 (exclut ghost positions avec qty=0)
+    2. SECONDAIRE: DB positions — OPEN + qty_token > 0 + entry_ts récent
+       Rattrape les positions hydratées qui n'auraient pas de fichier.
+
+    Le compteur final = max(fichier, DB) pour ne jamais sous-estimer l'exposition.
+
+    Fail-open: si les deux sources échouent, retourne (True, ...).
 
     Env vars:
       MAX_OPEN_POSITIONS   : limite (default 0 = disabled)
-      MAX_OPEN_MAX_AGE_H   : positions plus vieilles sont ignorées (default 48h)
+      MAX_OPEN_MAX_AGE_H   : fenêtre en heures (default 48h)
     """
     _max_open = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
     if _max_open <= 0:
@@ -37,6 +67,13 @@ def check_max_positions() -> Tuple[bool, str]:
 
     _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "48"))
 
+    # --- Source 1: fichier buy_exposure.json ---
+    _file_count = _read_exposure_file()
+
+    # --- Source 2: DB (secondaire) ---
+    _db_count = 0
+    _db_total = 0
+    _db_ok = False
     try:
         import sqlite3
         import time as _mop_time
@@ -45,64 +82,52 @@ def check_max_positions() -> Tuple[bool, str]:
         )
         _mop_con = sqlite3.connect(_mop_db, timeout=5)
 
-        # Détection dynamique des colonnes disponibles
         _cols_info = _mop_con.execute("PRAGMA table_info(positions)").fetchall()
         _col_names = {row[1] for row in _cols_info}
 
-        # Total OPEN (toutes époques)
-        _mop_total = _mop_con.execute(
+        _db_total = _mop_con.execute(
             "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
         ).fetchone()[0]
 
-        # Comptage actif: positions récentes (< max_age_h) ET qty_token > 0
-        _has_entry_ts = "entry_ts" in _col_names
-        _has_qty = "qty_token" in _col_names
-
+        # DB: OPEN + qty_token > 0 + récent
         _where = "status LIKE 'OPEN%'"
         _params: list = []
-
-        if _has_qty:
+        if "qty_token" in _col_names:
             _where += " AND COALESCE(qty_token, 0) > 0"
-
-        if _has_entry_ts and _max_age_h > 0:
+        if "entry_ts" in _col_names and _max_age_h > 0:
             _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
             _where += " AND COALESCE(entry_ts, 0) >= ?"
             _params.append(_cutoff_ts)
-
-        _mop_count = _mop_con.execute(
+        _db_count = _mop_con.execute(
             f"SELECT COUNT(*) FROM positions WHERE {_where}", _params
         ).fetchone()[0]
-
-        # Compteur ghost (récentes mais qty=0) pour le log
-        _ghost_count = 0
-        if _has_qty and _has_entry_ts and _max_age_h > 0:
-            _ghost_count = _mop_con.execute(
-                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%' AND COALESCE(entry_ts, 0) >= ? AND COALESCE(qty_token, 0) <= 0",
-                (_cutoff_ts,)
-            ).fetchone()[0]
-
         _mop_con.close()
+        _db_ok = True
+    except Exception as _db_e:
+        print(f"⚠️ MAX_OPEN DB read failed (non-fatal): {_db_e}", flush=True)
 
-        _old_count = _mop_total - _mop_count - _ghost_count
-        _parts = []
-        if _old_count > 0:
-            _parts.append(f"{_old_count} old>{_max_age_h:.0f}h")
-        if _ghost_count > 0:
-            _parts.append(f"{_ghost_count} ghost(qty=0)")
-        _age_info = f" (ignored {' + '.join(_parts)})" if _parts else ""
+    # --- Compteur final: max(fichier, DB) ---
+    if _file_count >= 0:
+        _active = max(_file_count, _db_count)
+        _source = f"file={_file_count},db={_db_count}"
+    elif _db_ok:
+        _active = _db_count
+        _source = f"db={_db_count}(file unavailable)"
+    else:
+        # Aucune source fiable → fail-open
+        print("⚠️ MAX_OPEN_POSITIONS: no reliable source (fail-open)", flush=True)
+        return True, ""
 
-        if _mop_count >= _max_open:
-            msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_age_info} → skip BUY"
-            print(msg, flush=True)
-            return False, msg
-        else:
-            print(
-                f"📊 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_age_info} (OK)", flush=True
-            )
-            return True, ""
-    except Exception as _mop_e:
+    _ignored = _db_total - _active if _db_total > _active else 0
+    _detail = f" [{_source}, total_open={_db_total}]"
+
+    if _active >= _max_open:
+        msg = f"🛑 MAX_OPEN_POSITIONS: {_active}/{_max_open} active{_detail} → skip BUY"
+        print(msg, flush=True)
+        return False, msg
+    else:
         print(
-            f"⚠️ MAX_OPEN_POSITIONS check failed (fail-open): {_mop_e}", flush=True
+            f"📊 MAX_OPEN_POSITIONS: {_active}/{_max_open} active{_detail} (OK)", flush=True
         )
         return True, ""
 
