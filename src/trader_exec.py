@@ -638,7 +638,13 @@ MAX_PRICE_IMPACT_PCT = float(os.getenv("MAX_PRICE_IMPACT_PCT", os.getenv("TRADER
 DEFAULT_SOL_AMOUNT = float(os.getenv("TRADER_SOL_AMOUNT", os.getenv("BUY_AMOUNT_SOL", "0.01")))
 
 ONE_SHOT = os.getenv("ONE_SHOT", os.getenv("TRADER_ONE_SHOT","0")).strip().lower() in ("1", "true", "yes", "on")
+# SHADOW_FORCE: si SHADOW_MODE=1, forcer DRY_RUN=True inconditionnellement
+# Ceci est un verrou de sécurité indépendant de DRY_RUN/TRADER_DRY_RUN
+_shadow_force = os.getenv("SHADOW_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
 DRY_RUN = os.getenv("TRADER_DRY_RUN", os.getenv("DRY_RUN", "1")).strip().lower() in ("1", "true", "yes", "on")
+if _shadow_force and not DRY_RUN:
+    DRY_RUN = True
+    print("🛡️ SHADOW_MODE=1 → DRY_RUN forcé à True (aucun trade réel)", flush=True)
 SKIP_PREFLIGHT = os.getenv("TRADER_SKIP_PREFLIGHT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 WALLET_PUBKEY = (os.getenv("WALLET_PUBKEY") or os.getenv("TRADER_USER_PUBLIC_KEY") or "").strip()
@@ -1806,6 +1812,11 @@ def main() -> int:
                 pass
             # --- /DRY_RUN_AUTOSKIP_SLEEP_V1 ---
 
+            return 0
+
+        # SHADOW_GUARD: double vérification avant envoi réel
+        if os.getenv("SHADOW_MODE", "0").strip().lower() in ("1", "true", "yes", "on"):
+            print("🛡️ SHADOW_GUARD: SHADOW_MODE=1 → envoi bloqué (defense-in-depth)", flush=True)
             return 0
 
         try:

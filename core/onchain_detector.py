@@ -78,6 +78,17 @@ IGNORE_MINTS = {
 _seen_sigs_global: set = set()
 _SEEN_SIGS_MAX = 5000  # garder les N derniers pour limiter la mémoire
 
+# BLOC_D: Dedup par mint (evite de re-enrichir/logger le meme token)
+_seen_mints_global: dict = {}  # mint → timestamp dernière observation
+_SEEN_MINTS_MAX = 2000
+_SEEN_MINTS_COOLDOWN_SEC = int(os.getenv("ONCHAIN_MINT_COOLDOWN_SEC", "120"))  # 2min cooldown par mint
+
+# BLOC_F: Rate limiter Jupiter (éviter 429)
+_jup_last_call_ts: float = 0.0
+_JUP_MIN_INTERVAL_SEC = float(os.getenv("JUP_MIN_INTERVAL_SEC", "1.5"))  # min 1.5s entre appels
+_jup_429_backoff_until: float = 0.0  # timestamp jusqu'auquel on skip Jupiter
+_JUP_429_BACKOFF_SEC = float(os.getenv("JUP_429_BACKOFF_SEC", "30"))  # backoff 30s après un 429
+
 
 # ============================================================
 # Schema SQLite (table onchain_candidates)
@@ -231,40 +242,60 @@ def fast_enrich(candidate: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     # 3. Jupiter route check (can this token be swapped?)
-    try:
-        import requests as _req
-        jup_base = os.getenv("JUP_BASE_URL", os.getenv("JUP_BASE", "https://lite-api.jup.ag")).rstrip("/")
-        _jup_url = f"{jup_base}/swap/v1/quote"
-        _jup_params = {
-            "inputMint": "So11111111111111111111111111111111111111112",
-            "outputMint": mint,
-            "amount": "10000000",  # 0.01 SOL
-            "slippageBps": "500",
-        }
-        _jr = _req.get(_jup_url, params=_jup_params, timeout=3.0)
-        if _jr.status_code == 200:
-            _jq = _jr.json()
-            candidate["details"]["jup_routable"] = True
-            candidate["details"]["jup_out_amount"] = str(_jq.get("outAmount", "0"))
-            _rp = _jq.get("routePlan") or []
-            candidate["details"]["jup_routes"] = len(_rp)
-            try:
-                _impact = float(_jq.get("priceImpactPct", 0) or 0)
-                candidate["details"]["jup_price_impact_pct"] = round(_impact, 3)
-            except Exception:
-                pass
-        else:
-            candidate["details"]["jup_routable"] = False
-            _body = (_jr.text or "").lower()[:200]
-            if "not_tradable" in _body or "token_not_tradable" in _body:
-                candidate["details"]["jup_reason"] = "not_tradable"
-            elif "no route" in _body or "no_route" in _body:
-                candidate["details"]["jup_reason"] = "no_route"
-            else:
-                candidate["details"]["jup_reason"] = f"http_{_jr.status_code}"
-    except Exception as _je:
+    # BLOC_F: rate limiting + backoff pour éviter 429
+    global _jup_last_call_ts, _jup_429_backoff_until
+    _now_f = time.time()
+    _skip_jup = False
+    if _now_f < _jup_429_backoff_until:
+        _skip_jup = True
         candidate["details"]["jup_routable"] = None
-        candidate["details"]["jup_error"] = str(_je)[:80]
+        candidate["details"]["jup_reason"] = "backoff_429"
+    elif (_now_f - _jup_last_call_ts) < _JUP_MIN_INTERVAL_SEC:
+        _skip_jup = True
+        candidate["details"]["jup_routable"] = None
+        candidate["details"]["jup_reason"] = "rate_limited"
+
+    if not _skip_jup:
+        try:
+            import requests as _req
+            _jup_last_call_ts = time.time()
+            jup_base = os.getenv("JUP_BASE_URL", os.getenv("JUP_BASE", "https://lite-api.jup.ag")).rstrip("/")
+            _jup_url = f"{jup_base}/swap/v1/quote"
+            _jup_params = {
+                "inputMint": "So11111111111111111111111111111111111111112",
+                "outputMint": mint,
+                "amount": "10000000",  # 0.01 SOL
+                "slippageBps": "500",
+            }
+            _jr = _req.get(_jup_url, params=_jup_params, timeout=3.0)
+            if _jr.status_code == 200:
+                _jq = _jr.json()
+                candidate["details"]["jup_routable"] = True
+                candidate["details"]["jup_out_amount"] = str(_jq.get("outAmount", "0"))
+                _rp = _jq.get("routePlan") or []
+                candidate["details"]["jup_routes"] = len(_rp)
+                try:
+                    _impact = float(_jq.get("priceImpactPct", 0) or 0)
+                    candidate["details"]["jup_price_impact_pct"] = round(_impact, 3)
+                except Exception:
+                    pass
+            elif _jr.status_code == 429:
+                # BLOC_F: backoff après 429
+                _jup_429_backoff_until = time.time() + _JUP_429_BACKOFF_SEC
+                candidate["details"]["jup_routable"] = None
+                candidate["details"]["jup_reason"] = "http_429_backoff"
+            else:
+                candidate["details"]["jup_routable"] = False
+                _body = (_jr.text or "").lower()[:200]
+                if "not_tradable" in _body or "token_not_tradable" in _body:
+                    candidate["details"]["jup_reason"] = "not_tradable"
+                elif "no route" in _body or "no_route" in _body:
+                    candidate["details"]["jup_reason"] = "no_route"
+                else:
+                    candidate["details"]["jup_reason"] = f"http_{_jr.status_code}"
+        except Exception as _je:
+            candidate["details"]["jup_routable"] = None
+            candidate["details"]["jup_error"] = str(_je)[:80]
 
     # 4. Dev memory check
     try:
@@ -723,15 +754,16 @@ def run_detection_cycle() -> int:
 
     Retourne le nombre de candidats loggues.
     """
-    global _seen_sigs_global
+    global _seen_sigs_global, _seen_mints_global
 
     if not ENABLED:
         return 0
 
     raw_candidates = []
-    # P2: compteurs de rejet pour diagnostic
+    # P2+D: compteurs de rejet pour diagnostic
     _reject = {
         "no_sig": 0, "dedup_local": 0, "dedup_global": 0,
+        "dedup_mint": 0,
         "parse_fail": 0, "no_mint": 0, "ignore_mint": 0,
         "enriched": 0, "logged": 0, "errors": 0,
     }
@@ -790,6 +822,18 @@ def run_detection_cycle() -> int:
             if mint in IGNORE_MINTS:
                 _reject["ignore_mint"] += 1
                 continue
+
+            # BLOC_D: dedup par mint avec cooldown
+            _now_ts = int(time.time())
+            _last_seen_ts = _seen_mints_global.get(mint, 0)
+            if _last_seen_ts > 0 and (_now_ts - _last_seen_ts) < _SEEN_MINTS_COOLDOWN_SEC:
+                _reject["dedup_mint"] += 1
+                continue
+            _seen_mints_global[mint] = _now_ts
+            # Limiter la taille du dict
+            if len(_seen_mints_global) > _SEEN_MINTS_MAX:
+                _cutoff = _now_ts - _SEEN_MINTS_COOLDOWN_SEC * 2
+                _seen_mints_global = {k: v for k, v in _seen_mints_global.items() if v > _cutoff}
 
             # Construire le candidat complet
             candidate = build_candidate(
@@ -852,11 +896,13 @@ def run_detection_cycle() -> int:
                 f"🔍 ONCHAIN cycle: raw={_reject.get('raw_total', 0)}"
                 f" dedup_global={_reject['dedup_global']}"
                 f" dedup_local={_reject['dedup_local']}"
+                f" dedup_mint={_reject['dedup_mint']}"
                 f" parse_fail={_reject['parse_fail']}"
                 f" ignore={_reject['ignore_mint']}"
                 f" enriched={_reject['enriched']}"
                 f" logged={logged}"
-                f" seen_global={len(_seen_sigs_global)}",
+                f" seen_sigs={len(_seen_sigs_global)}"
+                f" seen_mints={len(_seen_mints_global)}",
                 flush=True,
             )
         except Exception:

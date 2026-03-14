@@ -176,7 +176,7 @@ def load_onchain_candidates() -> List[Dict[str, Any]]:
                 "symbol": str(row["symbol"] or ""),
                 "source": str(row["source"] or ""),
                 "event_type": str(row["event_type"] or ""),
-                "liquidity_usd": float(row["liq_sol"] or 0) * 150.0,  # approx SOL→USD
+                "liquidity_usd": float(row["liq_sol"] or 0) * ESTIMATED_SOL_USD,  # SOL→USD via config
                 "market_cap_usd": float(row["market_cap_usd"] or 0),
                 "vol_5m": float(row["volume_5m_usd"] or 0),
                 "fast_score": float(row["fast_score"] or 0),
@@ -469,7 +469,7 @@ def merge_candidates(
 
     # P9: Filtrage final avec logs de rejet detailles
     result = []
-    _reject_reasons = {"low_score": 0, "low_liq": 0, "not_tradable": 0,
+    _reject_reasons = {"low_score": 0, "low_liq": 0, "no_liq": 0, "not_tradable": 0,
                        "blacklisted": 0, "freeze": 0, "accepted": 0}
 
     for mint, cand in by_mint.items():
@@ -477,21 +477,26 @@ def merge_candidates(
         liq = cand.get("_liq_usd", 0)
         sym = cand.get("symbol", "?")[:10]
         src = cand.get("_source", "?")
+        flags = cand.get("risk_flags", [])
 
         # Filtres d'exclusion avec log de rejet
         if score < MIN_SCORE:
             _reject_reasons["low_score"] += 1
             continue
-        if liq > 0 and liq < MIN_LIQ_USD:
+        # BLOC_E: hard-reject no_liq — candidats sans liquidité ne sont pas buyables
+        if "no_liq" in flags or liq <= 0:
+            _reject_reasons["no_liq"] += 1
+            continue
+        if liq < MIN_LIQ_USD:
             _reject_reasons["low_liq"] += 1
             continue
-        if "not_tradable" in cand.get("risk_flags", []):
+        if "not_tradable" in flags:
             _reject_reasons["not_tradable"] += 1
             continue
-        if "dev_blacklisted" in cand.get("risk_flags", []):
+        if "dev_blacklisted" in flags:
             _reject_reasons["blacklisted"] += 1
             continue
-        if "freeze_auth" in cand.get("risk_flags", []):
+        if "freeze_auth" in flags:
             _reject_reasons["freeze"] += 1
             continue
 
@@ -503,6 +508,7 @@ def merge_candidates(
     try:
         print(
             f"  🔀 merger filter: total={_total_before} accepted={_reject_reasons['accepted']}"
+            f" no_liq={_reject_reasons['no_liq']}"
             f" low_score={_reject_reasons['low_score']}"
             f" low_liq={_reject_reasons['low_liq']}"
             f" not_tradable={_reject_reasons['not_tradable']}"

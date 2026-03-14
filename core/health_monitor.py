@@ -70,29 +70,48 @@ def _probe_heartbeats() -> Dict[str, Any]:
 
 
 def _probe_ready_file() -> Dict[str, Any]:
-    """Verifie si le fichier ready_to_trade.json est frais."""
+    """Verifie si le fichier ready (JSON ou CANONICAL JSONL) est frais."""
     result = {
         "ready_file_exists": False,
         "ready_file_stale": True,
         "ready_file_age_s": -1,
         "ready_candidates": 0,
+        "ready_file_path": "",
     }
     try:
-        rf = Path(READY_FILE)
-        if rf.exists():
-            result["ready_file_exists"] = True
-            mtime = rf.stat().st_mtime
-            age = int(time.time() - mtime)
-            result["ready_file_age_s"] = age
-            result["ready_file_stale"] = age > READY_FILE_STALE_SEC
+        # Chercher dans l'ordre : READY_FILE configuré, puis READY_CANONICAL
+        candidates_files = [
+            Path(READY_FILE),
+            Path(os.getenv("READY_CANONICAL_FILE", "state/READY_CANONICAL.jsonl")),
+        ]
+        for rf in candidates_files:
             try:
-                data = json.loads(rf.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    result["ready_candidates"] = len(data)
-                elif isinstance(data, dict):
-                    result["ready_candidates"] = len(data.get("tokens", data.get("candidates", [])))
+                if not rf.exists() or rf.stat().st_size < 5:
+                    continue
+                mtime = rf.stat().st_mtime
+                age = int(time.time() - mtime)
+                # Prendre le fichier le plus frais
+                if result["ready_file_exists"] and age >= result["ready_file_age_s"]:
+                    continue
+                result["ready_file_exists"] = True
+                result["ready_file_age_s"] = age
+                result["ready_file_stale"] = age > READY_FILE_STALE_SEC
+                result["ready_file_path"] = str(rf)
+                try:
+                    text = rf.read_text(encoding="utf-8").strip()
+                    if str(rf).endswith(".jsonl"):
+                        # JSONL: une ligne = un candidat
+                        result["ready_candidates"] = sum(1 for ln in text.splitlines() if ln.strip())
+                    else:
+                        data = json.loads(text)
+                        if isinstance(data, list):
+                            result["ready_candidates"] = len(data)
+                        elif isinstance(data, dict):
+                            result["ready_candidates"] = len(data.get("tokens", data.get("candidates", [])))
+                except Exception:
+                    pass
             except Exception:
-                pass
+                continue
     except Exception:
         pass
     return result

@@ -118,14 +118,25 @@ def main():
         print(f"❌ DB introuvable: {DB}")
         sys.exit(1)
 
-    # --- Load open positions ---
+    # --- Load open positions (schema-safe) ---
     con = sqlite3.connect(DB, timeout=5.0)
     con.row_factory = sqlite3.Row
+    # Découvrir les colonnes disponibles pour éviter "no such column"
+    _cols_info = con.execute("PRAGMA table_info(positions)").fetchall()
+    _col_names = {row[1] for row in _cols_info}
+    # Construire une requête adaptée au schéma réel
+    _select_cols = ["mint", "status"]
+    for _c in ("id", "symbol", "qty_token", "entry_price", "entry_ts", "size_sol"):
+        if _c in _col_names:
+            _select_cols.append(_c)
+    _select = ", ".join(_select_cols)
     rows = con.execute(
-        "SELECT id, mint, symbol, qty_token, entry_price, entry_ts, size_sol, status "
-        "FROM positions WHERE status LIKE 'OPEN%' ORDER BY entry_ts ASC"
+        f"SELECT {_select} FROM positions WHERE status LIKE 'OPEN%' ORDER BY entry_ts ASC"
+        if "entry_ts" in _col_names else
+        f"SELECT {_select} FROM positions WHERE status LIKE 'OPEN%'"
     ).fetchall()
     print(f"📊 Positions OPEN: {len(rows)}")
+    print(f"   Colonnes détectées: {sorted(_col_names)}")
     print()
 
     if not rows:
@@ -142,9 +153,9 @@ def main():
 
     for i, row in enumerate(rows):
         mint = row["mint"]
-        pos_id = row["id"]
-        symbol = row["symbol"] or "?"
-        qty_db = float(row["qty_token"] or 0.0)
+        pos_id = row["id"] if "id" in _col_names else i
+        symbol = (row["symbol"] if "symbol" in _col_names else None) or "?"
+        qty_db = float((row["qty_token"] if "qty_token" in _col_names else None) or 0.0)
 
         # RPC: getTokenAccountsByOwner for this mint
         try:
@@ -188,8 +199,8 @@ def main():
                     "symbol": symbol,
                     "qty_db": qty_db,
                     "balance_onchain": total_balance,
-                    "entry_ts": row["entry_ts"],
-                    "size_sol": float(row["size_sol"] or 0),
+                    "entry_ts": row["entry_ts"] if "entry_ts" in _col_names else 0,
+                    "size_sol": float((row["size_sol"] if "size_sol" in _col_names else None) or 0),
                 })
                 age_h = (int(time.time()) - int(row["entry_ts"] or 0)) / 3600 if row["entry_ts"] else 0
                 print(f"  💀 [{i+1}/{len(rows)}] {symbol:>10} ({mint[:8]}…) balance={total_balance:.6f} qty_db={qty_db:.2f} age={age_h:.0f}h → DEAD")
@@ -230,13 +241,24 @@ def main():
         print("🧹 APPLICATION DU NETTOYAGE...")
         now_ts = int(time.time())
         closed_count = 0
+        # Construire UPDATE adapté au schéma réel
+        _upd_parts = ["status='CLOSED'"]
+        _upd_params_tpl = []
+        if "close_reason" in _col_names:
+            _upd_parts.append("close_reason=?")
+            _upd_params_tpl.append("cleanup_dead_zero_balance")
+        if "close_ts" in _col_names:
+            _upd_parts.append("close_ts=?")
+            _upd_params_tpl.append(now_ts)
+        if "close_price_usd" in _col_names:
+            _upd_parts.append("close_price_usd=0.0")
+        # Clé primaire : id ou mint selon schéma
+        _pk_col = "id" if "id" in _col_names else "mint"
+        _upd_sql = f"UPDATE positions SET {', '.join(_upd_parts)} WHERE {_pk_col}=? AND status LIKE 'OPEN%'"
         for d in dead:
             try:
-                con.execute(
-                    "UPDATE positions SET status='CLOSED', close_reason=?, close_ts=?, close_price_usd=0.0 "
-                    "WHERE id=? AND status LIKE 'OPEN%'",
-                    ("cleanup_dead_zero_balance", now_ts, d["id"])
-                )
+                _params = list(_upd_params_tpl) + [d["id"] if _pk_col == "id" else d["mint"]]
+                con.execute(_upd_sql, _params)
                 closed_count += 1
                 print(f"  ✅ CLOSED id={d['id']} {d['symbol']} ({d['mint'][:8]}…)")
             except Exception as e:
