@@ -20,7 +20,12 @@ def check_max_positions() -> Tuple[bool, str]:
     Retourne (True, msg) si OK, (False, msg) si trop de positions.
     Fail-open: si erreur, retourne (True, ...).
 
-    Schema-safe: utilise uniquement status + entry_ts (présents dans le schéma réel).
+    Schema-safe: utilise uniquement status + entry_ts + qty_token (schéma réel).
+
+    Filtres combinés (AND):
+      1. status LIKE 'OPEN%'
+      2. entry_ts récent (< MAX_OPEN_MAX_AGE_H heures)
+      3. qty_token > 0 (exclut ghost positions avec qty=0)
 
     Env vars:
       MAX_OPEN_POSITIONS   : limite (default 0 = disabled)
@@ -49,21 +54,42 @@ def check_max_positions() -> Tuple[bool, str]:
             "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
         ).fetchone()[0]
 
-        # Comptage actif: seulement les positions récentes (< max_age_h)
-        if "entry_ts" in _col_names and _max_age_h > 0:
+        # Comptage actif: positions récentes (< max_age_h) ET qty_token > 0
+        _has_entry_ts = "entry_ts" in _col_names
+        _has_qty = "qty_token" in _col_names
+
+        _where = "status LIKE 'OPEN%'"
+        _params: list = []
+
+        if _has_qty:
+            _where += " AND COALESCE(qty_token, 0) > 0"
+
+        if _has_entry_ts and _max_age_h > 0:
             _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
-            _mop_count = _mop_con.execute(
-                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%' AND COALESCE(entry_ts, 0) >= ?",
+            _where += " AND COALESCE(entry_ts, 0) >= ?"
+            _params.append(_cutoff_ts)
+
+        _mop_count = _mop_con.execute(
+            f"SELECT COUNT(*) FROM positions WHERE {_where}", _params
+        ).fetchone()[0]
+
+        # Compteur ghost (récentes mais qty=0) pour le log
+        _ghost_count = 0
+        if _has_qty and _has_entry_ts and _max_age_h > 0:
+            _ghost_count = _mop_con.execute(
+                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%' AND COALESCE(entry_ts, 0) >= ? AND COALESCE(qty_token, 0) <= 0",
                 (_cutoff_ts,)
             ).fetchone()[0]
-        else:
-            # Pas de entry_ts → fallback COUNT brut
-            _mop_count = _mop_total
 
         _mop_con.close()
 
-        _old_count = _mop_total - _mop_count
-        _age_info = f" (ignored {_old_count} older than {_max_age_h:.0f}h)" if _old_count > 0 else ""
+        _old_count = _mop_total - _mop_count - _ghost_count
+        _parts = []
+        if _old_count > 0:
+            _parts.append(f"{_old_count} old>{_max_age_h:.0f}h")
+        if _ghost_count > 0:
+            _parts.append(f"{_ghost_count} ghost(qty=0)")
+        _age_info = f" (ignored {' + '.join(_parts)})" if _parts else ""
 
         if _mop_count >= _max_open:
             msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_age_info} → skip BUY"
