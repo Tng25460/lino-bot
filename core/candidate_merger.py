@@ -475,7 +475,8 @@ def merge_candidates(
     # P9: Filtrage final avec logs de rejet detailles
     result = []
     _reject_reasons = {"low_score": 0, "low_liq": 0, "no_liq": 0, "not_tradable": 0,
-                       "blacklisted": 0, "freeze": 0, "accepted": 0}
+                       "blacklisted": 0, "freeze": 0, "high_impact_unknown": 0, "accepted": 0}
+    _max_impact_merger = float(os.getenv("MERGER_MAX_IMPACT_PCT", "50.0"))
 
     for mint, cand in by_mint.items():
         score = cand.get("score_total", 0)
@@ -504,6 +505,11 @@ def merge_candidates(
         if "freeze_auth" in flags:
             _reject_reasons["freeze"] += 1
             continue
+        # BLOC_B: reject impact inconnu (999%) ou excessif — économise des appels Jupiter inutiles
+        _cand_impact = float(cand.get("_price_impact", 999) or 999)
+        if _cand_impact >= _max_impact_merger:
+            _reject_reasons["high_impact_unknown"] += 1
+            continue
 
         result.append(cand)
         _reject_reasons["accepted"] += 1
@@ -518,7 +524,8 @@ def merge_candidates(
             f" low_liq={_reject_reasons['low_liq']}"
             f" not_tradable={_reject_reasons['not_tradable']}"
             f" blacklisted={_reject_reasons['blacklisted']}"
-            f" freeze={_reject_reasons['freeze']}",
+            f" freeze={_reject_reasons['freeze']}"
+            f" high_impact={_reject_reasons['high_impact_unknown']}",
             flush=True,
         )
     except Exception:

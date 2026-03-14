@@ -15,13 +15,19 @@ from typing import Optional, Tuple
 
 def check_max_positions() -> Tuple[bool, str]:
     """
-    Verifie le nombre de positions ouvertes.
+    Verifie le nombre de positions ouvertes ACTIVES (ignore poussière/historique).
     Retourne (True, msg) si OK, (False, msg) si trop de positions.
     Fail-open: si erreur, retourne (True, ...).
+
+    Env vars:
+      MAX_OPEN_POSITIONS       : limite (default 0 = disabled)
+      MAX_OPEN_MIN_SIZE_SOL    : seuil min pour compter une position (default 0.005)
     """
     _max_open = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
     if _max_open <= 0:
         return True, ""
+
+    _min_size = float(os.getenv("MAX_OPEN_MIN_SIZE_SOL", "0.005"))
 
     try:
         import sqlite3
@@ -29,17 +35,38 @@ def check_max_positions() -> Tuple[bool, str]:
             "TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite")
         )
         _mop_con = sqlite3.connect(_mop_db, timeout=5)
-        _mop_count = _mop_con.execute(
-            "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
-        ).fetchone()[0]
+
+        # Détection dynamique des colonnes disponibles
+        _cols_info = _mop_con.execute("PRAGMA table_info(positions)").fetchall()
+        _col_names = {row[1] for row in _cols_info}
+
+        # Comptage intelligent: ignore les positions poussière (size_sol < seuil)
+        if "size_sol" in _col_names and _min_size > 0:
+            _mop_count = _mop_con.execute(
+                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%' AND COALESCE(size_sol, 0) >= ?",
+                (_min_size,)
+            ).fetchone()[0]
+            _mop_total = _mop_con.execute(
+                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
+            ).fetchone()[0]
+            _dust_count = _mop_total - _mop_count
+        else:
+            _mop_count = _mop_con.execute(
+                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
+            ).fetchone()[0]
+            _mop_total = _mop_count
+            _dust_count = 0
+
         _mop_con.close()
+
+        _dust_info = f" (ignored {_dust_count} dust<{_min_size}SOL)" if _dust_count > 0 else ""
         if _mop_count >= _max_open:
-            msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} positions ouvertes → skip BUY"
+            msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active positions{_dust_info} → skip BUY"
             print(msg, flush=True)
             return False, msg
         else:
             print(
-                f"📊 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} (OK)", flush=True
+                f"📊 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_dust_info} (OK)", flush=True
             )
             return True, ""
     except Exception as _mop_e:
