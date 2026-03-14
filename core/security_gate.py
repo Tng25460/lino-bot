@@ -16,14 +16,15 @@ from typing import Optional, Tuple
 def _read_exposure_file() -> int:
     """
     Lit state/buy_exposure.json (écrit par trader_loop) et retourne
-    le nombre de trades NON FERMÉS dans la fenêtre MAX_OPEN_MAX_AGE_H.
+    le nombre TOTAL d'entrées dans le fichier.
 
-    Ce fichier contient une liste de timestamps Unix des BUY envoyés.
+    Le fichier est déjà nettoyé par le writer (purge > 48h à chaque écriture),
+    donc on compte simplement toutes les entrées sans filtre supplémentaire.
+    Ceci évite le bug où MAX_OPEN_MAX_AGE_H=0 causait un cutoff = now → count=0.
+
     Source de vérité indépendante de la DB (pas de dépendance à qty_token).
     Fail-safe: retourne -1 si lecture impossible.
     """
-    import time as _t
-    _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "48"))
     _exposure_path = os.path.join(
         os.getenv("HEARTBEAT_DIR", "state"), "buy_exposure.json"
     )
@@ -32,14 +33,17 @@ def _read_exposure_file() -> int:
         with open(_exposure_path, "r", encoding="utf-8") as _f:
             _data = _ej.load(_f)
         if not isinstance(_data, list):
+            print(f"⚠️ EXPOSURE_READ: invalid format in {_exposure_path}", flush=True)
             return -1
-        _now = _t.time()
-        _cutoff = _now - (_max_age_h * 3600)
-        _count = sum(1 for ts in _data if isinstance(ts, (int, float)) and ts >= _cutoff)
+        # Compter toutes les entrées valides (le writer purge déjà les vieilles)
+        _count = sum(1 for ts in _data if isinstance(ts, (int, float)))
+        print(f"📊 EXPOSURE_READ: {_exposure_path} → {_count} entries", flush=True)
         return _count
     except FileNotFoundError:
+        print(f"📊 EXPOSURE_READ: {_exposure_path} not found (first run?)", flush=True)
         return -1
-    except Exception:
+    except Exception as _e:
+        print(f"⚠️ EXPOSURE_READ: error reading {_exposure_path}: {_e}", flush=True)
         return -1
 
 
@@ -65,7 +69,7 @@ def check_max_positions() -> Tuple[bool, str]:
     if _max_open <= 0:
         return True, ""
 
-    _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "48"))
+    _max_age_h = max(float(os.getenv("MAX_OPEN_MAX_AGE_H", "48")), 1.0)  # floor 1h minimum
 
     # --- Source 1: fichier buy_exposure.json ---
     _file_count = _read_exposure_file()
