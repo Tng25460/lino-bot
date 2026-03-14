@@ -184,15 +184,39 @@ async def trader_loop():
         except Exception:
             pass
 
+    # --- RATE_LIMITER_V1: fenêtre glissante 1h ---
+    _trade_timestamps: list = []  # timestamps des trades envoyés (rc=0 ou rc=2)
+
+    def _rate_limit_ok() -> bool:
+        """Vérifie si on peut encore trader cette heure. Nettoie les vieux timestamps."""
+        _mth = int(os.getenv('TRADER_MAX_TRADES_PER_HOUR', os.getenv('MAX_TRADES_PER_HOUR', os.getenv('LOOP_MAX_TRADES_PER_HOUR', '6'))))
+        if _mth <= 0:
+            return False  # SELL_ONLY mode
+        now = time.time()
+        # Purger les timestamps > 1h
+        while _trade_timestamps and (now - _trade_timestamps[0]) > 3600:
+            _trade_timestamps.pop(0)
+        if len(_trade_timestamps) >= _mth:
+            _oldest = _trade_timestamps[0]
+            _wait = 3600 - (now - _oldest)
+            print(f"🛑 RATE_LIMIT: {len(_trade_timestamps)}/{_mth} trades/h → skip BUY (next slot in {_wait:.0f}s)", flush=True)
+            return False
+        print(f"📊 RATE_LIMIT: {len(_trade_timestamps)}/{_mth} trades/h (OK)", flush=True)
+        return True
+
+    def _rate_limit_record():
+        """Enregistre un trade réussi dans la fenêtre."""
+        _trade_timestamps.append(time.time())
+    # --- /RATE_LIMITER_V1 ---
+
     while True:
         _heartbeat_buy()  # MAJ heartbeat à CHAQUE tick (pas seulement dans run_live)
-        # --- SELL_ONLY_GUARD_V2 ---
-        _mth = int(os.getenv('TRADER_MAX_TRADES_PER_HOUR', os.getenv('MAX_TRADES_PER_HOUR', os.getenv('LOOP_MAX_TRADES_PER_HOUR','6'))))
-        if _mth <= 0:
-            import time as _t
-            _t.sleep(float(os.getenv('SELL_ONLY_SLEEP_S','2')))
+        # --- SELL_ONLY_GUARD + RATE_LIMIT ---
+        if not _rate_limit_ok():
+            _rl_sleep = float(os.getenv('RATE_LIMIT_SLEEP_S', os.getenv('SELL_ONLY_SLEEP_S', '30')))
+            await asyncio.sleep(_rl_sleep)
             continue
-        # --- /SELL_ONLY_GUARD_V2 ---
+        # --- /SELL_ONLY_GUARD + RATE_LIMIT ---
 
 
         try:
@@ -208,6 +232,10 @@ async def trader_loop():
             ).returncode
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
+            # RATE_LIMITER_V1: enregistrer le trade si tx envoyée (rc=2) ou succès (rc=0)
+            if rc in (0, 2):
+                _rate_limit_record()
+                print(f"📊 RATE_LIMIT: recorded trade (total={len(_trade_timestamps)} in window)", flush=True)
             # normalize_rc2_v1
             if rc == 2:
                 rc = 0

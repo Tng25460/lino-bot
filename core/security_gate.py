@@ -15,27 +15,22 @@ from typing import Optional, Tuple
 
 def check_max_positions() -> Tuple[bool, str]:
     """
-    Verifie le nombre de positions ouvertes ACTIVES (ignore poussière/historique).
+    Verifie le nombre de positions ouvertes RECENTES.
+    Ignore les positions historiques plus vieilles que MAX_OPEN_MAX_AGE_H.
     Retourne (True, msg) si OK, (False, msg) si trop de positions.
     Fail-open: si erreur, retourne (True, ...).
 
-    Stratégie schema-safe (pas de dépendance à size_sol):
-      1. Si entry_price ET qty_token existent: position_value = entry_price * qty_token
-         → ignore si < MAX_OPEN_MIN_VALUE_USD (default 0.50$)
-      2. Si entry_ts existe: ignore positions trop vieilles (> MAX_OPEN_MAX_AGE_H heures)
-      3. Fallback: COUNT brut (fail-open)
+    Schema-safe: utilise uniquement status + entry_ts (présents dans le schéma réel).
 
     Env vars:
-      MAX_OPEN_POSITIONS       : limite (default 0 = disabled)
-      MAX_OPEN_MIN_VALUE_USD   : valeur min USD pour compter (default 0.50)
-      MAX_OPEN_MAX_AGE_H       : age max en heures (default 0 = disabled)
+      MAX_OPEN_POSITIONS   : limite (default 0 = disabled)
+      MAX_OPEN_MAX_AGE_H   : positions plus vieilles sont ignorées (default 48h)
     """
     _max_open = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
     if _max_open <= 0:
         return True, ""
 
-    _min_value_usd = float(os.getenv("MAX_OPEN_MIN_VALUE_USD", "0.50"))
-    _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "0"))
+    _max_age_h = float(os.getenv("MAX_OPEN_MAX_AGE_H", "48"))
 
     try:
         import sqlite3
@@ -49,48 +44,34 @@ def check_max_positions() -> Tuple[bool, str]:
         _cols_info = _mop_con.execute("PRAGMA table_info(positions)").fetchall()
         _col_names = {row[1] for row in _cols_info}
 
-        # Construire les conditions de filtrage selon le schéma réel
-        _where_parts = ["status LIKE 'OPEN%'"]
-        _params = []
-
-        # Filtre par valeur: entry_price * qty_token >= seuil USD
-        if "entry_price" in _col_names and "qty_token" in _col_names and _min_value_usd > 0:
-            _where_parts.append("(COALESCE(entry_price, 0) * COALESCE(qty_token, 0)) >= ?")
-            _params.append(_min_value_usd)
-
-        # Filtre par age: entry_ts > now - max_age_h * 3600
-        if "entry_ts" in _col_names and _max_age_h > 0:
-            _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
-            _where_parts.append("COALESCE(entry_ts, 0) >= ?")
-            _params.append(_cutoff_ts)
-
-        _where_sql = " AND ".join(_where_parts)
-
-        _mop_count = _mop_con.execute(
-            f"SELECT COUNT(*) FROM positions WHERE {_where_sql}", _params
-        ).fetchone()[0]
-
+        # Total OPEN (toutes époques)
         _mop_total = _mop_con.execute(
             "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
         ).fetchone()[0]
 
+        # Comptage actif: seulement les positions récentes (< max_age_h)
+        if "entry_ts" in _col_names and _max_age_h > 0:
+            _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
+            _mop_count = _mop_con.execute(
+                "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%' AND COALESCE(entry_ts, 0) >= ?",
+                (_cutoff_ts,)
+            ).fetchone()[0]
+        else:
+            # Pas de entry_ts → fallback COUNT brut
+            _mop_count = _mop_total
+
         _mop_con.close()
 
-        _dust_count = _mop_total - _mop_count
-        _filters = []
-        if "entry_price" in _col_names and "qty_token" in _col_names and _min_value_usd > 0:
-            _filters.append(f"val>={_min_value_usd}$")
-        if "entry_ts" in _col_names and _max_age_h > 0:
-            _filters.append(f"age<{_max_age_h}h")
-        _dust_info = f" (ignored {_dust_count} dust [{','.join(_filters)}])" if _dust_count > 0 else ""
+        _old_count = _mop_total - _mop_count
+        _age_info = f" (ignored {_old_count} older than {_max_age_h:.0f}h)" if _old_count > 0 else ""
 
         if _mop_count >= _max_open:
-            msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active positions{_dust_info} → skip BUY"
+            msg = f"🛑 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_age_info} → skip BUY"
             print(msg, flush=True)
             return False, msg
         else:
             print(
-                f"📊 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_dust_info} (OK)", flush=True
+                f"📊 MAX_OPEN_POSITIONS: {_mop_count}/{_max_open} active{_age_info} (OK)", flush=True
             )
             return True, ""
     except Exception as _mop_e:
