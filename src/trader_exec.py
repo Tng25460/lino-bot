@@ -411,6 +411,23 @@ def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
         except Exception:
             return 0.0
 
+    def _get_liq(r):
+        try:
+            return float(r.get("liquidity_usd") or r.get("liq_usd") or 0)
+        except Exception:
+            return 0.0
+
+    # P13: HARD FILTER — never pick garbage candidates
+    # Séparer les candidats valides (score>0 ET liq>0) des garbage
+    _valid = [r for r in rows if _get_score(r) > 0 and _get_liq(r) > 0]
+    _garbage_count = len(rows) - len(_valid)
+    if _garbage_count > 0:
+        print(f"   🗑️ _pick: rejected {_garbage_count} garbage candidates (score=0 or liq=0)", flush=True)
+    if not _valid:
+        print(f"   🛑 _pick: NO valid candidates after garbage filter → None", flush=True)
+        return None
+    rows = _valid
+
     # P11: fast_lane candidates toujours en tête
     rows2 = sorted(rows, key=lambda r: (1 if r.get("fast_lane") else 0, _get_score(r)), reverse=True)
     k = max(1, int(SCORED_TOPK))
@@ -696,14 +713,45 @@ def _headers() -> Dict[str, str]:
 
 
 def _load_ready() -> list[dict]:
-    """Charge READY et filtre les candidats trop vieux inline.
-    P12: dernière défense contre too_old leaking dans trader_exec.
+    """Charge READY, sanitise et filtre hard inline.
+    P12: dernière défense contre too_old leaking.
+    P13: hard sanitation — reject garbage AVANT pick.
     """
     if not READY_FILE.exists():
         return []
+
+    # --- P0: STARTUP FRESHNESS GATE ---
+    # Au démarrage / premier cycle, READY_CANONICAL peut être un résidu
+    # d'un run précédent. On exige que merger_ts (écrit par le merger live)
+    # soit récent, OU que le fichier ait été modifié récemment.
+    _STARTUP_MAX_STALE_S = int(os.getenv("STARTUP_READY_MAX_STALE_S", "120"))  # 2 min
+    try:
+        _file_mtime = int(READY_FILE.stat().st_mtime)
+        _file_age = int(time.time()) - _file_mtime
+        if _file_age > _STARTUP_MAX_STALE_S:
+            # Vérifier si merger_ts dans la première ligne est récent
+            _has_fresh_merger = False
+            try:
+                with READY_FILE.open("r", encoding="utf-8", errors="ignore") as _ff:
+                    _first_line = _ff.readline().strip()
+                if _first_line:
+                    _first_row = json.loads(_first_line)
+                    _merger_ts = int(_first_row.get("merger_ts", 0) or 0)
+                    if _merger_ts > 0 and (int(time.time()) - _merger_ts) <= _STARTUP_MAX_STALE_S:
+                        _has_fresh_merger = True
+            except Exception:
+                pass
+            if not _has_fresh_merger:
+                print(f"   🛑 READY_NOT_FRESH: file_age={_file_age}s > {_STARTUP_MAX_STALE_S}s, no fresh merger_ts → skip cycle (wait for live merger)", flush=True)
+                return []
+    except Exception:
+        pass
+
     _now_lr = int(time.time())
     _max_age_lr = int(os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600"))
     _stale_count = 0
+    _sanitize_reject = 0
+    _toxic_flags = {"no_liq", "not_tradable", "dev_blacklisted", "freeze_auth", "dev_rugged"}
     out = []
     with READY_FILE.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -712,16 +760,68 @@ def _load_ready() -> list[dict]:
                 continue
             try:
                 row = json.loads(line)
-                # P12: filtre age inline — les tokens trop vieux ne doivent JAMAIS atteindre le pick
+
+                # --- P13 HARD SANITATION ---
+                # 1. Mint valide obligatoire
+                _mint = str(row.get("mint") or row.get("outputMint") or row.get("address") or "").strip()
+                if not _mint or len(_mint) < 20:
+                    _sanitize_reject += 1
+                    continue
+
+                # 2. score_total > 0 obligatoire (sauf fallback score explicite > 0)
+                _score = 0.0
+                try:
+                    _score = float(row.get("score_total") or 0)
+                except Exception:
+                    pass
+                if _score <= 0:
+                    try:
+                        _score = float(row.get("score") or 0)
+                    except Exception:
+                        _score = 0.0
+                if _score <= 0:
+                    _sanitize_reject += 1
+                    continue
+
+                # 3. liquidity_usd > 0 obligatoire
+                _liq = 0.0
+                try:
+                    _liq = float(row.get("liquidity_usd") or row.get("liq_usd") or 0)
+                except Exception:
+                    pass
+                if _liq <= 0:
+                    _sanitize_reject += 1
+                    continue
+
+                # 4. flags toxiques → reject
+                _flags = set()
+                try:
+                    _raw_flags = row.get("flags") or row.get("toxic_flags") or []
+                    if isinstance(_raw_flags, str):
+                        _flags = {f.strip() for f in _raw_flags.split(",") if f.strip()}
+                    elif isinstance(_raw_flags, (list, set)):
+                        _flags = {str(f).strip() for f in _raw_flags}
+                except Exception:
+                    pass
+                if _flags & _toxic_flags:
+                    _sanitize_reject += 1
+                    continue
+
+                # --- P12: filtre age inline ---
                 _row_ts = int(row.get("ts", 0) or 0)
                 if _row_ts > 0 and (_now_lr - _row_ts) > _max_age_lr:
                     _stale_count += 1
                     continue
+
                 out.append(row)
             except Exception:
                 continue
     if _stale_count > 0:
         print(f"   🗑️ _load_ready: filtered {_stale_count} stale rows (age>{_max_age_lr}s)", flush=True)
+    if _sanitize_reject > 0:
+        print(f"   🗑️ _load_ready: SANITIZE rejected {_sanitize_reject} garbage rows (no mint/score/liq or toxic flags)", flush=True)
+    if not out:
+        print(f"   🛑 READY_NO_VALID_ROWS: all rows rejected (stale={_stale_count} sanitize={_sanitize_reject})", flush=True)
     return out
 
 
@@ -1095,27 +1195,28 @@ def main() -> int:
 
     # IMPORTANT: trader_exec ne score PAS. Le scoring/filters doivent être upstream (core/trading.py)
 
-    # pick first candidate not in skiplist (avoid getting stuck on ready[0])
+    # P13: PICK avec _pick_best_scored_ready (qui filtre garbage score=0/liq=0)
+    # Ne JAMAIS tomber sur ready[0] aveugle comme fallback
     cand = None
     try:
-        _skip = set()
-        try:
-            _skip = set(_load_skip_mints() or [])
-        except Exception:
-            _skip = set()
-        for _c in ready:
-            _m = (_c.get("outputMint") or _c.get("mint") or _c.get("address") or "").strip()
-            if not _m:
-                continue
-            if _m in _skip:
-                continue
-            cand = _c
-            break
-    except Exception:
+        cand = _pick_best_scored_ready(ready)
+    except Exception as _pe:
+        print(f"⚠️ _pick_best_scored_ready failed: {_pe}", flush=True)
         cand = None
 
     if cand is None:
-        cand = ready[0]
+        # Dernier recours: vérifier manuellement qu'on a au moins un candidat avec score+liq
+        for _c in ready:
+            _cs = float(_c.get("score_total") or _c.get("score") or 0)
+            _cl = float(_c.get("liquidity_usd") or _c.get("liq_usd") or 0)
+            _cm = str(_c.get("mint") or _c.get("outputMint") or _c.get("address") or "").strip()
+            if _cm and _cs > 0 and _cl > 0:
+                cand = _c
+                break
+        if cand is None:
+            print(f"🛑 PICK_NO_VALID_CANDIDATE: all {len(ready)} candidates have score=0 or liq=0 → skip BUY", flush=True)
+            _dtrace("SKIP", "", reason="pick_no_valid_candidate", details={"ready_count": len(ready)})
+            return 0
 
     output_mint = (cand.get("outputMint") or cand.get("mint") or cand.get("address") or "").strip()
 # ANTI_REBUY_PICK_LOOP_V1
@@ -1126,7 +1227,7 @@ def main() -> int:
         print(f"⚠️ re-pick: blocked by {why} mint={output_mint}")
         # remove blocked mints and pick again
         ready2 = [r for r in ready if (r.get('outputMint') or r.get('mint') or r.get('address') or '').strip() not in skip_set]
-        cand2 = _pick_best_scored_ready(ready2) if USE_SCORED_IF_PRESENT else (ready2[0] if ready2 else None)
+        cand2 = _pick_best_scored_ready(ready2) if ready2 else None
         if cand2:
             cand = cand2
             output_mint = (cand.get('outputMint') or cand.get('mint') or cand.get('address') or '').strip()
