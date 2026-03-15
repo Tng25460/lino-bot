@@ -1213,6 +1213,91 @@ class SellEngine:
                 except Exception:
                     pass
 
+        # ================================================================
+        # PRIO1_C: TIME-DECAY EXIT — sorties progressives par âge
+        # Plus agressif que TIME_STOP: coupe tôt les positions flat/faibles.
+        # Env: TIME_DECAY_ENABLED=1, TIME_DECAY_3M_MIN_PNL=0.03,
+        #      TIME_DECAY_10M_MIN_PNL=0.10, TIME_DECAY_20M_TRIM_PCT=0.50
+        # ================================================================
+        _td_enabled = os.getenv("TIME_DECAY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        if _td_enabled and entry_ts > 0:
+            try:
+                _td_age_min = (now - entry_ts) / 60.0
+                _td_3m_min = _env_float("TIME_DECAY_3M_MIN_PNL", 0.03)
+                _td_10m_min = _env_float("TIME_DECAY_10M_MIN_PNL", 0.10)
+
+                # T+3min : si PnL < +3% → exit total
+                if _td_age_min >= 3.0 and pnl < _td_3m_min:
+                    print(
+                        f"⏳ TIME_DECAY_EXIT 3min mint={mint} age={_td_age_min:.1f}m pnl={pnl:.2%} < {_td_3m_min:.0%}",
+                        flush=True,
+                    )
+                    if os.getenv("SELL_DRY_RUN", "0") == "1":
+                        print("🧪 SELL_DRY_RUN=1 -> skip TIME_DECAY sell", flush=True)
+                    else:
+                        txsig = self._sell_exec(mint, qty_total, "time_decay_3m")
+                        if txsig == "__DUST__":
+                            try:
+                                self.db.close_position(mint, close_reason="dust_untradeable")
+                            except Exception:
+                                pass
+                            return
+                        if not txsig or txsig in (
+                            "__FAIL__", "__ROUTE_FAIL__", "__JUP_HTTP_429__",
+                            "__INSUFFICIENT__", "__SKIP_QTY0__", "__SKIP_DUST__",
+                        ):
+                            return
+                        print(f"✅ SOLD TIME_DECAY_3M txsig={txsig}", flush=True)
+                        try:
+                            self.db.close_position(mint, close_reason="time_decay_3m", close_price=price)
+                        except Exception:
+                            pass
+                        try:
+                            from core.risk_engine import register_trade_result
+                            register_trade_result(pnl_pct=pnl, close_reason="time_decay_3m", mint=mint)
+                        except Exception:
+                            pass
+                        return
+
+                # T+10min : si PnL < +10% → exit total
+                if _td_age_min >= 10.0 and pnl < _td_10m_min:
+                    print(
+                        f"⏳ TIME_DECAY_EXIT 10min mint={mint} age={_td_age_min:.1f}m pnl={pnl:.2%} < {_td_10m_min:.0%}",
+                        flush=True,
+                    )
+                    if os.getenv("SELL_DRY_RUN", "0") == "1":
+                        print("🧪 SELL_DRY_RUN=1 -> skip TIME_DECAY sell", flush=True)
+                    else:
+                        txsig = self._sell_exec(mint, qty_total, "time_decay_10m")
+                        if txsig == "__DUST__":
+                            try:
+                                self.db.close_position(mint, close_reason="dust_untradeable")
+                            except Exception:
+                                pass
+                            return
+                        if not txsig or txsig in (
+                            "__FAIL__", "__ROUTE_FAIL__", "__JUP_HTTP_429__",
+                            "__INSUFFICIENT__", "__SKIP_QTY0__", "__SKIP_DUST__",
+                        ):
+                            return
+                        print(f"✅ SOLD TIME_DECAY_10M txsig={txsig}", flush=True)
+                        try:
+                            self.db.close_position(mint, close_reason="time_decay_10m", close_price=price)
+                        except Exception:
+                            pass
+                        try:
+                            from core.risk_engine import register_trade_result
+                            register_trade_result(pnl_pct=pnl, close_reason="time_decay_10m", mint=mint)
+                        except Exception:
+                            pass
+                        return
+            except Exception as _td_e:
+                try:
+                    print(f"⚠️ TIME_DECAY check failed (fail-open): {_td_e}", flush=True)
+                except Exception:
+                    pass
+        # --- /PRIO1_C: TIME-DECAY EXIT ---
+
         # TIME STOP (sell ALL)  [TIME_STOP_FIX_V2]
         # Déclenchement: position trop vieille
         # Garde: on ne vend que si pnl >= min pnl (avec epsilon float)
