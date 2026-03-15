@@ -235,6 +235,45 @@ def register_trade_result(
             flush=True,
         )
 
+        # ================================================================
+        # PRIO1_E: POST-TRADE LOGGER — JSONL append
+        # Stocke chaque trade fermé pour analyse et recalibration.
+        # Fichier: state/post_trade_log.jsonl (configurable via POST_TRADE_LOG)
+        # Fail-safe: ne crash jamais le bot.
+        # ================================================================
+        try:
+            import json as _ptl_json
+            import time as _ptl_time
+            _ptl_path = os.getenv("POST_TRADE_LOG", "state/post_trade_log.jsonl")
+            _ptl_now = _ptl_time.time()
+
+            _ptl_entry = {
+                "ts": int(_ptl_now),
+                "mint": str(mint),
+                "pnl_pct": round(float(pnl_pct), 6),
+                "close_reason": str(close_reason),
+                "sizing_sol": round(float(sizing_sol), 6) if sizing_sol else 0.0,
+                "day_trades": day_trades,
+                "day_pnl": round(day_pnl, 6),
+                "day_drawdown": round(day_drawdown, 6),
+                "consecutive_losses": consec_losses,
+                "sizing_multiplier": round(sizing_mult, 4),
+                "is_win": is_win,
+            }
+
+            # Append atomique
+            os.makedirs(os.path.dirname(_ptl_path) or ".", exist_ok=True)
+            with open(_ptl_path, "a", encoding="utf-8") as _ptl_f:
+                _ptl_f.write(_ptl_json.dumps(_ptl_entry, ensure_ascii=False) + "\n")
+
+            print(f"📝 POST_TRADE_LOGGED mint={mint[:16]}… pnl={pnl_pct:+.2%} reason={close_reason}", flush=True)
+        except Exception as _ptl_e:
+            try:
+                print(f"⚠️ POST_TRADE_LOG failed (non-fatal): {_ptl_e}", flush=True)
+            except Exception:
+                pass
+        # --- /PRIO1_E: POST-TRADE LOGGER ---
+
     except Exception as e:
         try:
             print(f"⚠️ risk_engine.register_trade_result failed (non-fatal): {e}", flush=True)

@@ -894,6 +894,74 @@ def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
             },
         ],
     }
+
+    # ================================================================
+    # PRIO1_A: MULTI-RPC PARALLEL SEND
+    # Envoyer la tx à plusieurs endpoints simultanément.
+    # Le premier succès gagne. Fail-safe: fallback primary.
+    # Env: RPC_SEND_ENDPOINTS (comma-separated), RPC_SEND_PARALLEL_ENABLED=1
+    # ================================================================
+    _parallel_enabled = os.getenv("RPC_SEND_PARALLEL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    _extra_endpoints_raw = os.getenv("RPC_SEND_ENDPOINTS", "").strip()
+    _extra_endpoints = [e.strip() for e in _extra_endpoints_raw.split(",") if e.strip()] if _extra_endpoints_raw else []
+
+    if _parallel_enabled and _extra_endpoints:
+        # Inclure le primary dans la liste
+        _all_endpoints = [rpc_http] + [e for e in _extra_endpoints if e != rpc_http]
+        _t0 = time.time()
+        import concurrent.futures
+        _results = {}  # endpoint -> (success, result_or_error)
+
+        def _send_to_endpoint(ep):
+            try:
+                _r = requests.post(ep, json=req, timeout=35)
+                if _r.status_code != 200:
+                    return (False, f"http={_r.status_code}")
+                _j = _r.json()
+                if "error" in _j:
+                    return (False, f"error={_j['error']}")
+                _res = _j.get("result")
+                if not _res:
+                    return (False, f"no_result")
+                return (True, str(_res))
+            except Exception as _e:
+                return (False, str(_e)[:200])
+
+        print(f"   🔀 RPC_PARALLEL_SEND: endpoints={len(_all_endpoints)} [{', '.join(e[:30] for e in _all_endpoints)}]", flush=True)
+
+        _winner = None
+        _winner_ep = None
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(_all_endpoints)) as _executor:
+                _futures = {_executor.submit(_send_to_endpoint, ep): ep for ep in _all_endpoints}
+                for _fut in concurrent.futures.as_completed(_futures, timeout=40):
+                    _ep = _futures[_fut]
+                    try:
+                        _ok, _val = _fut.result()
+                        if _ok and _winner is None:
+                            _winner = _val
+                            _winner_ep = _ep
+                        _results[_ep] = (_ok, _val)
+                    except Exception as _fe:
+                        _results[_ep] = (False, str(_fe)[:100])
+        except Exception as _pool_e:
+            print(f"   ⚠️ RPC_PARALLEL_SEND pool error: {_pool_e}", flush=True)
+
+        if _winner:
+            _elapsed_ms = int((time.time() - _t0) * 1000)
+            _append_dbg(f"RPC_PARALLEL_SEND winner={_winner_ep} ms={_elapsed_ms}")
+            _append_dbg(f"RPC_PARALLEL_RESULTS={_results}")
+            _n_ok = sum(1 for v in _results.values() if v[0])
+            print(f"   ✅ RPC_PARALLEL_SEND winner={_winner_ep[:40]}… ok={_n_ok}/{len(_all_endpoints)} ms={_elapsed_ms}", flush=True)
+            return _winner
+        else:
+            # Tous ont échoué — log et fallback primary
+            print(f"   ⚠️ RPC_PARALLEL_SEND all_failed: {_results} → fallback primary", flush=True)
+            # Fall through vers le send primary ci-dessous
+
+    # ================================================================
+    # Send primary (ou fallback si parallel échoue)
+    # ================================================================
     r = requests.post(rpc_http, json=req, timeout=35)
     _append_dbg("SEND_STATUS=" + str(r.status_code))
     _append_dbg("SEND_BODY=" + (r.text[:2000] if r.text else ""))
@@ -907,6 +975,8 @@ def _send_signed_b64(tx_b64: str, rpc_http: str) -> str:
     res = j.get("result")
     if not res:
         raise RuntimeError(f"sendTransaction no result: {j}")
+    if _parallel_enabled and _extra_endpoints:
+        print(f"   🔀 RPC_SEND fallback_primary OK", flush=True)
     return str(res)
 
 def _row_mint(row: dict) -> str:
@@ -1424,6 +1494,42 @@ def main() -> int:
         # fail-open: si le check crash, on continue (ne pas bloquer le trading)
         print(f"⚠️ PRE_QUOTE gate error (fail-open): {_pq_e}", flush=True)
 
+    # ================================================================
+    # PRIO1_D: DRAWDOWN CIRCUIT BREAKER
+    # Si le drawdown journalier dépasse un seuil, réduire ou bloquer les buys.
+    # Env: CIRCUIT_BREAKER_ENABLED=1, DD_SOFT_PCT=0.05, DD_HARD_PCT=0.10
+    # Fail-safe: si info indisponible → continue normalement.
+    # ================================================================
+    _cb_enabled = os.getenv("CIRCUIT_BREAKER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    _cb_size_mult = 1.0  # multiplicateur de taille (réduit si drawdown soft)
+    if _cb_enabled:
+        try:
+            from core.brain_db import get_risk_state as _cb_get_risk
+            _cb_state = _cb_get_risk()
+            _cb_dd = abs(float(_cb_state.get("day_drawdown", 0) or 0))
+            _cb_soft = abs(float(os.getenv("DD_SOFT_PCT", "0.05")))
+            _cb_hard = abs(float(os.getenv("DD_HARD_PCT", "0.10")))
+            _cb_consec = int(_cb_state.get("consecutive_losses", 0) or 0)
+
+            if _cb_dd >= _cb_hard:
+                print(f"🛑 CIRCUIT_BREAKER HARD: dd={_cb_dd:.2%} >= {_cb_hard:.0%} → SKIP buy", flush=True)
+                _dtrace("SKIP", str(output_mint), reason="circuit_breaker_hard",
+                        details={"dd": _cb_dd, "hard_limit": _cb_hard})
+                return 0
+            elif _cb_dd >= _cb_soft:
+                _cb_size_mult = 0.50
+                print(f"⚠️ CIRCUIT_BREAKER SOFT: dd={_cb_dd:.2%} >= {_cb_soft:.0%} → size×0.50", flush=True)
+            elif _cb_consec >= 5:
+                _cb_size_mult = 0.50
+                print(f"⚠️ CIRCUIT_BREAKER 5_CONSEC_LOSSES: → size×0.50", flush=True)
+        except Exception as _cb_e:
+            # Fail-safe: si erreur, continue normalement
+            try:
+                print(f"⚠️ CIRCUIT_BREAKER check failed (fail-open): {_cb_e}", flush=True)
+            except Exception:
+                pass
+    # --- /PRIO1_D: CIRCUIT BREAKER ---
+
     amount_lamports = _lamports_from_any(cand.get("amount_lamports"))
     BUY_LAMPORTS_OVERRIDE = os.getenv("BUY_LAMPORTS")
     if BUY_LAMPORTS_OVERRIDE:
@@ -1553,6 +1659,67 @@ def main() -> int:
     except Exception as _aq_e:
         print(f"   ⚠️ ADAPTIVE_QUOTE failed (fail-open, using base amount): {_aq_e}", flush=True)
     # --- /ADAPTIVE_QUOTE_SIZE_V1 ---
+
+    # ================================================================
+    # PRIO1_F: KELLY-LIKE SIZING
+    # Ajuste le montant APRÈS l'ADAPTIVE_QUOTE en fonction du score.
+    # Mode: SIZING_MODE=kelly (activé) ou legacy (défaut, pas de changement).
+    # Ne fait que réduire, jamais augmenter.
+    # Multiplicateur circuit breaker (_cb_size_mult) aussi appliqué ici.
+    # ================================================================
+    try:
+        _sm = os.getenv("SIZING_MODE", "legacy").strip().lower()
+        if _sm == "kelly":
+            _k_score = float(cand.get("score_total", cand.get("score", 0)) or 0)
+            _k_wr = float(os.getenv("KELLY_WIN_RATE", "0.35"))
+            _k_wl = float(os.getenv("KELLY_WIN_LOSS", "2.5"))
+            _k_max_single_pct = float(os.getenv("MAX_SINGLE_POSITION_PCT", "0.05"))
+
+            # Score-based multiplier (ne fait que réduire)
+            if _k_score >= 80:
+                _k_mult = 1.0
+            elif _k_score >= 60:
+                _k_mult = 0.75
+            elif _k_score >= 45:
+                _k_mult = 0.50
+            else:
+                _k_mult = 0.30  # minimum, pas 0 (on laisse ADAPTIVE_QUOTE décider du plancher)
+
+            # Kelly fraction (informationnel, clamp prudent)
+            _k_f = (_k_wr * _k_wl - (1.0 - _k_wr)) / max(0.01, _k_wl)
+            _k_half = max(0.0, _k_f / 2.0)
+            # On n'utilise pas directement Kelly pour la taille absolue (trop risqué),
+            # mais on utilise score_mult * circuit_breaker_mult
+            _k_final_mult = _k_mult * _cb_size_mult
+
+            if _k_final_mult < 1.0:
+                _k_before = int(amount_lamports)
+                amount_lamports = max(1, int(amount_lamports * _k_final_mult))
+                _k_before_sol = _k_before / 1_000_000_000
+                _k_after_sol = amount_lamports / 1_000_000_000
+                print(
+                    f"   📊 SIZING_KELLY: score={_k_score:.0f} mult={_k_mult:.2f} "
+                    f"cb={_cb_size_mult:.2f} final={_k_final_mult:.2f} "
+                    f"→ {_k_after_sol:.6f} SOL (was {_k_before_sol:.6f}) "
+                    f"kelly_f={_k_half:.3f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"   📊 SIZING_KELLY: score={_k_score:.0f} mult=1.0 (no reduction) kelly_f={_k_half:.3f}",
+                    flush=True,
+                )
+        elif _cb_size_mult < 1.0:
+            # Mode legacy mais circuit breaker actif → appliquer le mult
+            _k_before = int(amount_lamports)
+            amount_lamports = max(1, int(amount_lamports * _cb_size_mult))
+            print(f"   📊 SIZING_LEGACY: cb_mult={_cb_size_mult:.2f} → {amount_lamports/1e9:.6f} SOL", flush=True)
+    except Exception as _k_e:
+        try:
+            print(f"   ⚠️ SIZING_KELLY failed (fail-open): {_k_e}", flush=True)
+        except Exception:
+            pass
+    # --- /PRIO1_F: KELLY SIZING ---
 
     # --- HIST_BAD_HOOK_APPLIED_V2 ---
     try:
