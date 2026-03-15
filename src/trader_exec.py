@@ -611,16 +611,26 @@ def _get_balance_lamports(rpc_http: str, pubkey: str) -> int:
 
 
 
+# P12: READY_CANONICAL est la SEULE source fiable (scorée, filtrée, avec metadata).
+# Le fallback vers ready_to_trade.jsonl brut causait:
+#   - too_old leaking (tokens 28j dans le raw)
+#   - metadata garbage (liq=$0, score=0 dans adaptive quote)
+#   - pick aléatoire de tokens sans scoring
+# On utilise CANONICAL avec un seuil large (10min) car le merger tourne toutes les ~30s.
+# Si CANONICAL est vraiment trop vieux, mieux vaut skip que trader du garbage.
+_CANONICAL_MAX_AGE_S = int(os.getenv("CANONICAL_MAX_AGE_S", "600"))  # 10 min
 READY_FILE = Path(os.getenv("READY_FILE", "ready_to_trade.jsonl"))
-# P3: Prefer READY_CANONICAL (merged onchain+ready) if available
 try:
     _canonical = Path(os.getenv("READY_CANONICAL_FILE", "state/READY_CANONICAL.jsonl"))
     if _canonical.exists() and _canonical.stat().st_size > 10:
-        # Only use if fresh (< 5 min old)
         _canonical_age = int(time.time()) - int(_canonical.stat().st_mtime)
-        if _canonical_age < 300:
+        if _canonical_age < _CANONICAL_MAX_AGE_S:
             READY_FILE = _canonical
             print(f"   ready_file= (from READY_CANONICAL) age={_canonical_age}s", flush=True)
+        else:
+            # CANONICAL trop vieux → on l'utilise QUAND MÊME (mieux que raw) mais on log un warning
+            READY_FILE = _canonical
+            print(f"   ⚠️ ready_file= (READY_CANONICAL STALE age={_canonical_age}s > {_CANONICAL_MAX_AGE_S}s, still better than raw)", flush=True)
 except Exception:
     pass
 # Prefer brain-scored file if available (overrides canonical if explicitly set)
@@ -686,8 +696,14 @@ def _headers() -> Dict[str, str]:
 
 
 def _load_ready() -> list[dict]:
+    """Charge READY et filtre les candidats trop vieux inline.
+    P12: dernière défense contre too_old leaking dans trader_exec.
+    """
     if not READY_FILE.exists():
         return []
+    _now_lr = int(time.time())
+    _max_age_lr = int(os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600"))
+    _stale_count = 0
     out = []
     with READY_FILE.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -695,9 +711,17 @@ def _load_ready() -> list[dict]:
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                row = json.loads(line)
+                # P12: filtre age inline — les tokens trop vieux ne doivent JAMAIS atteindre le pick
+                _row_ts = int(row.get("ts", 0) or 0)
+                if _row_ts > 0 and (_now_lr - _row_ts) > _max_age_lr:
+                    _stale_count += 1
+                    continue
+                out.append(row)
             except Exception:
                 continue
+    if _stale_count > 0:
+        print(f"   🗑️ _load_ready: filtered {_stale_count} stale rows (age>{_max_age_lr}s)", flush=True)
     return out
 
 

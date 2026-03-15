@@ -280,17 +280,24 @@ async def trader_loop():
                 # EXPOSURE_V3: enregistrer l'achat par mint dans le registre actif
                 try:
                     from core.security_gate import exposure_add as _exp_add
-                    _meta_path = os.path.join(os.getenv("HEARTBEAT_DIR", "."), "last_swap_meta.json")
-                    if not os.path.exists(_meta_path):
-                        _meta_path = "last_swap_meta.json"
-                    try:
-                        with open(_meta_path, "r", encoding="utf-8") as _mf:
-                            _meta = json.load(_mf)
-                        _bought_mint = str(_meta.get("outputMint", "")).strip()
-                        if _bought_mint:
-                            _exp_add(_bought_mint)
-                    except FileNotFoundError:
-                        print("⚠️ EXPOSURE_V3: last_swap_meta.json not found (skip)", flush=True)
+                    # OUT_META dans trader_exec = "last_swap_meta.json" (CWD)
+                    # Chercher dans CWD d'abord, puis state/
+                    _bought_mint = ""
+                    for _mp in ["last_swap_meta.json",
+                                os.path.join(os.getenv("HEARTBEAT_DIR", "state"), "last_swap_meta.json")]:
+                        try:
+                            if os.path.exists(_mp):
+                                with open(_mp, "r", encoding="utf-8") as _mf:
+                                    _meta = json.load(_mf)
+                                _bought_mint = str(_meta.get("outputMint", "")).strip()
+                                if _bought_mint:
+                                    break
+                        except Exception:
+                            continue
+                    if _bought_mint:
+                        _exp_add(_bought_mint)
+                    else:
+                        print("⚠️ EXPOSURE_V3: no outputMint found in last_swap_meta.json", flush=True)
                 except Exception as _ev3_e:
                     print(f"⚠️ EXPOSURE_V3: record failed (non-fatal): {_ev3_e}", flush=True)
                 print(f"📊 RATE_LIMIT: recorded trade rc=2 (total={len(_trade_timestamps)} in window)", flush=True)
