@@ -73,6 +73,12 @@ MIN_LIQ_USD = float(os.getenv("MERGER_MIN_LIQ_USD", "2000"))
 MAX_CANDIDATES = int(os.getenv("MERGER_MAX_CANDIDATES", "100"))
 ONCHAIN_WINDOW = int(os.getenv("MERGER_ONCHAIN_WINDOW", "900"))
 
+# FAST_LANE: seuils pour candidats élite ultra-frais (bypass prioritaire)
+FAST_LANE_MAX_AGE_SEC = int(os.getenv("FAST_LANE_MAX_AGE_SEC", "120"))
+FAST_LANE_MIN_SCORE = float(os.getenv("FAST_LANE_MIN_SCORE", "40"))
+FAST_LANE_MIN_LIQ_USD = float(os.getenv("FAST_LANE_MIN_LIQ_USD", "3000"))
+FAST_LANE_MAX_IMPACT_PCT = float(os.getenv("FAST_LANE_MAX_IMPACT_PCT", "5.0"))
+
 # P8: prix SOL estimé (configurable) pour conversion liq_sol → USD
 ESTIMATED_SOL_USD = float(os.getenv("MERGER_SOL_PRICE_USD", "150.0"))
 
@@ -529,11 +535,43 @@ def merge_candidates(
         result.append(cand)
         _reject_reasons["accepted"] += 1
 
-    # P9: log diagnostic des rejets
+    # ================================================================
+    # FAST_LANE: marquer les candidats élite ultra-frais
+    # Critères: age <= FAST_LANE_MAX_AGE_SEC, score >= FAST_LANE_MIN_SCORE,
+    #   jupiter_route=True, liq >= FAST_LANE_MIN_LIQ_USD,
+    #   impact < FAST_LANE_MAX_IMPACT_PCT, pas de flags toxiques
+    # ================================================================
+    _toxic_flags = {"no_liq", "not_tradable", "dev_blacklisted", "freeze_auth", "high_impact", "dev_rugged"}
+    _fl_count = 0
+    import time as _fl_t
+    _fl_now = _fl_t.time()
+    for cand in result:
+        cand["_fast_lane"] = False  # défaut
+        try:
+            _fl_age = int(cand.get("age_seconds", 9999) or 9999)
+            _fl_score = float(cand.get("score_total", 0) or 0)
+            _fl_liq = float(cand.get("_liq_usd", 0) or 0)
+            _fl_impact = float(cand.get("_price_impact", 999) or 999)
+            _fl_jup = cand.get("_jupiter_route")
+            _fl_flags = set(cand.get("risk_flags", []))
+
+            if (_fl_age <= FAST_LANE_MAX_AGE_SEC
+                    and _fl_score >= FAST_LANE_MIN_SCORE
+                    and _fl_jup is True
+                    and _fl_liq >= FAST_LANE_MIN_LIQ_USD
+                    and _fl_impact < FAST_LANE_MAX_IMPACT_PCT
+                    and not _fl_flags.intersection(_toxic_flags)):
+                cand["_fast_lane"] = True
+                _fl_count += 1
+        except Exception:
+            pass
+
+    # P9: log diagnostic des rejets + fast_lane
     _total_before = len(by_mint)
     try:
         print(
             f"  🔀 merger filter: total={_total_before} accepted={_reject_reasons['accepted']}"
+            f" fast_lane={_fl_count}"
             f" no_liq={_reject_reasons['no_liq']}"
             f" low_score={_reject_reasons['low_score']}"
             f" low_liq={_reject_reasons['low_liq']}"
@@ -547,16 +585,16 @@ def merge_candidates(
     except Exception:
         pass
 
-    # Tri par freshness d'abord (ts desc), puis score pour départager
-    # Les tokens les plus récents ont la priorité pour le snipe
-    import time as _sort_t
-    _sort_now = _sort_t.time()
+    # Tri: FAST_LANE d'abord, puis freshness, puis score
+    # Les candidats fast_lane sont TOUJOURS en tête du fichier
+    _sort_now = _fl_now
     def _sort_key(x):
+        _is_fl = 1 if x.get("_fast_lane") else 0
         _ts = float(x.get("ts", 0) or 0)
         _age = _sort_now - _ts if _ts > 0 else 999999
         _score = float(x.get("score_total", 0))
-        # Priorité: fraîcheur (inversée, les plus récents d'abord), puis score
-        return (-_age, _score)
+        # Priorité: fast_lane (1 avant 0), fraîcheur, score
+        return (_is_fl, -_age, _score)
     result.sort(key=_sort_key, reverse=True)
 
     # Limiter
@@ -592,6 +630,7 @@ def write_canonical(candidates: List[Dict[str, Any]], path: str = "") -> int:
             "tx_velocity": cand.get("_tx_velocity", 0),
             "holders_estimate": cand.get("_holders_estimate", 0),
             "risk_flags": cand.get("risk_flags", []),
+            "fast_lane": bool(cand.get("_fast_lane", False)),
             "vol_5m": float(cand.get("vol_5m", cand.get("volume_5m_usd", 0)) or 0),
             "vol_1h": float(cand.get("vol_1h", 0) or 0),
             "vol_24h": float(cand.get("vol_24h", 0) or 0),
@@ -671,8 +710,9 @@ def run_merge() -> int:
         liq = c.get("_liq_usd", 0)
         src = c.get("_source", "?")
         jup = "✓" if c.get("_jupiter_route") else ("✗" if c.get("_jupiter_route") is False else "?")
+        fl = "⚡FL" if c.get("_fast_lane") else ""
         flags = ",".join(c.get("risk_flags", [])) or "-"
-        print(f"    {i+1}. {sym:>10} ({mint}…) score={sc:.0f} liq=${liq:,.0f} src={src} jup={jup} flags={flags}", flush=True)
+        print(f"    {i+1}. {sym:>10} ({mint}…) score={sc:.0f} liq=${liq:,.0f} src={src} jup={jup} {fl} flags={flags}", flush=True)
 
     return n
 

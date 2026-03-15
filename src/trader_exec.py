@@ -1096,6 +1096,12 @@ def main() -> int:
             cand = cand2
             output_mint = (cand.get('outputMint') or cand.get('mint') or cand.get('address') or '').strip()
             print(f"   repick -> {output_mint}")
+    # --- FAST_LANE_LOG ---
+    _cand_is_fast_lane = bool(cand.get("fast_lane", False))
+    if _cand_is_fast_lane:
+        print(f"   ⚡ FAST_LANE candidate selected: {output_mint} score={cand.get('score_total', '?')} age={cand.get('age_seconds', '?')}s", flush=True)
+    # --- /FAST_LANE_LOG ---
+
     FORCE_OUTPUT_MINT = os.getenv("FORCE_OUTPUT_MINT")
     if FORCE_OUTPUT_MINT:
         output_mint = FORCE_OUTPUT_MINT.strip()
@@ -1295,6 +1301,81 @@ def main() -> int:
         return 0
     # --- /amount_lamports guard (v2) ---
     print(f"   pick= {output_mint} amount_lamports= {amount_lamports}", flush=True)
+
+    # ================================================================
+    # ADAPTIVE_QUOTE_SIZE_V1: réduire le montant si liquidité/impact/score faibles
+    # Ne JAMAIS augmenter au-delà du montant configuré. Seulement réduire.
+    # Env vars:
+    #   ADAPTIVE_QUOTE_ENABLED (default 1)
+    #   ADAPTIVE_QUOTE_MIN_PCT (default 25) — plancher en % du montant de base
+    #   ADAPTIVE_QUOTE_LIQ_THRESHOLD_USD (default 10000) — sous ce seuil, downsizing
+    #   ADAPTIVE_QUOTE_IMPACT_THRESHOLD_PCT (default 3.0) — au-dessus, downsizing
+    # ================================================================
+    _aq_base_lamports = int(amount_lamports)  # garder la valeur de base avant modif
+    try:
+        _aq_enabled = os.getenv("ADAPTIVE_QUOTE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        if _aq_enabled:
+            _aq_min_pct = max(10, int(os.getenv("ADAPTIVE_QUOTE_MIN_PCT", "25")))
+            _aq_liq_thresh = float(os.getenv("ADAPTIVE_QUOTE_LIQ_THRESHOLD_USD", "10000"))
+            _aq_impact_thresh = float(os.getenv("ADAPTIVE_QUOTE_IMPACT_THRESHOLD_PCT", "3.0"))
+
+            # Lire les données du candidat
+            _aq_liq = float(cand.get("liquidity_usd", cand.get("_liq_usd", 0)) or 0)
+            _aq_impact = float(cand.get("price_impact_estimate",
+                          cand.get("jup_price_impact_pct",
+                          cand.get("_price_impact", -1))) or -1)
+            _aq_score = float(cand.get("score_total", cand.get("score", 0)) or 0)
+            _aq_fast_lane = bool(cand.get("fast_lane", False))
+
+            _aq_pct = 100  # commence à 100%
+            _aq_reasons = []
+
+            # Facteur 1: Liquidité basse → downsizing proportionnel
+            if _aq_liq > 0 and _aq_liq < _aq_liq_thresh:
+                # Ratio linéaire: liq=0 → min_pct%, liq=threshold → 100%
+                _aq_liq_ratio = max(_aq_min_pct, int((_aq_liq / _aq_liq_thresh) * 100))
+                if _aq_liq_ratio < _aq_pct:
+                    _aq_pct = _aq_liq_ratio
+                    _aq_reasons.append(f"low_liq=${_aq_liq:.0f}<{_aq_liq_thresh:.0f}")
+
+            # Facteur 2: Impact élevé → downsizing
+            if _aq_impact > 0 and _aq_impact > _aq_impact_thresh:
+                # impact 3% → 80%, impact 5% → 60%, impact 10% → 40%, impact 20%+ → min_pct
+                _aq_impact_ratio = max(_aq_min_pct, int(100 - ((_aq_impact - _aq_impact_thresh) * 10)))
+                if _aq_impact_ratio < _aq_pct:
+                    _aq_pct = _aq_impact_ratio
+                    _aq_reasons.append(f"high_impact={_aq_impact:.1f}%>{_aq_impact_thresh:.1f}%")
+
+            # Facteur 3: Score très bas → downsizing conservateur
+            if _aq_score < 25 and _aq_score > 0:
+                # score <25 → proportionnel: score=10→40%, score=20→80%
+                _aq_score_ratio = max(_aq_min_pct, int((_aq_score / 25.0) * 100))
+                if _aq_score_ratio < _aq_pct:
+                    _aq_pct = _aq_score_ratio
+                    _aq_reasons.append(f"low_score={_aq_score:.0f}")
+
+            # Bonus: fast_lane candidats gardent minimum 80%
+            if _aq_fast_lane and _aq_pct < 80:
+                _aq_pct = 80
+                _aq_reasons.append("fast_lane_floor=80%")
+
+            # Appliquer le plancher
+            _aq_pct = max(_aq_min_pct, min(100, _aq_pct))
+
+            if _aq_pct < 100:
+                _aq_new = max(1, int(_aq_base_lamports * _aq_pct / 100))
+                _aq_base_sol = _aq_base_lamports / 1_000_000_000
+                _aq_new_sol = _aq_new / 1_000_000_000
+                amount_lamports = _aq_new
+                print(f"   📐 ADAPTIVE_QUOTE: {_aq_pct}% → {_aq_new_sol:.6f} SOL (base={_aq_base_sol:.6f}) reasons=[{', '.join(_aq_reasons)}]", flush=True)
+            else:
+                print(f"   📐 ADAPTIVE_QUOTE: 100% (full size, no downsize needed) liq=${_aq_liq:.0f} impact={_aq_impact:.1f}% score={_aq_score:.0f}", flush=True)
+        else:
+            print("   📐 ADAPTIVE_QUOTE: OFF (set ADAPTIVE_QUOTE_ENABLED=1)", flush=True)
+    except Exception as _aq_e:
+        print(f"   ⚠️ ADAPTIVE_QUOTE failed (fail-open, using base amount): {_aq_e}", flush=True)
+    # --- /ADAPTIVE_QUOTE_SIZE_V1 ---
+
     # --- HIST_BAD_HOOK_APPLIED_V2 ---
     try:
         _hs, _hmsg, _hn, _havg, _hsec = _hist_bad_should_skip(output_mint)
