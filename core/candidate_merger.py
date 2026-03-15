@@ -117,6 +117,10 @@ def load_ready_candidates() -> List[Dict[str, Any]]:
             else:
                 return []
 
+        # P11: si le candidat n'a pas de ts, utiliser le mtime du fichier source
+        # Ceci permet au filtre too_old de fonctionner même pour les READY sans timestamp
+        _file_mtime = int(p.stat().st_mtime)
+
         with p.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 line = line.strip()
@@ -129,6 +133,10 @@ def load_ready_candidates() -> List[Dict[str, Any]]:
                         if mint and len(mint) >= 32 and mint not in IGNORE_MINTS:
                             obj["_source"] = "ready"
                             obj["_mint"] = mint
+                            # P11: garantir un ts pour le filtre too_old
+                            _obj_ts = int(obj.get("ts", obj.get("block_time", 0)) or 0)
+                            if _obj_ts <= 0:
+                                obj["ts"] = _file_mtime
                             candidates.append(obj)
                 except Exception:
                     continue
@@ -478,16 +486,52 @@ def merge_candidates(
         else:
             by_mint[mint] = scored
 
+    # P11: charger skip_mints + RL_SKIP en amont pour éviter les subprocess inutiles
+    _skip_mints: Set[str] = set()
+    _rl_skip_active: Set[str] = set()
+    try:
+        import json as _sj
+        _skip_path = os.getenv("TRADER_SKIP_MINTS_FILE",
+                     os.getenv("SKIP_MINTS_FILE", "state/skip_mints_trader.txt"))
+        if os.path.exists(_skip_path):
+            with open(_skip_path, "r", encoding="utf-8", errors="ignore") as _sf:
+                for _ln in _sf:
+                    _ln = _ln.strip()
+                    if _ln and not _ln.startswith("#"):
+                        _skip_mints.add(_ln)
+    except Exception:
+        pass
+    try:
+        _rl_path = os.getenv("RL_SKIP_FILE", "state/rl_skip_mints.json")
+        if os.path.exists(_rl_path):
+            with open(_rl_path, "r", encoding="utf-8", errors="ignore") as _rf:
+                _rl_data = json.loads(_rf.read() or "{}")
+            _now_rl = int(time.time())
+            for _m, _until in _rl_data.items():
+                try:
+                    if int(_until) > _now_rl:
+                        _rl_skip_active.add(str(_m))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _pre_skip_total = len(_skip_mints) + len(_rl_skip_active)
+
     # P9: Filtrage final avec logs de rejet detailles
     result = []
     _reject_reasons = {"low_score": 0, "low_liq": 0, "no_liq": 0, "not_tradable": 0,
                        "blacklisted": 0, "freeze": 0, "high_impact_unknown": 0,
-                       "too_old": 0, "accepted": 0}
+                       "too_old": 0, "pre_skipped": 0, "accepted": 0}
     _max_impact_merger = float(os.getenv("MERGER_MAX_IMPACT_PCT", "50.0"))
     _max_cand_age = int(os.getenv("MERGER_MAX_CANDIDATE_AGE_SEC",
                                    os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600")))
 
     for mint, cand in by_mint.items():
+        # P11: skip_mints + RL_SKIP filtre en amont (évite subprocess inutile)
+        if mint in _skip_mints or mint in _rl_skip_active:
+            _reject_reasons["pre_skipped"] += 1
+            continue
+
         score = cand.get("score_total", 0)
         liq = cand.get("_liq_usd", 0)
         sym = cand.get("symbol", "?")[:10]
@@ -572,6 +616,7 @@ def merge_candidates(
         print(
             f"  🔀 merger filter: total={_total_before} accepted={_reject_reasons['accepted']}"
             f" fast_lane={_fl_count}"
+            f" pre_skipped={_reject_reasons['pre_skipped']}"
             f" no_liq={_reject_reasons['no_liq']}"
             f" low_score={_reject_reasons['low_score']}"
             f" low_liq={_reject_reasons['low_liq']}"
@@ -636,7 +681,8 @@ def write_canonical(candidates: List[Dict[str, Any]], path: str = "") -> int:
             "vol_24h": float(cand.get("vol_24h", 0) or 0),
             "onchain_also": bool(cand.get("_onchain_also")),
             "ready_also": bool(cand.get("_ready_also", cand.get("in_ready_file", 0))),
-            "ts": int(time.time()),
+            "ts": int(cand.get("ts", cand.get("block_time", 0)) or 0),
+            "merger_ts": int(time.time()),
         }
         # Garder les champs du ready original utiles pour trader_exec
         for k in ("outputMint", "address", "amount_lamports", "score",

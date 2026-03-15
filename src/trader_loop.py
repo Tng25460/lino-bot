@@ -277,6 +277,22 @@ async def trader_loop():
             if rc == 2:
                 _rate_limit_record()
                 _exposure_record()
+                # EXPOSURE_V3: enregistrer l'achat par mint dans le registre actif
+                try:
+                    from core.security_gate import exposure_add as _exp_add
+                    _meta_path = os.path.join(os.getenv("HEARTBEAT_DIR", "."), "last_swap_meta.json")
+                    if not os.path.exists(_meta_path):
+                        _meta_path = "last_swap_meta.json"
+                    try:
+                        with open(_meta_path, "r", encoding="utf-8") as _mf:
+                            _meta = json.load(_mf)
+                        _bought_mint = str(_meta.get("outputMint", "")).strip()
+                        if _bought_mint:
+                            _exp_add(_bought_mint)
+                    except FileNotFoundError:
+                        print("⚠️ EXPOSURE_V3: last_swap_meta.json not found (skip)", flush=True)
+                except Exception as _ev3_e:
+                    print(f"⚠️ EXPOSURE_V3: record failed (non-fatal): {_ev3_e}", flush=True)
                 print(f"📊 RATE_LIMIT: recorded trade rc=2 (total={len(_trade_timestamps)} in window)", flush=True)
             # normalize_rc2_v1
             if rc == 2:

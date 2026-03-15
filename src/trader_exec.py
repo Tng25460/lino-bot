@@ -392,21 +392,32 @@ def _holding_cache_get_recent_ui(mint: str) -> float:
 def _pick_best_scored_ready(rows: list[dict]) -> dict | None:
     if not rows:
         return None
-        # RL_SKIP filter
+    # RL_SKIP filter (P11: code mort fixé, était après return None)
+    try:
+        _before = len(rows)
+        rows = [r for r in rows if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or ''))]
+        _after = len(rows)
+        if _after != _before:
+            print(f"🧊 RL_SKIP filtered {_before-_after} rows", flush=True)
+        if not rows:
+            return None
+    except Exception as _e:
+        print('⚠️ RL_SKIP filter failed:', _e, flush=True)
+
+    # P11: utiliser score_total (READY_CANONICAL) avec fallback score (legacy READY)
+    def _get_score(r):
         try:
-            _before = len(rows)
-            rows = [r for r in rows if not _rl_skip_is(str(r.get('mint') or r.get('output_mint') or ''))]
-            _after = len(rows)
-            if _after != _before:
-                print(f"🧊 RL_SKIP filtered {_before-_after} rows", flush=True)
-        except Exception as _e:
-            print('⚠️ RL_SKIP filter failed:', _e, flush=True)
-    rows2 = sorted(rows, key=lambda r: float(r.get("score") or -1e9), reverse=True)
+            return float(r.get("score_total") or r.get("score") or 0)
+        except Exception:
+            return 0.0
+
+    # P11: fast_lane candidates toujours en tête
+    rows2 = sorted(rows, key=lambda r: (1 if r.get("fast_lane") else 0, _get_score(r)), reverse=True)
     k = max(1, int(SCORED_TOPK))
     top = rows2[:k]
 
     import random
-    scores = [float(r.get("score") or 0.0) for r in top]
+    scores = [_get_score(r) for r in top]
     mn = min(scores) if scores else 0.0
     weights = [(s - mn + 1e-6) for s in scores]
     try:
