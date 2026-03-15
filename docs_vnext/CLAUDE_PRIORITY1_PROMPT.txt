@@ -1,0 +1,163 @@
+You are working on BOT LINO, a live Solana trading bot. Your job is NOT to explain in theory. Your job is to MODIFY THE CODEBASE directly and completely, in one pass, with production-grade patches.
+
+CRITICAL RULES
+- Reply in FRENCH.
+- Output ONLY Ubuntu-ready commands / code blocks to paste.
+- No long explanations unless strictly necessary.
+- Prefer one or few copy-paste blocks.
+- Make the changes directly in the existing repo structure.
+- Keep the current live bot logic working unless explicitly replacing it.
+- Do not ask me to do analysis first. Do the implementation plan and code changes now.
+- Never touch stablecoins logic for picks: token-only only.
+- Preserve the recent fixes already working:
+  - EXPOSURE_V3 mint-keyed runtime registry
+  - no fallback raw READY bug fixed
+  - sanitation / READY freshness / PRE_QUOTE_REJECT protections
+  - FAST_LANE behavior
+  - ADAPTIVE_QUOTE currently working
+  - RC=2-only trade counting
+- Do NOT reintroduce DB -> active_exposure migration logic.
+
+CONTEXT
+Repo:
+ /home/tng25/lino_FINAL_20260203_182626
+
+Current objective:
+ Build the strongest possible BOT LINO vNext, but incrementally and safely.
+ We want the highest ROI upgrades first, without breaking the currently working production logic.
+
+ALREADY CHOSEN PRIORITIES
+PRIORITE 1
+- multi-RPC parallel send
+- breakeven stop
+- time-decay exit
+- drawdown circuit breaker
+- post-trade logger
+- Kelly sizing
+
+PRIORITE 2
+- trader_exec in-process
+- state central in-memory
+- main.py asyncio
+- suppression subprocess
+
+PRIORITE 3
+- websocket logsSubscribe
+- sell engine adaptatif par phase
+- score recalibration
+- dev wallet monitoring
+
+WHAT I WANT FROM YOU NOW
+I want you to IMPLEMENT PRIORITE 1 completely in the real codebase.
+That means:
+1. inspect the current repo files
+2. detect exact insertion points
+3. patch the code directly
+4. provide Ubuntu-ready commands to:
+   - create backups
+   - apply code changes
+   - run syntax checks
+   - restart safely if needed
+   - validate via grep/logs/sqlite
+5. if a feature needs a new file/module, create it
+6. keep changes minimal but production-grade
+7. use feature flags / env vars where smart
+8. do not break current runtime behavior
+
+PRIORITE 1 SPECIFICATIONS
+
+A) MULTI-RPC PARALLEL SEND
+- Add support for multiple RPC endpoints for sending transactions.
+- Keep current RPC as primary if present.
+- Add optional env vars such as:
+  - RPC_SEND_ENDPOINTS
+  - RPC_SEND_PARALLEL_ENABLED
+- If enabled, send transaction to multiple endpoints in parallel and accept first success.
+- Read-only RPC can still stay current for now if simpler.
+- Must fail safe: if parallel send fails, fallback to primary single send.
+- Add concise logs:
+  - RPC_PARALLEL_SEND enabled=...
+  - RPC_SEND winner=...
+  - RPC_SEND fallback_primary
+- Avoid breaking existing send path.
+
+B) BREAKEVEN STOP
+- In sell engine, when price reaches +15% above entry, activate breakeven protection.
+- Once active, if price comes back near entry (entry + fees buffer), exit remaining position.
+- Add logs:
+  - BREAKEVEN_ARM
+  - BREAKEVEN_HIT
+- Must not fight with existing TP1/TP2 logic incorrectly.
+
+C) TIME-DECAY EXIT
+- Add progressive exit rules:
+  - after 3 min, if pnl < +3%, exit
+  - after 10 min, if pnl < +10%, exit
+  - after 20 min, optional partial forced trim
+- Must be feature-flagged in env.
+- Add logs:
+  - TIME_DECAY_ARM
+  - TIME_DECAY_EXIT
+- Keep existing TIME_STOP compatibility or replace carefully if cleaner.
+
+D) DRAWDOWN CIRCUIT BREAKER
+- Add simple robust portfolio protection:
+  - if daily realized pnl drawdown breaches threshold, reduce buy size or block buys
+- Start simple and safe:
+  - daily drawdown soft limit => reduce buy size
+  - daily drawdown hard limit => skip buys temporarily
+- Use env vars:
+  - CIRCUIT_BREAKER_ENABLED
+  - DD_SOFT_PCT
+  - DD_HARD_PCT
+- Add logs:
+  - CIRCUIT_BREAKER soft
+  - CIRCUIT_BREAKER hard
+- Fail safe if PnL info unavailable.
+
+E) POST-TRADE LOGGER
+- Create a lightweight trade analysis logger.
+- On trade close, append a JSONL record with:
+  - mint
+  - entry_ts
+  - exit_ts
+  - pnl_pct
+  - hold_time_min
+  - exit_reason
+  - score_at_entry if available
+- Store in state/post_trade_log.jsonl
+- Must not crash bot if logging fails.
+- Add concise log:
+  - POST_TRADE_LOGGED
+
+F) KELLY-LIKE SIZING
+- Replace or extend current sizing logic with a safer formal structure.
+- Keep it practical, not academic.
+- Use env vars and caps:
+  - SIZING_MODE=legacy|kelly
+  - KELLY_WIN_RATE
+  - KELLY_WIN_LOSS
+  - MAX_SINGLE_POSITION_PCT
+- Final size must respect:
+  - base configured buy amount
+  - max open positions / exposure
+  - liquidity constraints already present
+- If too risky, clamp downward only.
+- Never increase size aggressively by default.
+- Add concise log:
+  - SIZING_KELLY
+- Keep legacy fallback.
+
+OUTPUT FORMAT REQUIRED
+- First give one short diagnostic summary in French.
+- Then give ONE OR FEW BIG UBUNTU COPY-PASTE BLOCKS only.
+- Each block must be ready to paste.
+- Do not give pseudo-code only.
+- Do not ask me to manually inspect files first.
+- Actually patch the repo.
+
+IMPORTANT
+- Do not touch PRIORITE 2 / PRIORITE 3 yet.
+- Do not redesign everything now.
+- Do not break working production fixes.
+- Do not add unnecessary complexity.
