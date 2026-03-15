@@ -1,3 +1,9 @@
+# AUTO_RESYNC_ACTIVE_EXPOSURE_V2
+if [ -x scripts/resync_active_exposure_from_log.py ]; then
+  echo "♻️ RESYNC active_exposure from last sell_engine log"
+  python3 scripts/resync_active_exposure_from_log.py || true
+fi
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -51,6 +57,7 @@ if [[ -f "$LOCK_FILE" ]]; then
     exit 1
   fi
   rm -f "$LOCK_FILE" || true
+
 fi
 
 echo $$ > "$LOCK_FILE"
