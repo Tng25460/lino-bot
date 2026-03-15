@@ -272,11 +272,12 @@ async def trader_loop():
             ).returncode
 
             print(f"TRADER_EXEC_RC={rc}", flush=True)
-            # RATE_LIMITER_V1: enregistrer le trade si tx envoyée (rc=2) ou succès (rc=0)
-            if rc in (0, 2):
+            # RATE_LIMITER_V2: SEUL rc=2 = tx réellement envoyée (SystemExit(2) dans trader_exec)
+            # rc=0 = aucun candidat / skip / reject — NE PAS compter comme trade
+            if rc == 2:
                 _rate_limit_record()
                 _exposure_record()
-                print(f"📊 RATE_LIMIT: recorded trade (total={len(_trade_timestamps)} in window)", flush=True)
+                print(f"📊 RATE_LIMIT: recorded trade rc=2 (total={len(_trade_timestamps)} in window)", flush=True)
             # normalize_rc2_v1
             if rc == 2:
                 rc = 0

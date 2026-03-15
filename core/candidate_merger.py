@@ -475,8 +475,11 @@ def merge_candidates(
     # P9: Filtrage final avec logs de rejet detailles
     result = []
     _reject_reasons = {"low_score": 0, "low_liq": 0, "no_liq": 0, "not_tradable": 0,
-                       "blacklisted": 0, "freeze": 0, "high_impact_unknown": 0, "accepted": 0}
+                       "blacklisted": 0, "freeze": 0, "high_impact_unknown": 0,
+                       "too_old": 0, "accepted": 0}
     _max_impact_merger = float(os.getenv("MERGER_MAX_IMPACT_PCT", "50.0"))
+    _max_cand_age = int(os.getenv("MERGER_MAX_CANDIDATE_AGE_SEC",
+                                   os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600")))
 
     for mint, cand in by_mint.items():
         score = cand.get("score_total", 0)
@@ -484,6 +487,18 @@ def merge_candidates(
         sym = cand.get("symbol", "?")[:10]
         src = cand.get("_source", "?")
         flags = cand.get("risk_flags", [])
+
+        # P10: filtrage age EN AMONT — évite que trader_exec gaspille un cycle
+        try:
+            _cand_ts = int(cand.get("ts", 0) or 0)
+            if _cand_ts > 0 and _max_cand_age > 0:
+                import time as _t
+                _cand_age = int(_t.time()) - _cand_ts
+                if _cand_age > _max_cand_age:
+                    _reject_reasons["too_old"] += 1
+                    continue
+        except Exception:
+            pass
 
         # Filtres d'exclusion avec log de rejet
         if score < MIN_SCORE:
@@ -525,14 +540,24 @@ def merge_candidates(
             f" not_tradable={_reject_reasons['not_tradable']}"
             f" blacklisted={_reject_reasons['blacklisted']}"
             f" freeze={_reject_reasons['freeze']}"
-            f" high_impact={_reject_reasons['high_impact_unknown']}",
+            f" high_impact={_reject_reasons['high_impact_unknown']}"
+            f" too_old={_reject_reasons['too_old']}",
             flush=True,
         )
     except Exception:
         pass
 
-    # Tri par score decroissant
-    result.sort(key=lambda x: float(x.get("score_total", 0)), reverse=True)
+    # Tri par freshness d'abord (ts desc), puis score pour départager
+    # Les tokens les plus récents ont la priorité pour le snipe
+    import time as _sort_t
+    _sort_now = _sort_t.time()
+    def _sort_key(x):
+        _ts = float(x.get("ts", 0) or 0)
+        _age = _sort_now - _ts if _ts > 0 else 999999
+        _score = float(x.get("score_total", 0))
+        # Priorité: fraîcheur (inversée, les plus récents d'abord), puis score
+        return (-_age, _score)
+    result.sort(key=_sort_key, reverse=True)
 
     # Limiter
     result = result[:MAX_CANDIDATES]
