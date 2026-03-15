@@ -1,0 +1,25 @@
+PRIORITE 1
+- multi-RPC parallel send
+- breakeven stop
+- time-decay exit
+- drawdown circuit breaker
+- post-trade logger
+- kelly sizing
+
+PRIORITE 2
+- trader_exec in-process
+- state central in-memory
+- main.py asyncio
+- suppression subprocess
+
+PRIORITE 3
+- websocket logsSubscribe
+- sell engine adaptatif par phase
+- score recalibration
+- dev wallet monitoring
+
+PLUS TARD
+- direct AMM multi-DEX
+- smart wallet tracking
+- social sentiment
+- contextual bandit / RL
