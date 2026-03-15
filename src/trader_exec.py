@@ -725,6 +725,7 @@ def _load_ready() -> list[dict]:
     # d'un run précédent. On exige que merger_ts (écrit par le merger live)
     # soit récent, OU que le fichier ait été modifié récemment.
     _STARTUP_MAX_STALE_S = int(os.getenv("STARTUP_READY_MAX_STALE_S", "120"))  # 2 min
+    _file_age = 0  # P14: init pour accès downstream
     try:
         _file_mtime = int(READY_FILE.stat().st_mtime)
         _file_age = int(time.time()) - _file_mtime
@@ -749,8 +750,9 @@ def _load_ready() -> list[dict]:
 
     _now_lr = int(time.time())
     _max_age_lr = int(os.getenv("P4_MAX_TOKEN_AGE_SEC", "3600"))
-    _stale_count = 0
-    _sanitize_reject = 0
+    # P14: compteurs détaillés par catégorie de rejet
+    _rej = {"invalid_mint": 0, "zero_score": 0, "zero_liq": 0,
+            "toxic_flags": 0, "bad_age": 0, "not_actionable": 0}
     _toxic_flags = {"no_liq", "not_tradable", "dev_blacklisted", "freeze_auth", "dev_rugged"}
     out = []
     with READY_FILE.open("r", encoding="utf-8", errors="ignore") as f:
@@ -761,11 +763,11 @@ def _load_ready() -> list[dict]:
             try:
                 row = json.loads(line)
 
-                # --- P13 HARD SANITATION ---
+                # --- P13/P14 HARD SANITATION with detailed counters ---
                 # 1. Mint valide obligatoire
                 _mint = str(row.get("mint") or row.get("outputMint") or row.get("address") or "").strip()
                 if not _mint or len(_mint) < 20:
-                    _sanitize_reject += 1
+                    _rej["invalid_mint"] += 1
                     continue
 
                 # 2. score_total > 0 obligatoire (sauf fallback score explicite > 0)
@@ -780,7 +782,7 @@ def _load_ready() -> list[dict]:
                     except Exception:
                         _score = 0.0
                 if _score <= 0:
-                    _sanitize_reject += 1
+                    _rej["zero_score"] += 1
                     continue
 
                 # 3. liquidity_usd > 0 obligatoire
@@ -790,7 +792,7 @@ def _load_ready() -> list[dict]:
                 except Exception:
                     pass
                 if _liq <= 0:
-                    _sanitize_reject += 1
+                    _rej["zero_liq"] += 1
                     continue
 
                 # 4. flags toxiques → reject
@@ -804,24 +806,39 @@ def _load_ready() -> list[dict]:
                 except Exception:
                     pass
                 if _flags & _toxic_flags:
-                    _sanitize_reject += 1
+                    _rej["toxic_flags"] += 1
                     continue
 
-                # --- P12: filtre age inline ---
+                # 5. jupiter_ok==False explicite → not actionable
+                _jup_ok = row.get("jupiter_ok")
+                if _jup_ok is False:
+                    _rej["not_actionable"] += 1
+                    continue
+
+                # 6. filtre age inline (P12)
                 _row_ts = int(row.get("ts", 0) or 0)
                 if _row_ts > 0 and (_now_lr - _row_ts) > _max_age_lr:
-                    _stale_count += 1
+                    _rej["bad_age"] += 1
                     continue
 
                 out.append(row)
             except Exception:
                 continue
-    if _stale_count > 0:
-        print(f"   🗑️ _load_ready: filtered {_stale_count} stale rows (age>{_max_age_lr}s)", flush=True)
-    if _sanitize_reject > 0:
-        print(f"   🗑️ _load_ready: SANITIZE rejected {_sanitize_reject} garbage rows (no mint/score/liq or toxic flags)", flush=True)
+    _total_rej = sum(_rej.values())
+    if _total_rej > 0:
+        print(f"   🗑️ _load_ready: SANITIZE rejected {_total_rej} rows → {_rej}", flush=True)
     if not out:
-        print(f"   🛑 READY_NO_VALID_ROWS: all rows rejected (stale={_stale_count} sanitize={_sanitize_reject})", flush=True)
+        print(f"   🛑 READY_NO_VALID_ROWS: all rows rejected → {_rej}", flush=True)
+
+    # P14: MINIMUM ACTIONABLE COUNT au startup
+    # Après un restart, exiger au moins N candidats valides pour éviter un pick sur un pool trop mince
+    _min_actionable = int(os.getenv("STARTUP_MIN_ACTIONABLE_ROWS", "2"))
+    if len(out) < _min_actionable and _file_age > 30:
+        # Seulement si le fichier n'est pas ultra-frais (merger vient de tourner)
+        # fichier frais (<30s) = merger actif, on fait confiance même avec 1 candidat
+        print(f"   🛑 READY_NOT_ENOUGH: {len(out)} valid < min={_min_actionable} (file_age={_file_age}s) → skip cycle", flush=True)
+        return []
+
     return out
 
 
@@ -1380,7 +1397,32 @@ def main() -> int:
     except Exception:
         pass
 
-
+    # ================================================================
+    # P14: PRE-QUOTE QUALITY GATE
+    # Dernier checkpoint AVANT d'envoyer une requête Jupiter.
+    # Si le candidat est clairement garbage → exit proprement, zéro waste.
+    # ================================================================
+    try:
+        _pq_score = float(cand.get("score_total") or cand.get("score") or 0)
+        _pq_liq = float(cand.get("liquidity_usd") or cand.get("liq_usd") or 0)
+        _pq_mint = str(cand.get("mint") or cand.get("outputMint") or cand.get("address") or "").strip()
+        _pq_jup = cand.get("jupiter_ok")
+        _pq_fail = []
+        if not _pq_mint or len(_pq_mint) < 20:
+            _pq_fail.append("no_mint")
+        if _pq_score <= 0:
+            _pq_fail.append(f"score={_pq_score}")
+        if _pq_liq <= 0:
+            _pq_fail.append(f"liq=${_pq_liq}")
+        if _pq_jup is False:
+            _pq_fail.append("jupiter_ok=False")
+        if _pq_fail:
+            print(f"🛑 PRE_QUOTE_REJECT: {_pq_fail} mint={_pq_mint[:16]}… → skip (no Jupiter waste)", flush=True)
+            _dtrace("REJECT", str(_pq_mint), reason="pre_quote_quality_gate", details={"failures": _pq_fail})
+            return 0
+    except Exception as _pq_e:
+        # fail-open: si le check crash, on continue (ne pas bloquer le trading)
+        print(f"⚠️ PRE_QUOTE gate error (fail-open): {_pq_e}", flush=True)
 
     amount_lamports = _lamports_from_any(cand.get("amount_lamports"))
     BUY_LAMPORTS_OVERRIDE = os.getenv("BUY_LAMPORTS")
