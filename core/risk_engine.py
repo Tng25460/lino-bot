@@ -50,6 +50,28 @@ def _ienv(name: str, default: int) -> int:
 # check_circuit_breaker
 # ============================================================
 def check_circuit_breaker() -> Tuple[bool, str]:
+
+    # PATCH VNEXT: fail-open si circuit breaker global desactive
+    try:
+        _risk_cb_disabled = os.getenv("RISK_CB_DISABLE", "").strip().lower() in ("1", "true", "yes", "on")
+        _risk_cb_disabled = _risk_cb_disabled or os.getenv("RISK_DISABLE_CIRCUIT_BREAKER", "").strip().lower() in ("1", "true", "yes", "on")
+        _risk_cb_disabled = _risk_cb_disabled or os.getenv("CIRCUIT_BREAKER_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
+        if _risk_cb_disabled:
+            try:
+                _st = _load_state()
+                if isinstance(_st, dict):
+                    _st["circuit_breaker_until"] = 0
+                    _st["circuit_breaker_reason"] = ""
+                    try:
+                        _save_state(_st)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            print("🟢 RISK_ENGINE fail-open: circuit breaker disabled by env", flush=True)
+            return True, "risk_cb_disabled"
+    except Exception:
+        pass
     """
     Vérifie si le circuit breaker est actif.
 
@@ -118,6 +140,16 @@ def check_circuit_breaker() -> Tuple[bool, str]:
 
 
 def _activate_breaker(state: Dict[str, Any], reason: str, cooldown_sec: int) -> None:
+
+    try:
+        _risk_cb_disabled = os.getenv("RISK_CB_DISABLE", "").strip().lower() in ("1", "true", "yes", "on")
+        _risk_cb_disabled = _risk_cb_disabled or os.getenv("RISK_DISABLE_CIRCUIT_BREAKER", "").strip().lower() in ("1", "true", "yes", "on")
+        _risk_cb_disabled = _risk_cb_disabled or os.getenv("CIRCUIT_BREAKER_ENABLED", "1").strip().lower() in ("0", "false", "no", "off")
+        if _risk_cb_disabled:
+            print("🟢 RISK_ENGINE breaker activation skipped (disabled by env)", flush=True)
+            return
+    except Exception:
+        pass
     """Active le circuit breaker pour cooldown_sec secondes."""
     try:
         from core.brain_db import update_risk_state
