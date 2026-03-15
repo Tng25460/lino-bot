@@ -47,19 +47,58 @@ def _read_exposure_file() -> int:
         return -1
 
 
+def _count_recent_closes() -> int:
+    """
+    Compte les positions FERMÉES récemment (close_ts dans la fenêtre 48h).
+    Utilisé pour soustraire du compteur d'exposition fichier.
+
+    Sans cela, buy_exposure.json ne fait qu'augmenter et le bot
+    s'auto-bloque après MAX_OPEN achats même si tout est vendu.
+
+    Fail-safe: retourne 0 si lecture impossible.
+    """
+    try:
+        import sqlite3
+        import time as _ct
+        _max_age_h = max(float(os.getenv("MAX_OPEN_MAX_AGE_H", "48")), 1.0)
+        _mop_db = os.getenv(
+            "TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite")
+        )
+        _con = sqlite3.connect(_mop_db, timeout=5)
+
+        _cols_info = _con.execute("PRAGMA table_info(positions)").fetchall()
+        _col_names = {row[1] for row in _cols_info}
+
+        if "close_ts" not in _col_names:
+            _con.close()
+            return 0
+
+        _cutoff = int(_ct.time()) - int(_max_age_h * 3600)
+        _closed = _con.execute(
+            "SELECT COUNT(*) FROM positions WHERE status NOT LIKE 'OPEN%' AND COALESCE(close_ts, 0) >= ?",
+            (_cutoff,)
+        ).fetchone()[0]
+        _con.close()
+        return _closed
+    except Exception:
+        return 0
+
+
 def check_max_positions() -> Tuple[bool, str]:
     """
-    Vérifie le plafond d'exposition via 2 sources (la plus haute gagne):
+    Vérifie le plafond d'exposition NETTE:
 
-    1. PRIMAIRE: buy_exposure.json — trades récents écrits par trader_loop
-       Fiable immédiatement après un BUY (pas de dépendance à qty_token).
+    exposition_nette = achats_récents (fichier) - ventes_récentes (DB)
 
-    2. SECONDAIRE: DB positions — OPEN + qty_token > 0 + entry_ts récent
-       Rattrape les positions hydratées qui n'auraient pas de fichier.
+    Sources:
+      1. buy_exposure.json — tous les BUY rc=2 (timestamps)
+      2. DB positions — positions CLOSED avec close_ts récent
 
-    Le compteur final = max(fichier, DB) pour ne jamais sous-estimer l'exposition.
+    Le calcul: net = file_count - closed_count (plancher à 0).
+    Ceci résout le bug où l'exposition ne descendait JAMAIS quand on vendait,
+    bloquant le bot après MAX_OPEN achats même si tout était vendu.
 
-    Fail-open: si les deux sources échouent, retourne (True, ...).
+    Fail-open: si les sources échouent, retourne (True, ...).
 
     Env vars:
       MAX_OPEN_POSITIONS   : limite (default 0 = disabled)
@@ -69,69 +108,55 @@ def check_max_positions() -> Tuple[bool, str]:
     if _max_open <= 0:
         return True, ""
 
-    _max_age_h = max(float(os.getenv("MAX_OPEN_MAX_AGE_H", "48")), 1.0)  # floor 1h minimum
-
-    # --- Source 1: fichier buy_exposure.json ---
+    # --- Source 1: fichier buy_exposure.json (achats bruts) ---
     _file_count = _read_exposure_file()
 
-    # --- Source 2: DB (secondaire) ---
-    _db_count = 0
-    _db_total = 0
-    _db_ok = False
-    try:
-        import sqlite3
-        import time as _mop_time
-        _mop_db = os.getenv(
-            "TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite")
-        )
-        _mop_con = sqlite3.connect(_mop_db, timeout=5)
+    # --- Source 2: positions fermées récemment (à soustraire) ---
+    _closed_count = _count_recent_closes()
 
-        _cols_info = _mop_con.execute("PRAGMA table_info(positions)").fetchall()
-        _col_names = {row[1] for row in _cols_info}
-
-        _db_total = _mop_con.execute(
-            "SELECT COUNT(*) FROM positions WHERE status LIKE 'OPEN%'"
-        ).fetchone()[0]
-
-        # DB: OPEN + qty_token > 0 + récent
-        _where = "status LIKE 'OPEN%'"
-        _params: list = []
-        if "qty_token" in _col_names:
-            _where += " AND COALESCE(qty_token, 0) > 0"
-        if "entry_ts" in _col_names and _max_age_h > 0:
-            _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
-            _where += " AND COALESCE(entry_ts, 0) >= ?"
-            _params.append(_cutoff_ts)
-        _db_count = _mop_con.execute(
-            f"SELECT COUNT(*) FROM positions WHERE {_where}", _params
-        ).fetchone()[0]
-        _mop_con.close()
-        _db_ok = True
-    except Exception as _db_e:
-        print(f"⚠️ MAX_OPEN DB read failed (non-fatal): {_db_e}", flush=True)
-
-    # --- Compteur final: max(fichier, DB) ---
+    # --- Exposition nette ---
     if _file_count >= 0:
-        _active = max(_file_count, _db_count)
-        _source = f"file={_file_count},db={_db_count}"
-    elif _db_ok:
-        _active = _db_count
-        _source = f"db={_db_count}(file unavailable)"
+        _net = max(0, _file_count - _closed_count)
+        _source = f"file={_file_count}-closed={_closed_count}=net={_net}"
     else:
-        # Aucune source fiable → fail-open
-        print("⚠️ MAX_OPEN_POSITIONS: no reliable source (fail-open)", flush=True)
-        return True, ""
+        # Fichier indisponible → fallback DB brut
+        _net = 0
+        _db_ok = False
+        try:
+            import sqlite3
+            import time as _mop_time
+            _max_age_h = max(float(os.getenv("MAX_OPEN_MAX_AGE_H", "48")), 1.0)
+            _mop_db = os.getenv(
+                "TRADES_DB_PATH", os.getenv("DB_PATH", "state/trades.sqlite")
+            )
+            _mop_con = sqlite3.connect(_mop_db, timeout=5)
+            _cols_info = _mop_con.execute("PRAGMA table_info(positions)").fetchall()
+            _col_names = {row[1] for row in _cols_info}
+            _where = "status LIKE 'OPEN%'"
+            _params: list = []
+            if "entry_ts" in _col_names and _max_age_h > 0:
+                _cutoff_ts = int(_mop_time.time()) - int(_max_age_h * 3600)
+                _where += " AND COALESCE(entry_ts, 0) >= ?"
+                _params.append(_cutoff_ts)
+            _net = _mop_con.execute(
+                f"SELECT COUNT(*) FROM positions WHERE {_where}", _params
+            ).fetchone()[0]
+            _mop_con.close()
+            _db_ok = True
+            _source = f"db_fallback={_net}(file unavailable)"
+        except Exception as _db_e:
+            print(f"⚠️ MAX_OPEN_POSITIONS: no reliable source (fail-open): {_db_e}", flush=True)
+            return True, ""
 
-    _ignored = _db_total - _active if _db_total > _active else 0
-    _detail = f" [{_source}, total_open={_db_total}]"
+    _detail = f" [{_source}]"
 
-    if _active >= _max_open:
-        msg = f"🛑 MAX_OPEN_POSITIONS: {_active}/{_max_open} active{_detail} → skip BUY"
+    if _net >= _max_open:
+        msg = f"🛑 MAX_OPEN_POSITIONS: {_net}/{_max_open} net{_detail} → skip BUY"
         print(msg, flush=True)
         return False, msg
     else:
         print(
-            f"📊 MAX_OPEN_POSITIONS: {_active}/{_max_open} active{_detail} (OK)", flush=True
+            f"📊 MAX_OPEN_POSITIONS: {_net}/{_max_open} net{_detail} (OK)", flush=True
         )
         return True, ""
 
